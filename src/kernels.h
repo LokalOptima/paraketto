@@ -246,3 +246,19 @@ void split_transpose_3way_fp16(const half* in,
                                 half* out0, half* out1, half* out2,
                                 int T, int heads, int head_dim,
                                 cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
+// Fused split + transpose + pos_bias: [T, 3*D] → q_u, q_v (with bias), K, V
+//   Reads QKV interleaved data once, writes:
+//     q_u[H,T,d] = Q[h,t,d] + bias_u[h,d]
+//     q_v[H,T,d] = Q[h,t,d] + bias_v[h,d]
+//     K[H,T,d], V[H,T,d]  (unchanged)
+//   Eliminates separate split_transpose_3way + add_pos_bias_dual.
+// ---------------------------------------------------------------------------
+void split_transpose_qkv_bias_fp16(const half* in,
+                                    const half* bias_u,
+                                    const half* bias_v,
+                                    half* q_u, half* q_v,
+                                    half* k, half* v,
+                                    int T, int heads, int head_dim,
+                                    cudaStream_t stream);

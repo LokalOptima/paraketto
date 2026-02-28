@@ -17,7 +17,6 @@
 #include <cuda_fp16.h>
 #include <cublas_v2.h>
 #include <cublasLt.h>
-#include <cudnn.h>
 
 // ---------------------------------------------------------------------------
 // Weight file format constants
@@ -195,7 +194,10 @@ struct CudaModel {
     // --- Pre-concatenated QKV weights per block ---
     half* qkv_w[N_BLOCKS];       // [D_MODEL, 3*D_MODEL] per block
 
-    // --- Encoder buffers (all FP16) ---
+    // --- Pooled GPU allocation (single cudaMalloc for all buffers below) ---
+    void* gpu_pool = nullptr;
+
+    // --- Encoder buffers (all FP16, carved from gpu_pool) ---
     float* mel_fp32  = nullptr;  // [128, T_mel] — upload buffer for FP32 mel
     half* mel_fp16   = nullptr;  // [128, T_mel] — cast from FP32 input
     half* sub_buf[2];            // subsampling ping-pong, sized for max intermediate
@@ -218,13 +220,12 @@ struct CudaModel {
     half* conv_mid   = nullptr;  // [T', D_CONV_PW]
     half* conv_glu   = nullptr;  // [T', D_MODEL]
     half* conv_dw    = nullptr;  // [T', D_MODEL]
-    half* pos_bias   = nullptr;  // [N_HEADS, T', T'] — materialized position bias for SDPA
-    float* sdpa_stats = nullptr; // [1, N_HEADS, T', 1] — SDPA stats output
-    void* sdpa_workspace = nullptr;
-    size_t sdpa_workspace_size = 0;
+    half* pos_bias   = nullptr;  // [N_HEADS, T', T'] — position bias for attention
 
-    // --- cuDNN flash attention ---
-    cudnnHandle_t cudnn = nullptr;
+    // --- Device pointer arrays for cublasGemmBatched (pos scores) ---
+    const half** d_pos_A_ptrs = nullptr;  // [N_HEADS] — per-head into pos_temp
+    const half** d_pos_B_ptrs = nullptr;  // [N_HEADS] — per-head into q_v_buf
+    half** d_pos_C_ptrs = nullptr;        // [N_HEADS] — per-head into pos_scores
 
     // --- Decoder buffers (FP16) ---
     half* dec_embed  = nullptr;  // [D_PRED]

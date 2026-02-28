@@ -1090,3 +1090,53 @@ void split_transpose_3way_fp16(const half* in,
         in, out0, out1, out2, T, heads, head_dim);
 }
 
+// ---------------------------------------------------------------------------
+// Fused split + transpose + pos_bias
+// Input: [T, 3*D], bias_u/bias_v: [heads, head_dim]
+// Output: q_u, q_v (with bias), K, V in [heads, T, head_dim]
+// ---------------------------------------------------------------------------
+
+__global__ void split_transpose_qkv_bias_kernel(const half* __restrict__ in,
+                                                  const half* __restrict__ bias_u,
+                                                  const half* __restrict__ bias_v,
+                                                  half* __restrict__ q_u,
+                                                  half* __restrict__ q_v,
+                                                  half* __restrict__ k,
+                                                  half* __restrict__ v,
+                                                  int T, int heads, int head_dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int D = heads * head_dim;
+    int total = T * D;
+    if (idx < total) {
+        int t = idx / D;
+        int rem = idx % D;
+        int h = rem / head_dim;
+        int d = rem % head_dim;
+        int in_row = t * 3 * D;
+        int out_idx = h * T * head_dim + t * head_dim + d;
+
+        float q_val = __half2float(in[in_row + rem]);
+        float bu = __half2float(bias_u[h * head_dim + d]);
+        float bv = __half2float(bias_v[h * head_dim + d]);
+
+        q_u[out_idx] = __float2half(q_val + bu);
+        q_v[out_idx] = __float2half(q_val + bv);
+        k[out_idx] = in[in_row + D + rem];
+        v[out_idx] = in[in_row + 2 * D + rem];
+    }
+}
+
+void split_transpose_qkv_bias_fp16(const half* in,
+                                    const half* bias_u,
+                                    const half* bias_v,
+                                    half* q_u, half* q_v,
+                                    half* k, half* v,
+                                    int T, int heads, int head_dim,
+                                    cudaStream_t stream) {
+    int total = T * heads * head_dim;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    split_transpose_qkv_bias_kernel<<<blocks, threads, 0, stream>>>(
+        in, bias_u, bias_v, q_u, q_v, k, v, T, heads, head_dim);
+}
+

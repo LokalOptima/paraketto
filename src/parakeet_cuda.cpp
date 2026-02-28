@@ -4,8 +4,8 @@
 // runs encoder (cuBLAS + custom kernels) and TDT greedy decoder on GPU.
 // No TensorRT dependency.
 //
-// Build: make parakeet_cuda
-// Usage: ./parakeet_cuda [--weights FILE] audio.wav
+// Build: make parakeet.cuda
+// Usage: ./parakeet.cuda [--weights FILE] audio.wav
 
 #include <cassert>
 #include <chrono>

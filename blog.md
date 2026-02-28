@@ -562,3 +562,250 @@ listening on http://localhost:8080
 ```
 
 The benchmark (`tests/bench_cpp.py`) was also rewritten to use the server endpoint instead of parsing stderr — simpler and more accurate since inference timing comes from the JSON response rather than regex-matching log lines. This fixed an off-by-one bug where the `init:` log line was being matched as a file timing entry, skewing per-dataset RTFx numbers.
+
+### Step 10: Replacing TensorRT — Phase 1 (Weight Export + Loading)
+
+Goal: eliminate the ~800MB libnvinfer.so dependency and ~1.2GB GPU-specific engine files. Replace with direct cuBLAS + custom CUDA kernels. Phase 1 is weight export + loading infrastructure.
+
+#### Challenge 1: Anonymous ONNX Tensor Names
+
+The ONNX models from `istupakov/parakeet-tdt-0.6b-v2-onnx` use anonymous names for most weight matrices. Instead of `layers.0.fc1.weight`, the weights feeding MatMul/Conv/LSTM ops get auto-generated names like `onnx::MatMul_6382`, `onnx::Conv_6310`, `onnx::LSTM_205`. This is standard for PyTorch's ONNX exporter — `nn.Module` parameters get proper names, but functional op inputs don't.
+
+**Solution:** Walk the ONNX graph topology. Each node's output name contains the full architectural path (e.g. `/layers.0/feed_forward1/linear1/MatMul_output_0`). The `resolve_names()` function in `export_weights.py` traces which initializer feeds which node, extracts the semantic path from the output name, and reconstructs proper names for all op types.
+
+#### Challenge 2: Multi-Layer LSTM Name Collision
+
+Two LSTM nodes share the same base path, differing only by a `_1` suffix in their output names (`LSTM_output_0` vs `LSTM_1_output_0`). Initial name resolution stripped the suffix uniformly, so layer 1 silently overwrote layer 0.
+
+**Solution:** Detect `LSTM_N_output_0` pattern and append the layer index. Layer 0 → `decoder.dec_rnn.lstm.*`, layer 1 → `decoder.dec_rnn.lstm.1.*`.
+
+#### Challenge 3: Model Architecture Differs from Plan
+
+The original plan assumed packed QKV [1024→3072], 3 subsampling layers with batch norm, and separate LSTM biases. The actual ONNX model has:
+
+- **Separate Q, K, V, pos projections** (4 × [1024, 1024], not packed)
+- **5 conv layers** in subsampling (indices 0,2,3,5,6), no batch norm
+- **No batch norm** in conformer conv module
+- **No biases** on FF linear layers
+- **ONNX LSTM format** — combined bias [1, 8×H]
+- A **`linear_pos` projection** for relative positional encoding (4th attention projection)
+
+**Solution:** Rewrote Weights struct and name mappings based on actual ONNX inspection.
+
+#### Results
+
+- **625 tensors** exported (612 encoder + 13 decoder), all verified round-trip
+- **weights.bin**: 1,236 MB FP16 — GPU-agnostic, works on any CUDA device
+- **Weight loading**: 123ms (vs ~333ms TRT engine deserialization) — **2.7× faster**
+- **Dual backend**: `--backend trt` (default, unchanged) and `--backend cuda` (loads weights, inference stub)
+- TRT path completely unaffected — same binary, same behavior
+
+```
+$ ./parakeet --backend cuda --weights weights.bin data/librispeech/6930-75918-0000.wav
+weights: 625 tensors, 1178.4 MB GPU
+  all key weights mapped successfully
+init: 202ms (weights=123 mel+stream=79 bufs=0)
+```
+
+### Step 11: Replacing TensorRT — Phase 2 (CUDA Encoder + Decoder)
+
+Full CUDA implementation of the FastConformer encoder (24 blocks), LSTM decoder, and TDT joint network using cuBLAS GEMMs and custom CUDA kernels. No TensorRT, no cuDNN.
+
+#### Custom CUDA Kernels Written
+
+19 kernels in `kernels.cu` (~750 lines):
+- **LayerNorm** (with optional residual+scale fusion)
+- **SiLU / GLU** (vectorized half2)
+- **Softmax** (numerically stable: FP32 accumulation, max subtraction)
+- **Depthwise Conv1D k=9** (shared memory tiling)
+- **Conv2D** (general, supports groups for depthwise)
+- **LSTM cell** (fused gate computation, ONNX iofc gate order)
+- **Attention helpers**: pos_bias add, relative position skew, score scaling
+- **Data movement**: transpose, reshape, embedding gather, bias add, residual add, cast
+
+#### Bug 1: cuBLAS GEMM Convention Mismatch
+
+**Symptom:** Output was "was was was was..." (garbage repetition).
+
+**Root cause:** ONNX MatMul weights are stored as [input_dim, output_dim] (W in `Y = X @ W`), but the initial GEMM helper used `CUBLAS_OP_T` on W, computing `Y = X @ W^T` — effectively double-transposing.
+
+For FF layers mapping 1024→4096, the weight is [1024, 4096]. Using `CUBLAS_OP_T` treated it as [4096, 1024] transposed back to [1024, 4096] — accidentally correct dimensions but wrong values because the actual matrix is already in the right orientation.
+
+Wait, that's not right either. The actual issue: cuBLAS assumes column-major but our data is row-major. For row-major `Y[m,n] = X[m,k] @ W[k,n]`, the correct cuBLAS call is `cublasHgemm(OP_N, OP_N, n, m, k, W, n, X, k, Y, n)`.
+
+**Solution:** Created two GEMM helpers:
+- `gemm_nn`: `Y = X @ W` — for ONNX MatMul weights [k, n]
+- `gemm_nt`: `Y = X @ W^T` — for Conv/PyTorch weights [n, k]
+
+#### Bug 2: LSTM State Unconditionally Updated
+
+**Symptom:** Output was "L M" (very short, only 2 tokens).
+
+**Root cause:** In TDT/RNN-T, the prediction network LSTM should only advance its state when a non-blank token is emitted. The initial implementation used `std::swap(lstm_h, lstm_h_new)` inside `decode_step()`, which permanently modified LSTM state even for blank predictions.
+
+**Solution:** Added separate `lstm_h_out[2]` and `lstm_c_out[2]` "staging" buffers. `decode_step()` writes new state to these without modifying the current state. A separate `decoder_commit()` method swaps the buffers, called only when `token != BLANK_ID`.
+
+#### Bug 3: Attention Head Layout Mismatch
+
+**Symptom:** Output was "Robin Carter." (real English but completely wrong).
+
+**Root cause:** Q, K, V projections produce [T, 1024] = [T, 8, 128] in memory. The batched GEMM and pos_bias kernels expect [8, T, 128] layout. Element (h, t, d) in [8, T, 128] is at offset `h*T*128 + t*128 + d`, but in [T, 8, 128] it's at `t*1024 + h*128 + d` — different memory locations.
+
+**Solution:** Added `transpose_0213_fp16` kernel that transposes [A, B, C] → [B, A, C]. The MHSA section now explicitly transposes Q, K, V, and pos_proj from [T, 8, 128] → [8, T, 128] before attention, and transposes attn_out back after the weighted sum.
+
+#### Bug 4: Mel Spectrogram Layout (The Big One)
+
+**Symptom:** Output was "Concorr returned with life amidst the tents." (close but wrong). Encoder output had cosine similarity of only 0.50 with TRT.
+
+**Root cause:** The ONNX model **transposes** the mel input before the first conv2d. The mel spectrogram is `[batch, 128, T_mel]` but the ONNX graph does `Transpose(perm=[0,2,1])` → `[batch, T_mel, 128]` then `Unsqueeze(axis=1)` → `[batch, 1, T_mel, 128]` before the first 2D convolution.
+
+My code was feeding `[1, 128, T_mel]` directly to conv2d (H=128, W=T_mel). The correct input is `[1, T_mel, 128]` (H=T_mel, W=128). This makes H the time dimension and W the frequency dimension. After 3 stride-2 stages:
+- Correct: `[256, T/8, 16]` → reshape `[T/8, 4096]` (time is first dim)
+- Wrong:   `[256, 16, T/8]` → reshape `[T/8, 4096]` (same shape but completely different values)
+
+The output shapes matched (both 44 frames of 4096 dims), hiding the bug. The numerical values were completely different because the convolutions operate differently when H and W are swapped.
+
+**Debugging approach:** Added encoder output dumps, compared against ONNX Runtime. Full encoder cosine similarity was 0.50 (terrible). Used `MAX_BLOCKS=0` to isolate subsampling output — still 0.77 cosine. Traced the ONNX graph backwards from conv.0 to find the Transpose+Unsqueeze chain.
+
+**Solution:** Transpose mel from [128, T_mel] to [T_mel, 128] before conv2d. Also changed the final reshape kernel from `[C,H,W]→[W,C*H]` to `[C,H,W]→[H,C*W]` to match the new dimension ordering.
+
+**Key lesson:** Always trace the exact ONNX graph operations from input to the first compute node. Don't assume the input layout matches the weight shapes — there may be implicit reshapes/transposes.
+
+#### Results
+
+After all four fixes, the CUDA backend produces **identical** transcriptions to TRT on all test files:
+
+```
+$ for f in data/librispeech/6930-75918-000{0,1,2,3,4}.wav; do
+    echo "$(basename $f):"
+    echo "  TRT:  $(./parakeet --backend trt $f 2>/dev/null | tail -1)"
+    echo "  CUDA: $(./parakeet --backend cuda --weights weights.bin $f 2>/dev/null | tail -1)"
+  done
+
+6930-75918-0000.wav:
+  TRT:  Concord returned to its place amidst the tents.
+  CUDA: Concord returned to its place amidst the tents.
+[... all 5 files match exactly ...]
+```
+
+Encoder output cosine similarity: **0.9999** (mean across frames), max abs diff 0.015 (FP16 vs FP32 rounding).
+
+Performance: **416x RTFx** (CUDA) vs **541x RTFx** (TRT). The CUDA backend is ~23% slower than TRT, mainly in the decoder (cuBLAS per-step overhead for small GEMMs vs TRT's fused kernels). The encoder is comparable (3.5ms CUDA vs 4.2ms TRT).
+
+#### Architecture (CUDA backend)
+
+```
+src/kernels.cu       # ~800 lines: 19 custom CUDA kernels
+src/kernels.h        # kernel declarations
+src/conformer.h      # Weights struct + CudaModel struct
+src/conformer.cpp    # ~800 lines: weight loading + encoder/decoder forward pass
+src/parakeet.cpp     # Pipeline integration, --backend cuda support
+weights.bin          # 1.2 GB flat binary (GPU-agnostic, no engine rebuilds)
+```
+
+Link dependencies: `cudart`, `cublas`, `cublasLt`, `cufft`, `cudnn`. cuDNN is used only for flash attention (SDPA) in the encoder.
+
+### Step 12: Encoder Kernel Fusion
+
+After Step 11, the CUDA encoder ran 24 operations per conformer block (576 total across 24 blocks): 10 cuBLAS GEMMs + 1 cuDNN SDPA + 13 custom kernels. We investigated reducing kernel launch overhead via fusion.
+
+#### What we tried
+
+**4-step plan:**
+1. Fuse `split_transpose_3way` + `add_pos_bias_dual` into one kernel (`split_transpose_qkv_bias`)
+2. Eliminate pos_proj transpose via `cublasGemmBatched` with per-head pointer arrays
+3. cuDNN matmul+SiLU graphs for FF modules (fuse GEMM + activation)
+4. cuDNN matmul+GLU graph for conv PW1 (fuse GEMM + gated activation)
+
+Steps 1+2 are pure kernel launch elimination (2 fewer launches per block = 48 total).
+Steps 3+4 use cuDNN frontend graph API to fuse GEMM + pointwise ops.
+
+#### What worked: Steps 1+2 (custom kernel fusion)
+
+**Step 1: `split_transpose_qkv_bias_fp16`** — A new CUDA kernel that reads the fused QKV output `[T, 3D]` once and writes `q_u = Q + bias_u`, `q_v = Q + bias_v`, `K`, `V` directly in `[H, T, head_dim]` layout. Replaces separate `split_transpose_3way` + `add_pos_bias_dual` (2 kernels → 1).
+
+**Step 2: Strided batched GEMM for position scores** — Instead of transposing `pos_proj` from `[2T-1, 8, 128]` to `[8, 2T-1, 128]` then calling `cublasGemmStridedBatched`, we use `cublasGemmBatched` with per-head pointer arrays that read directly from the interleaved layout (`ldb = D_MODEL = 1024`). Eliminates the `transpose_0213` kernel entirely.
+
+#### What didn't work: Steps 3+4 (cuDNN matmul graphs)
+
+cuDNN frontend graph API can compose `matmul → pointwise(swish)` and execute as one fused kernel. We built and tested these for FF1/FF2 (matmul+SiLU) and conv PW1 (matmul+GLU). Results:
+
+- **No performance benefit.** A/B testing showed identical enc_ms with and without cuDNN matmul graphs.
+- **Significant cold-start cost.** Each new sequence length T requires building a new cuDNN graph (~70-90ms), making the first inference per T very slow.
+- **Likely explanation:** cublasLt already selects optimal GEMM kernels via algorithm caching (we use `CUBLASLT_SEARCH_BEST_FIT`). The SiLU/GLU elementwise ops are memory-bandwidth-bound and run at near-peak bandwidth already. Fusing them into the GEMM epilogue doesn't help when the GEMM itself dominates compute time.
+
+These were removed from the codebase.
+
+#### Benchmark results
+
+Server mode, 81 files (40 librispeech + 41 earnings22), 3 runs after warmup:
+
+```
+BASELINE (cuDNN SDPA, pre-fusion):
+  Run 1: 81 files, 588.9s audio, 1.001s inf, avg=12.4ms, RTFx=588x
+  Run 2: 81 files, 588.9s audio, 1.017s inf, avg=12.6ms, RTFx=579x
+  Run 3: 81 files, 588.9s audio, 1.021s inf, avg=12.6ms, RTFx=577x
+  Overall: avg=12.5ms, RTFx=581x
+
+OPTIMIZED (+ fused split_qkv_bias + strided batched GEMM):
+  Run 1: 81 files, 588.9s audio, 0.973s inf, avg=12.0ms, RTFx=605x
+  Run 2: 81 files, 588.9s audio, 0.964s inf, avg=11.9ms, RTFx=611x
+  Run 3: 81 files, 588.9s audio, 0.962s inf, avg=11.9ms, RTFx=612x
+  Overall: avg=11.9ms, RTFx=609x
+```
+
+| Metric | Before | After | Change |
+|--------|--------|-------|--------|
+| avg inference | 12.5ms | 11.9ms | **-0.6ms (-5%)** |
+| RTFx | 581x | 609x | **+5%** |
+| Correctness | 81/81 match | 81/81 match | Exact match |
+
+Per block: 24 → 22 ops (eliminated `split_transpose_3way` and `transpose_0213`). Total: 576 → 528 kernel launches.
+
+**Takeaway:** Eliminating kernel launches via custom fused kernels gives a modest but real 5% improvement. Library-level GEMM+activation fusion (cuDNN graphs) provides no benefit when the GEMM library (cublasLt) is already well-tuned — the launch overhead savings (~3µs/launch) are offset by cuDNN graph dispatch overhead.
+
+#### Head-to-head: TensorRT vs CUDA backend
+
+Server mode, 81 files (589s audio), RTX 5070 Ti, 5 warmup passes + 3 benchmark runs, isolated:
+
+| Backend | Run 1 | Run 2 | Run 3 | Avg |
+|---------|-------|-------|-------|-----|
+| **TensorRT** (FP16 engines) | 11.3ms / 642x | 11.4ms / 638x | 11.8ms / 618x | **11.5ms / 633x** |
+| **CUDA** (cuBLAS + cuDNN SDPA + custom kernels) | 12.7ms / 572x | 12.6ms / 578x | 12.2ms / 594x | **12.5ms / 581x** |
+
+**CUDA is ~8% slower than TRT** (12.5ms vs 11.5ms). Down from 23% in Step 11, thanks to cuDNN flash attention, cublasLt algorithm caching, and kernel fusion. The remaining ~1ms gap is TRT's Myelin compiler fusing GEMM+residual+LayerNorm chains — not replicable with library calls.
+
+The CUDA backend eliminates ~800MB of TensorRT runtime libraries and GPU-specific engine files, replacing them with a single portable `weights.bin` that works on any CUDA GPU.
+
+### Step 13: Removing cuDNN, Startup Optimization
+
+#### cuDNN SDPA: zero inference benefit
+
+A/B testing showed cuDNN flash attention (SDPA) provided **no inference speed improvement** over the manual path (2 batched GEMMs + fused_score_softmax + transpose). With cuDNN SDPA disabled, RTFx was identical (~595x) while saving ~37ms of warmup time per new sequence length (cuDNN graph building).
+
+The manual attention path already uses optimized cuBLAS batched GEMMs and a custom fused kernel for score+skew+softmax. cuDNN SDPA adds overhead from graph dispatch, variant pack construction, and workspace management that offsets any kernel-level gains.
+
+Removed all cuDNN code: SDPA graph builder/cache, cudnnHandle, cudnn_frontend include. **Dropped `libcudnn` from link dependencies entirely.**
+
+#### Startup optimizations
+
+Three changes to model init:
+
+1. **Pooled GPU allocation** — Replaced ~35 individual `cudaMalloc` calls with a single allocation, then carved buffer pointers from it (256-byte aligned for tensor core ops). Each `cudaMalloc` has ~2-5ms of driver overhead; pooling eliminates ~100ms.
+
+2. **`cudaMemcpy2D` for QKV weight concatenation** — The pre-concatenation of Q/K/V weights into fused `[D, 3D]` matrices was doing 24 blocks × 1024 rows × 3 = 73,728 individual `cudaMemcpyAsync` calls. Replaced with `cudaMemcpy2DAsync` (72 calls total — 3 per block). Each call copies all 1024 rows with the correct source/destination strides.
+
+3. **No cuDNN handle** — `cudnnCreate()` + `cudnnSetStream()` cost ~3ms even before any graph building.
+
+#### Results
+
+| Component | TRT | CUDA (before) | CUDA (after) |
+|-----------|-----|---------------|--------------|
+| cuda_init | 69ms | 68ms | 67ms |
+| load + model init | 305ms | 286ms | 135ms |
+| warmup | 16ms | 34ms | 35ms |
+| **Total startup** | **~392ms** | **~386ms** | **~238ms** |
+
+**CUDA startup is now 40% faster than TRT** (238ms vs 392ms). TRT's 305ms is dominated by engine deserialization (rebuilding GPU kernel launch parameters from the 1.2GB serialized plan). CUDA's 135ms is weight mmap + single cudaMalloc + 72 strided copies + position encoding generation.
+
+Inference speed unchanged at ~600x RTFx. Link dependencies: `cudart`, `cublas`, `cublasLt`, `cufft` only. No TensorRT, no cuDNN.
