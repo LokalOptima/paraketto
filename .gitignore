@@ -27,3 +27,9 @@ Thumbs.db
 
 # Logs
 *.log
+
+# C++ build artifacts
+parakeet
+
+# TRT engines (GPU-specific, not portable)
+engines/

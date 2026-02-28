@@ -1,8 +1,15 @@
 PARAKEET_MODEL ?= nemo-parakeet-tdt-0.6b-v2
 VENV_PKGS       = .venv/lib/python3.13/site-packages
-export LD_LIBRARY_PATH := $(VENV_PKGS)/tensorrt_libs:$(VENV_PKGS)/onnxruntime/capi:$(LD_LIBRARY_PATH)
+TRT_LIBS        = $(VENV_PKGS)/tensorrt_libs
+TRT_INCLUDE     = third_party/tensorrt
+CUDA_HOME      ?= /usr/local/cuda-13.1
+export LD_LIBRARY_PATH := $(TRT_LIBS):$(VENV_PKGS)/onnxruntime/capi:$(LD_LIBRARY_PATH)
 
-.PHONY: run bench
+CXX      = g++
+CXXFLAGS = -std=c++17 -O2 -I$(TRT_INCLUDE) -I$(CUDA_HOME)/include
+LDFLAGS  = -L$(CUDA_HOME)/lib64 -lcudart $(TRT_LIBS)/libnvinfer.so.10 -Wl,-rpath,$(TRT_LIBS)
+
+.PHONY: run bench bench-cpp
 
 run: src/parakeet-transcribe.py
 	arecord -f S16_LE -r 16000 -c 1 -t raw - | \
@@ -10,3 +17,10 @@ run: src/parakeet-transcribe.py
 
 bench:
 	uv run python tests/bench.py
+
+# C++ build
+parakeet: src/parakeet.cpp
+	$(CXX) $(CXXFLAGS) $< $(LDFLAGS) -o $@
+
+bench-cpp: parakeet
+	./parakeet data/combined-90s.wav
