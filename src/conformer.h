@@ -232,27 +232,19 @@ struct CudaModel {
     half* conv_mid   = nullptr;  // [T', D_CONV_PW]
     half* conv_glu   = nullptr;  // [T', D_MODEL]
     half* conv_dw    = nullptr;  // [T', D_MODEL]
-    half* pos_bias   = nullptr;  // [N_HEADS, T', T'] — position bias for attention
-
-    // --- Device pointer arrays for cublasGemmBatched (pos scores) ---
-    const half** d_pos_A_ptrs = nullptr;  // [N_HEADS] — per-head into pos_temp
-    const half** d_pos_B_ptrs = nullptr;  // [N_HEADS] — per-head into q_v_buf
-    half** d_pos_C_ptrs = nullptr;        // [N_HEADS] — per-head into pos_scores
 
     // --- Decoder buffers (FP16) ---
-    half* dec_embed  = nullptr;  // [D_PRED]
-    half* lstm_gates = nullptr;  // [4*D_PRED]
-    half* lstm_h[2];             // h state for 2 LSTM layers, each [D_PRED]
-    half* lstm_c[2];             // c state for 2 LSTM layers, each [D_PRED]
-    half* lstm_h_out[2];         // output h state (uncommitted)
-    half* lstm_c_out[2];         // output c state (uncommitted)
-    half* enc_proj   = nullptr;  // [D_JOINT]
-    half* dec_proj   = nullptr;  // [D_JOINT]
-    half* joint_act  = nullptr;  // [D_JOINT]
-    half* joint_out  = nullptr;  // [D_OUTPUT]
-
-    // --- CUDA graph cache for encoder (keyed by T) ---
-    std::unordered_map<int, std::pair<cudaGraph_t, cudaGraphExec_t>> graph_cache;
+    half* dec_embed     = nullptr;  // [D_PRED]
+    half* lstm_gates    = nullptr;  // [4*D_PRED]
+    half* lstm_h[2];                // h state for 2 LSTM layers, each [D_PRED]
+    half* lstm_c[2];                // c state for 2 LSTM layers, each [D_PRED]
+    half* lstm_h_out[2];            // output h state (uncommitted)
+    half* lstm_c_out[2];            // output c state (uncommitted)
+    half* enc_proj_all  = nullptr;  // [T_max, D_JOINT] — precomputed after encoding
+    half* dec_proj      = nullptr;  // [D_JOINT]
+    half* joint_act     = nullptr;  // [D_JOINT]
+    half* joint_out     = nullptr;  // [D_OUTPUT]
+    int*  argmax_out    = nullptr;  // [2] — token, step (for GPU argmax)
 
     // --- Methods ---
     void init(const Weights& weights, cudaStream_t s, int max_mel_frames);

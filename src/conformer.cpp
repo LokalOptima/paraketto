@@ -382,15 +382,14 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames)
         (size_t)(T_max * D_CONV_PW),            // conv_mid
         (size_t)(T_max * D_MODEL),              // conv_glu
         (size_t)(T_max * D_MODEL),              // conv_dw
-        (size_t)(N_HEADS * T_max * T_max),      // pos_bias
         (size_t)D_PRED,                         // dec_embed
         (size_t)(4 * D_PRED),                   // lstm_gates
         (size_t)D_PRED, (size_t)D_PRED,         // lstm_h[0], lstm_h[1]
         (size_t)D_PRED, (size_t)D_PRED,         // lstm_c[0], lstm_c[1]
         (size_t)D_PRED, (size_t)D_PRED,         // lstm_h_out[0], lstm_h_out[1]
         (size_t)D_PRED, (size_t)D_PRED,         // lstm_c_out[0], lstm_c_out[1]
-        (size_t)D_JOINT, (size_t)D_JOINT,       // enc_proj, dec_proj
-        (size_t)D_JOINT,                        // joint_act
+        (size_t)(T_max * D_JOINT),              // enc_proj_all (precomputed)
+        (size_t)D_JOINT, (size_t)D_JOINT,       // dec_proj, joint_act
         (size_t)D_OUTPUT,                       // joint_out
     };
     constexpr int N_BUFS = sizeof(sizes) / sizeof(sizes[0]);
@@ -399,17 +398,15 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames)
     size_t total_half = 0;
     for (int i = 0; i < N_BUFS; i++) total_half += sizes[i];
 
-    // Also need: QKV weights (24 blocks), pointer arrays (3), mel_fp32
+    // Also need: QKV weights (24 blocks), mel_fp32
     size_t qkv_total = (size_t)N_BLOCKS * D_MODEL * 3 * D_MODEL;
-    size_t ptr_arrays = 3 * N_HEADS;  // stored as half* but sizeof(half*) = 8, sizeof(half) = 2
-    size_t ptr_bytes = 3 * N_HEADS * sizeof(half*);
 
     char* pool;
     // Add generous alignment padding (256 bytes per buffer)
-    int total_bufs = N_BUFS + N_BLOCKS + 3;  // +mel_fp32 +ptr_arrays
+    int total_bufs = N_BUFS + N_BLOCKS + 2;  // +mel_fp32 +argmax_out
     size_t pool_bytes = (total_half + qkv_total) * sizeof(half)
                       + mel_fp32_elems * sizeof(float)
-                      + ptr_bytes
+                      + 2 * sizeof(int)  // argmax_out
                       + (size_t)total_bufs * 256;  // alignment padding
     CUDA_CHECK(cudaMalloc(&pool, pool_bytes));
     gpu_pool = pool;  // save for free()
@@ -438,14 +435,15 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames)
     scores     = take(sizes[15]);  pos_scores = take(sizes[16]);
     attn_out   = take(sizes[17]);  mhsa_out   = take(sizes[18]);
     conv_mid   = take(sizes[19]);  conv_glu   = take(sizes[20]);
-    conv_dw    = take(sizes[21]);  pos_bias   = take(sizes[22]);
-    dec_embed  = take(sizes[23]);  lstm_gates = take(sizes[24]);
-    lstm_h[0]  = take(sizes[25]);  lstm_h[1]  = take(sizes[26]);
-    lstm_c[0]  = take(sizes[27]);  lstm_c[1]  = take(sizes[28]);
-    lstm_h_out[0] = take(sizes[29]); lstm_h_out[1] = take(sizes[30]);
-    lstm_c_out[0] = take(sizes[31]); lstm_c_out[1] = take(sizes[32]);
-    enc_proj   = take(sizes[33]);  dec_proj   = take(sizes[34]);
-    joint_act  = take(sizes[35]);  joint_out  = take(sizes[36]);
+    conv_dw    = take(sizes[21]);
+    dec_embed  = take(sizes[22]);  lstm_gates = take(sizes[23]);
+    lstm_h[0]  = take(sizes[24]);  lstm_h[1]  = take(sizes[25]);
+    lstm_c[0]  = take(sizes[26]);  lstm_c[1]  = take(sizes[27]);
+    lstm_h_out[0] = take(sizes[28]); lstm_h_out[1] = take(sizes[29]);
+    lstm_c_out[0] = take(sizes[30]); lstm_c_out[1] = take(sizes[31]);
+    enc_proj_all = take(sizes[32]);
+    dec_proj   = take(sizes[33]);  joint_act  = take(sizes[34]);
+    joint_out  = take(sizes[35]);
 
     // QKV weight blocks from pool
     for (int b = 0; b < N_BLOCKS; b++) {
@@ -457,11 +455,10 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames)
     mel_fp32 = (float*)pool;
     pool += mel_fp32_elems * sizeof(float);
 
-    // Device pointer arrays from pool, aligned
+    // argmax_out (int[2]) from pool, aligned
     pool = (char*)(((uintptr_t)pool + ALIGN - 1) & ~(ALIGN - 1));
-    d_pos_A_ptrs = (const half**)pool;
-    d_pos_B_ptrs = (const half**)((char*)d_pos_A_ptrs + N_HEADS * sizeof(half*));
-    d_pos_C_ptrs = (half**)((char*)d_pos_B_ptrs + N_HEADS * sizeof(half*));
+    argmax_out = (int*)pool;
+    pool += 2 * sizeof(int);
 
     // Pre-concatenate QKV weights using cudaMemcpy2D (72 calls vs 73K row-by-row)
     for (int b = 0; b < N_BLOCKS; b++) {
@@ -484,6 +481,7 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames)
 
     // Pre-compute position encoding for T_max (reused via offset for any T <= T_max)
     generate_pos_encoding_gpu(pos_enc, T_max, D_MODEL, stream);
+
     CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
@@ -537,11 +535,6 @@ void CudaModel::free() {
     }
     gemm_cache.clear();
     if (lt_workspace) { cudaFree(lt_workspace); lt_workspace = nullptr; }
-    for (auto& [t, gp] : graph_cache) {
-        cudaGraphExecDestroy(gp.second);
-        cudaGraphDestroy(gp.first);
-    }
-    graph_cache.clear();
     // All inference buffers are carved from a single pooled allocation
     if (gpu_pool) { cudaFree(gpu_pool); gpu_pool = nullptr; }
 }
@@ -676,6 +669,24 @@ static void gemm_nt_accum(cublasLtHandle_t lt, cublasHandle_t h,
             n, m, k, W, k, X, k, Y, n, true);
 }
 
+// Y[m,n] = X[m,k] @ W[n,k]^T + bias[n]  (NT with bias epilogue)
+static void gemm_nt_bias(cublasLtHandle_t lt, cublasHandle_t h,
+                           void* ws, size_t ws_size, cudaStream_t stream,
+                           const half* X, int m, int k,
+                           const half* W, int n, const half* bias, half* Y) {
+    lt_gemm(lt, h, ws, ws_size, stream, CUBLAS_OP_T, CUBLAS_OP_N,
+            n, m, k, W, k, X, k, Y, n, false, bias);
+}
+
+// Y += X @ W[n,k]^T + bias[n]  (NT accumulate with bias epilogue)
+static void gemm_nt_accum_bias(cublasLtHandle_t lt, cublasHandle_t h,
+                                 void* ws, size_t ws_size, cudaStream_t stream,
+                                 const half* X, int m, int k,
+                                 const half* W, int n, const half* bias, half* Y) {
+    lt_gemm(lt, h, ws, ws_size, stream, CUBLAS_OP_T, CUBLAS_OP_N,
+            n, m, k, W, k, X, k, Y, n, true, bias);
+}
+
 // Batched strided GEMM: C[b,m,n] = A[b,m,k] @ B[b,k,n]
 // A is [b,m,k], B is [b,k,n], C is [b,m,n]
 static void batched_gemm_nn(cublasHandle_t h,
@@ -802,57 +813,32 @@ int CudaModel::encode_gpu(int T_mel) {
             gnn(ln_out, T, D_MODEL, qkv_w[blk], 3 * D_MODEL, qkv);
 
             // Fused split+transpose+bias: [T, 3D] → q_u, q_v (with bias), K, V
-            // Replaces split_transpose_3way + add_pos_bias_dual (2 kernels → 1)
             half* K_h = k;
             half* V_h = v;
             split_transpose_qkv_bias_fp16(qkv, b.pos_bias_u, b.pos_bias_v,
                                            q_u, q_v_buf, K_h, V_h,
                                            T, N_HEADS, HEAD_DIM, stream);
 
-            // Position encoding projection (output to pos_proj, properly sized)
-            half* pos_temp = pos_proj;  // [(2*T_max)*D_MODEL] — large enough for [pos_len, D_MODEL]
+            // Position encoding projection
+            half* pos_temp = pos_proj;
             gnn(pos_enc_T, pos_len, D_MODEL, b.pos_w, D_MODEL, pos_temp);
 
-            // Position scores via cublasGemmBatched: reads un-transposed pos_temp directly
-            // Eliminates the transpose_0213 kernel (op #9)
-            // pos_temp is [pos_len, N_HEADS, HEAD_DIM] — per-head stride is D_MODEL
+            // Position scores via strided batched GEMM (no pointer arrays/H2D copies)
             {
-                const half* h_A_ptrs[N_HEADS];
-                const half* h_B_ptrs[N_HEADS];
-                half* h_C_ptrs[N_HEADS];
-                for (int h = 0; h < N_HEADS; h++) {
-                    h_A_ptrs[h] = pos_temp + h * HEAD_DIM;
-                    h_B_ptrs[h] = q_v_buf + h * T * HEAD_DIM;
-                    h_C_ptrs[h] = pos_scores + h * T * pos_len;
-                }
-                CUDA_CHECK(cudaMemcpyAsync(d_pos_A_ptrs, h_A_ptrs,
-                    N_HEADS * sizeof(half*), cudaMemcpyHostToDevice, stream));
-                CUDA_CHECK(cudaMemcpyAsync(d_pos_B_ptrs, h_B_ptrs,
-                    N_HEADS * sizeof(half*), cudaMemcpyHostToDevice, stream));
-                CUDA_CHECK(cudaMemcpyAsync(d_pos_C_ptrs, h_C_ptrs,
-                    N_HEADS * sizeof(half*), cudaMemcpyHostToDevice, stream));
-
                 half alpha_h = __float2half(1.0f), beta_h = __float2half(0.0f);
-                CUBLAS_CHECK(cublasGemmBatchedEx(cublas,
+                CUBLAS_CHECK(cublasGemmStridedBatchedEx(cublas,
                     CUBLAS_OP_T, CUBLAS_OP_N,
                     pos_len, T, HEAD_DIM,
                     &alpha_h,
-                    (const void**)d_pos_A_ptrs, CUDA_R_16F, D_MODEL,
-                    (const void**)d_pos_B_ptrs, CUDA_R_16F, HEAD_DIM,
+                    pos_temp, CUDA_R_16F, D_MODEL, (long long)HEAD_DIM,
+                    q_v_buf, CUDA_R_16F, HEAD_DIM, (long long)T * HEAD_DIM,
                     &beta_h,
-                    (void**)d_pos_C_ptrs, CUDA_R_16F, pos_len,
+                    pos_scores, CUDA_R_16F, pos_len, (long long)T * pos_len,
                     N_HEADS, CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
             }
 
-            // Skew position scores: [8, T, 2T-1] → [8, T, T]
-            // Pre-scale by 1/sqrt(d) so cuDNN SDPA's (Q×K^T×scale + bias) matches
-            // our original (Q×K^T + bias)×scale
             float scale = 1.0f / sqrtf((float)HEAD_DIM);
-            rel_pos_skew_scale_fp16(pos_scores, pos_bias, N_HEADS, T, scale, stream);
 
-            // cuDNN Flash Attention: fuses content_scores + add_bias + scale + softmax + weighted_sum
-            // Input Q=q_u, K, V in [H, T, D] layout; Bias=pos_bias in [H, T, T]
-            // Output directly in [T, H, D] layout (no transpose needed)
             // Content attention scores: [8, T, T] = q_u @ K^T
             batched_gemm_nt(cublas, q_u, K_h, scores,
                             N_HEADS, T, T, HEAD_DIM,
@@ -867,7 +853,7 @@ int CudaModel::encode_gpu(int T_mel) {
             // Transpose [8, T, 128] → [T, 8, 128] = [T, 1024]
             transpose_0213_fp16(attn_out, ff_out, N_HEADS, T, HEAD_DIM, stream);
 
-            // Output projection (ff_out is now [T, 1024] in both paths)
+            // Output projection
             gnn(ff_out, T, D_MODEL, b.out_w, D_MODEL, mhsa_out);
         }
 
@@ -875,22 +861,22 @@ int CudaModel::encode_gpu(int T_mel) {
         residual_add_layer_norm_fp16(x, mhsa_out, 1.0f,
             b.conv_ln_w, b.conv_ln_b, ln_out, T, D_MODEL, 1e-5f, stream);
 
-        // Pointwise conv1 + GLU: [T,1024]×[2048,1024]^T → [T,2048] → GLU → [T,1024]
+        // Pointwise conv1 + GLU
         gnt(ln_out, T, D_MODEL, b.conv_pw1_w, D_CONV_PW, conv_mid);
         glu_fp16(conv_mid, conv_glu, T, D_MODEL, stream);
 
-        // Fused depthwise conv 1D k=9 + SiLU: [T, 1024] → [T, 1024]
+        // Fused depthwise conv 1D k=9 + SiLU
         depthwise_conv1d_k9_silu_fp16(conv_glu, b.conv_dw_w, b.conv_dw_b,
                                        conv_dw, T, D_MODEL, stream);
 
-        // Pointwise conv2: [T, 1024] → [T, 1024]
+        // Pointwise conv2
         gnt(conv_dw, T, D_MODEL, b.conv_pw2_w, D_MODEL, mhsa_out);
 
         // Fused: x += conv_out, then ln_out = LN(x)
         residual_add_layer_norm_fp16(x, mhsa_out, 1.0f,
             b.ff2_ln_w, b.ff2_ln_b, ln_out, T, D_MODEL, 1e-5f, stream);
 
-        // FF2 linear1 + SiLU: [T,1024] × [1024,4096] → [T,4096]
+        // FF2 linear1 + SiLU
         gnn(ln_out, T, D_MODEL, b.ff2_w1, D_FF, ff_mid);
         silu_inplace_fp16(ff_mid, T * D_FF, stream);
 
@@ -900,6 +886,10 @@ int CudaModel::encode_gpu(int T_mel) {
     }
 
     // x now holds encoder output [T, D_MODEL] in FP16
+
+    // Precompute encoder projections for all T frames (used by fused joint kernel)
+    gnn_bias(x, T, D_MODEL, w->enc_proj_w, D_JOINT, w->enc_proj_b, enc_proj_all);
+
     return T;
 }
 
@@ -919,49 +909,35 @@ void CudaModel::decoder_reset() {
 // ---------------------------------------------------------------------------
 
 half* CudaModel::decode_step(int enc_frame_idx, int prev_token) {
-    // Local GEMM helpers that capture cublasLt context
-    auto gnn = [&](const half* X, int m, int k, const half* W, int n, half* Y) {
-        gemm_nn(cublaslt, cublas, lt_workspace, lt_workspace_size, stream, X, m, k, W, n, Y);
+    // Local GEMM helpers with fused bias epilogues
+    auto gnn_b = [&](const half* X, int m, int k, const half* W, int n, const half* bias, half* Y) {
+        gemm_nn_bias(cublaslt, cublas, lt_workspace, lt_workspace_size, stream, X, m, k, W, n, bias, Y);
     };
-    auto gnt = [&](const half* X, int m, int k, const half* W, int n, half* Y) {
-        gemm_nt(cublaslt, cublas, lt_workspace, lt_workspace_size, stream, X, m, k, W, n, Y);
+    auto gnt_b = [&](const half* X, int m, int k, const half* W, int n, const half* bias, half* Y) {
+        gemm_nt_bias(cublaslt, cublas, lt_workspace, lt_workspace_size, stream, X, m, k, W, n, bias, Y);
     };
-    auto gnt_acc = [&](const half* X, int m, int k, const half* W, int n, half* Y) {
-        gemm_nt_accum(cublaslt, cublas, lt_workspace, lt_workspace_size, stream, X, m, k, W, n, Y);
+    auto gnt_acc_b = [&](const half* X, int m, int k, const half* W, int n, const half* bias, half* Y) {
+        gemm_nt_accum_bias(cublaslt, cublas, lt_workspace, lt_workspace_size, stream, X, m, k, W, n, bias, Y);
     };
 
     // 1. Embedding gather
     embedding_gather_fp16(w->embed_w, prev_token, dec_embed, D_PRED, stream);
 
-    // 2. LSTM layer 0
-    gnt(dec_embed, 1, D_PRED, w->lstm0_w_ih, 4 * D_PRED, lstm_gates);
-    gnt_acc(lstm_h[0], 1, D_PRED, w->lstm0_w_hh, 4 * D_PRED, lstm_gates);
-    bias_add_inplace_fp16(lstm_gates, w->lstm0_bias, 1, 4 * D_PRED, stream);
-    bias_add_inplace_fp16(lstm_gates, w->lstm0_bias + 4 * D_PRED, 1, 4 * D_PRED, stream);
+    // 2. LSTM layer 0 — bias fused into GEMM epilogues
+    gnt_b(dec_embed, 1, D_PRED, w->lstm0_w_ih, 4 * D_PRED, w->lstm0_bias, lstm_gates);
+    gnt_acc_b(lstm_h[0], 1, D_PRED, w->lstm0_w_hh, 4 * D_PRED, w->lstm0_bias + 4 * D_PRED, lstm_gates);
     lstm_cell_fp16(lstm_gates, lstm_c[0], lstm_h_out[0], lstm_c_out[0], D_PRED, stream);
 
     // 3. LSTM layer 1
-    gnt(lstm_h_out[0], 1, D_PRED, w->lstm1_w_ih, 4 * D_PRED, lstm_gates);
-    gnt_acc(lstm_h[1], 1, D_PRED, w->lstm1_w_hh, 4 * D_PRED, lstm_gates);
-    bias_add_inplace_fp16(lstm_gates, w->lstm1_bias, 1, 4 * D_PRED, stream);
-    bias_add_inplace_fp16(lstm_gates, w->lstm1_bias + 4 * D_PRED, 1, 4 * D_PRED, stream);
+    gnt_b(lstm_h_out[0], 1, D_PRED, w->lstm1_w_ih, 4 * D_PRED, w->lstm1_bias, lstm_gates);
+    gnt_acc_b(lstm_h[1], 1, D_PRED, w->lstm1_w_hh, 4 * D_PRED, w->lstm1_bias + 4 * D_PRED, lstm_gates);
     lstm_cell_fp16(lstm_gates, lstm_c[1], lstm_h_out[1], lstm_c_out[1], D_PRED, stream);
 
-    // 4. Joint network
-    half* enc_frame = x + enc_frame_idx * D_MODEL;
-    gnn(enc_frame, 1, D_MODEL, w->enc_proj_w, D_JOINT, enc_proj);
-    if (w->enc_proj_b)
-        bias_add_inplace_fp16(enc_proj, w->enc_proj_b, 1, D_JOINT, stream);
-
-    gnn(lstm_h_out[1], 1, D_PRED, w->dec_proj_w, D_JOINT, dec_proj);
-    if (w->dec_proj_b)
-        bias_add_inplace_fp16(dec_proj, w->dec_proj_b, 1, D_JOINT, stream);
-
-    add_relu_fp16(enc_proj, dec_proj, joint_act, D_JOINT, stream);
-
-    gnn(joint_act, 1, D_JOINT, w->out_proj_w, D_OUTPUT, joint_out);
-    if (w->out_proj_b)
-        bias_add_inplace_fp16(joint_out, w->out_proj_b, 1, D_OUTPUT, stream);
+    // 4. Joint network — enc_proj precomputed in encode_gpu, saves 1 cuBLAS call/step
+    half* enc_proj_t = enc_proj_all + enc_frame_idx * D_JOINT;
+    gnn_b(lstm_h_out[1], 1, D_PRED, w->dec_proj_w, D_JOINT, w->dec_proj_b, dec_proj);
+    add_relu_fp16(enc_proj_t, dec_proj, joint_act, D_JOINT, stream);
+    gnn_b(joint_act, 1, D_JOINT, w->out_proj_w, D_OUTPUT, w->out_proj_b, joint_out);
 
     return joint_out;
 }

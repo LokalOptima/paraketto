@@ -77,6 +77,14 @@ void add_relu_fp16(const half* a, const half* b, half* y, int n,
                    cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
+// Dual argmax: token = argmax(logits[:vocab_size]), step = argmax(logits[vocab_size:])
+//   logits: [total] FP16, out: [2] int (token, step)
+//   One block, 256 threads with warp reduction.
+// ---------------------------------------------------------------------------
+void dual_argmax_fp16(const half* logits, int* out,
+                       int vocab_size, int total, cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
 // Depthwise conv 1D, kernel=9, stride=1, padding=4 (same)
 //   x: [T, C]  (channels-last / row-major)
 //   w: [C, 1, 9]
@@ -110,6 +118,36 @@ void softmax_fp16(const half* x, half* y, int rows, int cols,
 // ---------------------------------------------------------------------------
 void lstm_cell_fp16(const half* gates, const half* c_prev,
                     half* h_out, half* c_out, int H, cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
+// Fused LSTM step: W_ih @ x + W_hh @ h + bias + cell in one kernel
+//   x, h_prev, c_prev: [D]
+//   W_ih, W_hh: [4*D, D] (row-major, NT convention)
+//   bias: [8*D] = [b_ih(4*D), b_hh(4*D)]
+//   h_out, c_out: [D]
+//   One block, 256 threads. Eliminates 2 cuBLAS calls + 1 kernel per layer.
+// ---------------------------------------------------------------------------
+void fused_lstm_fp16(const half* x, const half* h_prev, const half* c_prev,
+                     const half* W_ih, const half* W_hh, const half* bias,
+                     half* h_out, half* c_out, int D, cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
+// Fused joint network: dec_proj + add + relu + out_proj in one kernel
+//   lstm_h:    [D_pred]
+//   enc_proj:  [D_joint] (precomputed encoder projection for this frame)
+//   dec_w_t:   [D_joint, D_pred] transposed decoder projection weights
+//   dec_b:     [D_joint]
+//   out_w_t:   [D_out, D_joint] transposed output projection weights
+//   out_b:     [D_out]
+//   joint_out: [D_out]
+//   One block, 256 threads. Eliminates 2 cuBLAS + 1 custom kernel.
+// ---------------------------------------------------------------------------
+void fused_joint_fp16(const half* lstm_h, const half* enc_proj,
+                      const half* dec_w_t, const half* dec_b,
+                      const half* out_w_t, const half* out_b,
+                      half* joint_out,
+                      int D_pred, int D_joint, int D_out,
+                      cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
 // Embedding gather: y = table[idx]

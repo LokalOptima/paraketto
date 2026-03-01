@@ -982,3 +982,78 @@ WER is identical across all 240 utterances — zero numerical regression.
 The TRT backend benefits more (+30% vs +17%) because TensorRT's Myelin compiler already optimizes the encoder heavily, making the mel stall a proportionally larger fraction of total time. With mel fused on GPU, TRT's encoder advantage shines through without the preprocessing bottleneck dragging it down.
 
 **The CUDA backend now matches TRT** (881x vs pre-fusion TRT 858x). The TRT backend with fused mel pulls ahead to 1118x — the fastest result we've seen, and **2.1x faster than the original Python ORT+TRT baseline** (529x).
+
+---
+
+### 9. Decoder Optimization Blitz — 881x → 1001x
+
+With the encoder heavily optimized and the mel pipeline fully on GPU, profiling revealed the next bottleneck: **the decoder takes 35-38% of total inference time**. For a typical utterance, the greedy decode loop runs ~1000 steps, each step launching 12 separate GPU operations (cuBLAS GEMMs + custom kernels). The per-step latency is dominated by kernel launch overhead, not compute.
+
+#### Profiling breakdown (before)
+
+| Component | Share | Notes |
+|-----------|-------|-------|
+| Mel | 5-13% | Fused on GPU, fast |
+| Encoder | 50-62% | 24 conformer blocks, cuBLAS-bound |
+| Decoder | 35-38% | ~1000 steps × 12 ops/step |
+
+#### Optimization 1: Strided batched GEMM
+
+The encoder's position score computation used `cublasGemmBatchedEx` with explicit pointer arrays — three arrays of 8 `half*` pointers, uploaded H2D every single encoder block. Replaced with `cublasGemmStridedBatchedEx` which computes strides arithmetically, eliminating 72 `cudaMemcpyAsync` H2D calls per encoder pass. The key insight: `pos_temp` (position projection output) has an interleaved layout `[pos_len, N_HEADS, HEAD_DIM]` where the per-head stride in the first dimension is exactly `HEAD_DIM` — perfect for strided batched GEMM.
+
+#### Optimization 2: GEMM bias epilogues for LSTM + joint
+
+The LSTM layers and joint network each did `GEMM → bias_add_inplace` as separate operations. Extended the cublasLt plan cache with `CUBLASLT_EPILOGUE_BIAS` support, adding `gemm_nt_bias` and `gemm_nt_accum_bias` wrappers. Per decode step: **18 ops → 11 ops**.
+
+Before (per LSTM layer):
+```
+gnt(x, W_ih)  →  bias_add(b_ih)  →  gnt_acc(h, W_hh)  →  bias_add(b_hh)  →  lstm_cell
+```
+
+After:
+```
+gnt_bias(x, W_ih, b_ih)  →  gnt_acc_bias(h, W_hh, b_hh)  →  lstm_cell
+```
+
+Same pattern for the joint network's three linear layers.
+
+#### Optimization 3: GPU argmax
+
+The decode loop previously transferred the full 1030-element FP16 joint output (2KB) from GPU to CPU every step, then did CPU argmax for token and duration. Replaced with a `dual_argmax_fp16` kernel: one block, 256 threads, warp-level parallel reduction finding both `argmax(logits[:1025])` (token) and `argmax(logits[1025:])` (duration step) on GPU. Now transfers just 8 bytes (two ints) per step.
+
+#### Optimization 4: Precomputed encoder projections
+
+The joint network computes `enc_proj = encoder_frame × W_enc + b_enc` every decode step — a 1×1024×640 GEMM. But `encoder_frame[t]` only depends on the encoder output, which is fixed for the entire decode loop. Moved the projection to a single batched GEMM right after encoding:
+
+```cpp
+// One GEMM: [T, 1024] × [1024, 640] + bias → [T, 640]
+gnn_bias(x, T, D_MODEL, w->enc_proj_w, D_JOINT, w->enc_proj_b, enc_proj_all);
+```
+
+This eliminates ~1000 separate cuBLAS calls (one per decode step), replacing them with a single efficient GEMM. During decoding, each step just indexes `enc_proj_all + t * D_JOINT`.
+
+#### Dead code removal
+
+Removed the `pos_bias` buffer (N_HEADS × T × T × 2 bytes — the largest decoder-related allocation), the unused `rel_pos_skew_scale_fp16` call path, device pointer arrays (`d_pos_A/B/C_ptrs`), and the CUDA Graph cache (attempted earlier, caused regression due to warmup overhead on variable-length inputs).
+
+#### What didn't work: fused LSTM/joint kernels
+
+Attempted to fuse the entire LSTM step (2 matrix-vector products + bias + cell computation) into a single CUDA kernel — 256 threads, one block, serial dot products over 640-element vectors in shared memory. **Result: 65x slower than cuBLAS.** The problem: cuBLAS distributes M=1 GEMMs across all 64 SMs with optimized memory access patterns; a single-block kernel uses ~2% of GPU capacity. The kernel launch overhead savings (~4μs per launch × ~4000 launches) were dwarfed by the compute regression. Same story for the fused joint kernel. Lesson: don't hand-roll matrix-vector products when cuBLAS already optimizes them across the full GPU.
+
+#### Results
+
+| Backend | Before | After | Improvement |
+|---------|--------|-------|-------------|
+| C++ CUDA | 881x | **1001x** | **+14%** |
+
+Per-dataset breakdown:
+
+| Dataset | WER | RTFx | Utts | Audio | Time |
+|---------|-----|------|------|-------|------|
+| librispeech | 1.68% | 908x | 100 | 896s | 987ms |
+| earnings22 | 16.48% | 824x | 40 | 253s | 307ms |
+| long | 1.91% | 1030x | 50 | 5578s | 5.42s |
+| difficult | 23.24% | 1003x | 50 | 509s | 508ms |
+| **Total** | | **1003x** | **240** | **7236s** | **7.22s** |
+
+WER identical across all 240 utterances. The CUDA backend has now crossed 1000x RTFx — **1.9x faster than the original Python baseline** (529x) with zero external dependencies beyond CUDA.

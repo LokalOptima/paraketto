@@ -373,6 +373,89 @@ void add_relu_fp16(const half* a, const half* b, half* y, int n,
 }
 
 // ---------------------------------------------------------------------------
+// Dual argmax: finds argmax over [0, vocab_size) and [vocab_size, total)
+//   logits: [total] FP16 values
+//   out: [2] int — out[0] = token (argmax over vocab), out[1] = step (argmax over durations)
+//   One block, 256 threads, warp-level reduction.
+// ---------------------------------------------------------------------------
+
+__global__ void dual_argmax_kernel(const half* __restrict__ logits,
+                                    int* __restrict__ out,
+                                    int vocab_size, int total) {
+    int tid = threadIdx.x;
+    int nthreads = blockDim.x;
+
+    // --- Token argmax: [0, vocab_size) ---
+    float best_val = -FLT_MAX;
+    int best_idx = 0;
+    for (int i = tid; i < vocab_size; i += nthreads) {
+        float v = __half2float(logits[i]);
+        if (v > best_val) { best_val = v; best_idx = i; }
+    }
+
+    // Warp reduction
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        float other_val = __shfl_xor_sync(0xffffffff, best_val, mask);
+        int other_idx = __shfl_xor_sync(0xffffffff, best_idx, mask);
+        if (other_val > best_val) { best_val = other_val; best_idx = other_idx; }
+    }
+
+    __shared__ float s_val[32];
+    __shared__ int s_idx[32];
+    int warp_id = tid / 32, lane = tid % 32;
+    if (lane == 0) { s_val[warp_id] = best_val; s_idx[warp_id] = best_idx; }
+    __syncthreads();
+
+    if (warp_id == 0) {
+        int nwarps = nthreads / 32;
+        best_val = (lane < nwarps) ? s_val[lane] : -FLT_MAX;
+        best_idx = (lane < nwarps) ? s_idx[lane] : 0;
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            float other_val = __shfl_xor_sync(0xffffffff, best_val, mask);
+            int other_idx = __shfl_xor_sync(0xffffffff, best_idx, mask);
+            if (other_val > best_val) { best_val = other_val; best_idx = other_idx; }
+        }
+        if (lane == 0) out[0] = best_idx;
+    }
+    __syncthreads();
+
+    // --- Step argmax: [vocab_size, total) ---
+    int dur_size = total - vocab_size;
+    best_val = -FLT_MAX;
+    best_idx = 0;
+    for (int i = tid; i < dur_size; i += nthreads) {
+        float v = __half2float(logits[vocab_size + i]);
+        if (v > best_val) { best_val = v; best_idx = i; }
+    }
+
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        float other_val = __shfl_xor_sync(0xffffffff, best_val, mask);
+        int other_idx = __shfl_xor_sync(0xffffffff, best_idx, mask);
+        if (other_val > best_val) { best_val = other_val; best_idx = other_idx; }
+    }
+
+    if (lane == 0) { s_val[warp_id] = best_val; s_idx[warp_id] = best_idx; }
+    __syncthreads();
+
+    if (warp_id == 0) {
+        int nwarps = nthreads / 32;
+        best_val = (lane < nwarps) ? s_val[lane] : -FLT_MAX;
+        best_idx = (lane < nwarps) ? s_idx[lane] : 0;
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            float other_val = __shfl_xor_sync(0xffffffff, best_val, mask);
+            int other_idx = __shfl_xor_sync(0xffffffff, best_idx, mask);
+            if (other_val > best_val) { best_val = other_val; best_idx = other_idx; }
+        }
+        if (lane == 0) out[1] = best_idx;
+    }
+}
+
+void dual_argmax_fp16(const half* logits, int* out,
+                       int vocab_size, int total, cudaStream_t stream) {
+    dual_argmax_kernel<<<1, 256, 0, stream>>>(logits, out, vocab_size, total);
+}
+
+// ---------------------------------------------------------------------------
 // Depthwise conv 1D, kernel=9, stride=1, padding=4
 // Layout: x[T, C], w[C, 1, 9], b[C], y[T, C]
 // Each thread handles one (t, c) output element.
@@ -557,6 +640,155 @@ void lstm_cell_fp16(const half* gates, const half* c_prev,
     int threads = 256;
     int blocks = (H + threads - 1) / threads;
     lstm_cell_kernel<<<blocks, threads, 0, stream>>>(gates, c_prev, h_out, c_out, H);
+}
+
+// ---------------------------------------------------------------------------
+// Fused LSTM step: GEMM + bias + cell in one kernel
+//   Shared memory: x[D] (half), h[D] (half), gates[4*D] (float)
+//   One block, 256 threads.
+// ---------------------------------------------------------------------------
+
+__global__ void fused_lstm_kernel(
+        const half* __restrict__ x,
+        const half* __restrict__ h_prev,
+        const half* __restrict__ c_prev,
+        const half* __restrict__ W_ih,     // [4*D, D] row-major
+        const half* __restrict__ W_hh,     // [4*D, D] row-major
+        const half* __restrict__ bias,     // [8*D] = [b_ih(4*D), b_hh(4*D)]
+        half* __restrict__ h_out,
+        half* __restrict__ c_out,
+        int D) {
+    extern __shared__ char smem[];
+    half*  x_sh  = (half*)smem;
+    half*  h_sh  = x_sh + D;
+    float* gates = (float*)(h_sh + D);
+
+    int tid = threadIdx.x;
+    int nt  = blockDim.x;
+
+    // Phase 1: load x and h into shared memory
+    for (int i = tid; i < D; i += nt) {
+        x_sh[i] = x[i];
+        h_sh[i] = h_prev[i];
+    }
+    __syncthreads();
+
+    // Phase 2: gates = W_ih @ x + W_hh @ h + b_ih + b_hh
+    int n_gates = 4 * D;
+    for (int g = tid; g < n_gates; g += nt) {
+        float sum = __half2float(bias[g]) + __half2float(bias[n_gates + g]);
+        const half* wih = W_ih + (long long)g * D;
+        const half* whh = W_hh + (long long)g * D;
+        for (int k = 0; k < D; k += 2) {
+            half2 wi = *(const half2*)(wih + k);
+            half2 wh = *(const half2*)(whh + k);
+            half2 xv = *(const half2*)(x_sh + k);
+            half2 hv = *(const half2*)(h_sh + k);
+            sum += __half2float(wi.x) * __half2float(xv.x)
+                 + __half2float(wi.y) * __half2float(xv.y);
+            sum += __half2float(wh.x) * __half2float(hv.x)
+                 + __half2float(wh.y) * __half2float(hv.y);
+        }
+        gates[g] = sum;
+    }
+    __syncthreads();
+
+    // Phase 3: LSTM cell (gate order: i, o, f, g — ONNX convention)
+    for (int i = tid; i < D; i += nt) {
+        float gi = gates[i];
+        float go = gates[D + i];
+        float gf = gates[2 * D + i];
+        float gg = gates[3 * D + i];
+
+        float i_gate = 1.0f / (1.0f + expf(-gi));
+        float o_gate = 1.0f / (1.0f + expf(-go));
+        float f_gate = 1.0f / (1.0f + expf(-gf));
+        float c_gate = tanhf(gg);
+
+        float c = f_gate * __half2float(c_prev[i]) + i_gate * c_gate;
+        float h = o_gate * tanhf(c);
+
+        c_out[i] = __float2half(c);
+        h_out[i] = __float2half(h);
+    }
+}
+
+void fused_lstm_fp16(const half* x, const half* h_prev, const half* c_prev,
+                     const half* W_ih, const half* W_hh, const half* bias,
+                     half* h_out, half* c_out, int D, cudaStream_t stream) {
+    size_t smem = D * sizeof(half) * 2 + 4 * D * sizeof(float);
+    fused_lstm_kernel<<<1, 256, smem, stream>>>(
+        x, h_prev, c_prev, W_ih, W_hh, bias, h_out, c_out, D);
+}
+
+// ---------------------------------------------------------------------------
+// Fused joint network: dec_proj + add + relu + out_proj in one kernel
+//   Phase 1: dec_proj[j] = W_dec_T[j,:] @ lstm_h + b_dec[j]
+//   Phase 2: joint_act[j] = relu(dec_proj[j] + enc_proj[j])
+//   Phase 3: out[j] = W_out_T[j,:] @ joint_act + b_out[j]
+//   Shared memory: lstm_h[D_pred] (half), joint_act[D_joint] (float)
+//   One block, 256 threads.
+// ---------------------------------------------------------------------------
+
+__global__ void fused_joint_kernel(
+        const half* __restrict__ lstm_h,
+        const half* __restrict__ enc_proj,
+        const half* __restrict__ dec_w_t,    // [D_joint, D_pred] transposed
+        const half* __restrict__ dec_b,      // [D_joint]
+        const half* __restrict__ out_w_t,    // [D_out, D_joint] transposed
+        const half* __restrict__ out_b,      // [D_out]
+        half* __restrict__ joint_out,
+        int D_pred, int D_joint, int D_out) {
+    extern __shared__ char smem[];
+    half*  h_sh      = (half*)smem;
+    float* joint_act = (float*)(h_sh + D_pred);
+
+    int tid = threadIdx.x;
+    int nt  = blockDim.x;
+
+    // Phase 1: load lstm_h into shared memory
+    for (int i = tid; i < D_pred; i += nt)
+        h_sh[i] = lstm_h[i];
+    __syncthreads();
+
+    // Phase 2: dec_proj + enc_proj + relu → joint_act (in shared memory)
+    for (int j = tid; j < D_joint; j += nt) {
+        float sum = __half2float(dec_b[j]);
+        const half* w_row = dec_w_t + (long long)j * D_pred;
+        for (int k = 0; k < D_pred; k += 2) {
+            half2 w = *(const half2*)(w_row + k);
+            half2 h = *(const half2*)(h_sh + k);
+            sum += __half2float(w.x) * __half2float(h.x)
+                 + __half2float(w.y) * __half2float(h.y);
+        }
+        sum += __half2float(enc_proj[j]);
+        joint_act[j] = fmaxf(sum, 0.0f);  // ReLU
+    }
+    __syncthreads();
+
+    // Phase 3: out_proj → joint_out
+    for (int j = tid; j < D_out; j += nt) {
+        float sum = __half2float(out_b[j]);
+        const half* w_row = out_w_t + (long long)j * D_joint;
+        for (int k = 0; k < D_joint; k += 2) {
+            half2 w = *(const half2*)(w_row + k);
+            sum += __half2float(w.x) * joint_act[k]
+                 + __half2float(w.y) * joint_act[k + 1];
+        }
+        joint_out[j] = __float2half(sum);
+    }
+}
+
+void fused_joint_fp16(const half* lstm_h, const half* enc_proj,
+                      const half* dec_w_t, const half* dec_b,
+                      const half* out_w_t, const half* out_b,
+                      half* joint_out,
+                      int D_pred, int D_joint, int D_out,
+                      cudaStream_t stream) {
+    size_t smem = D_pred * sizeof(half) + D_joint * sizeof(float);
+    fused_joint_kernel<<<1, 256, smem, stream>>>(
+        lstm_h, enc_proj, dec_w_t, dec_b, out_w_t, out_b,
+        joint_out, D_pred, D_joint, D_out);
 }
 
 // ---------------------------------------------------------------------------

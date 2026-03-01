@@ -680,35 +680,22 @@ private:
         int last_token = BLANK_ID;
         int t = 0, emitted = 0;
 
-        // Host buffer for joint output (FP16 → FP32 on CPU)
-        std::vector<half> joint_host(D_OUTPUT);
-        float logits[D_OUTPUT];
+        // Host buffer for argmax results (just 2 ints: token, step)
+        int argmax_host[2];
 
         while (t < enc_len) {
             half* joint_out = cuda_model.decode_step(t, last_token);
 
-            CUDA_CHECK(cudaMemcpyAsync(joint_host.data(), joint_out,
-                                        D_OUTPUT * sizeof(half),
+            // GPU argmax: finds token and step on device, transfers just 2 ints
+            dual_argmax_fp16(joint_out, cuda_model.argmax_out,
+                              VOCAB_SIZE, D_OUTPUT, stream);
+            CUDA_CHECK(cudaMemcpyAsync(argmax_host, cuda_model.argmax_out,
+                                        2 * sizeof(int),
                                         cudaMemcpyDeviceToHost, stream));
             CUDA_CHECK(cudaStreamSynchronize(stream));
 
-            // Convert FP16 → FP32
-            for (int i = 0; i < D_OUTPUT; i++)
-                logits[i] = __half2float(joint_host[i]);
-
-            // Token = argmax(logits[:vocab_size])
-            int token = 0;
-            float best = logits[0];
-            for (int i = 1; i < VOCAB_SIZE; i++)
-                if (logits[i] > best) { best = logits[i]; token = i; }
-
-            // Duration step = argmax(logits[vocab_size:])
-            int step = 0;
-            float best_dur = logits[VOCAB_SIZE];
-            for (int i = 1; i < D_OUTPUT - VOCAB_SIZE; i++)
-                if (logits[VOCAB_SIZE + i] > best_dur) {
-                    best_dur = logits[VOCAB_SIZE + i]; step = i;
-                }
+            int token = argmax_host[0];
+            int step = argmax_host[1];
 
             if (token != BLANK_ID) {
                 cuda_model.decoder_commit();
@@ -806,7 +793,10 @@ static void run_server(Pipeline& pipeline, const std::string& host, int port) {
 
         std::string body = "{\"text\":\"" + json_escape(text) +
             "\",\"audio_duration_s\":" + std::to_string(audio_dur) +
-            ",\"inference_time_s\":" + std::to_string(elapsed) + "}";
+            ",\"inference_time_s\":" + std::to_string(elapsed) +
+            ",\"mel_ms\":" + std::to_string(pipeline.last_mel_ms) +
+            ",\"enc_ms\":" + std::to_string(pipeline.last_enc_ms) +
+            ",\"dec_ms\":" + std::to_string(pipeline.last_dec_ms) + "}";
         res.set_content(body, "application/json");
     });
 
