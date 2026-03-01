@@ -454,9 +454,9 @@ The flow: CPU pre-emphasis and windowing → upload windowed frames to GPU → `
 
 Long-audio mel time: 42.9ms → 28.4ms (1.5x faster). Total RTFx: 918x → **836x** (on RTX 5070 Ti; original measurement was on different hardware).
 
-### Final Results
+### Results After Step 7
 
-Benchmarked on RTX 5070 Ti (compute 12.0):
+Benchmarked on RTX 5070 Ti (compute 12.0). Note: long-audio WER was not measured here — this was before the WER bug was discovered (see Step 14).
 
 ```
 C++ (parakeet.cpp):
@@ -809,3 +809,89 @@ Three changes to model init:
 **CUDA startup is now 40% faster than TRT** (238ms vs 392ms). TRT's 305ms is dominated by engine deserialization (rebuilding GPU kernel launch parameters from the 1.2GB serialized plan). CUDA's 135ms is weight mmap + single cudaMalloc + 72 strided copies + position encoding generation.
 
 Inference speed unchanged at ~600x RTFx. Link dependencies: `cudart`, `cublas`, `cublasLt`, `cufft` only. No TensorRT, no cuDNN.
+
+### Step 14: The TRT FP16 `encoded_lengths` Off-By-One Bug
+
+After adding a larger benchmark dataset with audio >30s, the TRT C++ backend showed **73.63% WER** on long audio — effectively garbage. Short audio (<30s) was fine. The CUDA backend and the Python ORT baseline both produced correct results (~2% WER) on the same files.
+
+#### The investigation
+
+This was the hardest bug to find because every obvious hypothesis was wrong.
+
+**Dead end 1: FP16 precision.** The initial theory was that FP16 LayerNorm or Softmax in the encoder caused numerical drift on longer sequences. We tried:
+
+- Full FP32 engine → correct (1.93% WER), but 2x larger and slower
+- `OBEY_PRECISION_CONSTRAINTS` forcing LayerNorm + Softmax to FP32 → still 73.63%
+- `OBEY_PRECISION_CONSTRAINTS` forcing all self-attention layers to FP32 → still 73.63%
+- Optimization level 3 (less aggressive fusion) → still 73.63%
+
+The engine sizes were identical (~1243 MB) regardless of how many layers were "forced" to FP32. **`OBEY_PRECISION_CONSTRAINTS` is silently broken in TRT 10.15** — the API is deprecated and has no effect. Every precision-based experiment told us nothing.
+
+**Dead end 2: ORT TRT EP uses CUDA EP fallback.** We thought ORT's Python wrapper worked because it fell back to CUDA EP (FP32) for numerically sensitive ops. We dumped the ORT graph partitioning and found: "All nodes placed on [TensorrtExecutionProvider]. Number of nodes: 1". No CUDA EP fallback at all — the entire encoder runs in TRT, same as our C++ code.
+
+**Dead end 3: Different engine quality.** We tried building an engine from ORT's preprocessed ONNX subgraph (2115 nodes vs 4491 in the original — constants folded, Casts removed). Same 73.63% WER. We even copied ORT's own cached TRT engine to use as our encoder.engine — same 73.63% WER. **The same TRT engine that works in Python ORT produced garbage in our C++ code.** This proved the engine was fine.
+
+**The breakthrough.** Since the engine was identical and encoder outputs were verified to be nearly identical (cosine similarity 0.9999), the bug had to be in how the C++ code *read* the encoder output. We compared `encoded_lengths` (the model's self-reported output length) against the actual tensor shape for different audio lengths:
+
+| Audio | Mel frames | `encoded_lengths` | Actual tensor T' | Mismatch? |
+|-------|-----------|-------------------|-------------------|-----------|
+| 3.5s  | 350       | 44                | 44                | No        |
+| 10.5s | 1050      | 132               | 132               | No        |
+| 54.6s | 5462      | **684**           | **683**           | **Yes (+1)** |
+| 89.0s | 8908      | **1115**          | **1114**          | **Yes (+1)** |
+
+For certain input lengths, the FP16 TRT engine's `encoded_lengths` output is **off by one** compared to the actual output tensor dimensions. Short audio is never affected.
+
+#### Why off-by-one is catastrophic
+
+The encoder output is stored in `[1, 1024, T']` layout — 1024 channels interleaved across T' time steps. To extract frame `t` for the decoder, the code uses `cudaMemcpy2D` with `enc_len` as the **source pitch** (byte stride between consecutive channels):
+
+```cpp
+cudaMemcpy2DAsync(
+    d_enc_frame.ptr, sizeof(float),           // dst: tightly packed
+    (char*)d_enc_out.ptr + t * sizeof(float),  // src: column t
+    enc_len * sizeof(float),                   // src pitch = T' floats
+    sizeof(float), 1024,                       // 1 float × 1024 rows
+    cudaMemcpyDeviceToDevice, stream);
+```
+
+If `enc_len` is 684 but the actual stride is 683, each successive row reads 1 float too far. By row 1023 (the last channel), the accumulated error is **1023 floats** — reading from a completely different frame. The extracted "frame" is a diagonal slice across many frames rather than a single column, producing nonsense decoder input.
+
+The CUDA backend (`conformer.cpp`) was unaffected because it stores encoder output in `[T, 1024]` layout (time-major). Frame extraction is just `x + t * 1024` — no pitch parameter, no dependence on `enc_len`.
+
+The Python ORT backend was unaffected because ORT reads the actual tensor dimensions from TRT's execution context, never trusting the model's `encoded_lengths` output.
+
+#### The fix
+
+Two lines changed. Instead of reading `encoded_lengths` from GPU memory, query the actual output tensor shape:
+
+```cpp
+// Before (buggy):
+int64_t enc_len = 0;
+cudaMemcpyAsync(&enc_len, d_enc_lens.ptr, sizeof(int64_t),
+                cudaMemcpyDeviceToHost, stream);
+cudaStreamSynchronize(stream);
+if (enc_len > max_enc) enc_len = max_enc;
+
+// After (fixed):
+encoder.enqueue(stream);
+cudaStreamSynchronize(stream);
+auto out_dims = encoder.context->getTensorShape("outputs");
+int64_t enc_len = out_dims.d[out_dims.nbDims - 1];  // actual T'
+```
+
+`getTensorShape` reads the dimensions that TRT's execution context actually allocated and wrote to — the ground truth for dynamic shape engines. The `encoded_lengths` model output is a computed value that goes through the FP16 arithmetic of the encoder and can have rounding errors.
+
+#### Results
+
+Long-audio WER dropped from **73.63%** to **1.94%** with full FP16 performance (no FP32 workaround needed):
+
+```
+Python  (ORT + TRT EP):   librispeech=1.81%  earnings22=16.48%  long=2.00%  difficult=39.36%  830x RTFx
+C++ TRT (parakeet.cpp):   librispeech=1.81%  earnings22=16.48%  long=1.94%  difficult=39.36%  862x RTFx
+C++ CUDA (cuBLAS):        librispeech=1.81%  earnings22=16.48%  long=1.92%  difficult=38.38%  707x RTFx
+```
+
+All three backends now agree on WER across all datasets. The TRT C++ backend is the fastest at 862x RTFx. The CUDA backend trades ~18% speed for eliminating the TRT dependency entirely.
+
+**Key lesson:** Never trust a model's self-reported output dimensions from a computed tensor. For TensorRT dynamic shape engines, always use `getTensorShape()` on the execution context to get actual tensor dimensions. The model's own length computation may have precision-dependent rounding behavior that doesn't match the engine's internal shape calculations.

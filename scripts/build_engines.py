@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Build TensorRT engines from ONNX models for parakeet-tdt-0.6b-v2."""
 
-import os
 from pathlib import Path
 
 import tensorrt as trt
@@ -18,7 +17,12 @@ def get_onnx_dir() -> Path:
     return Path(snapshot_download(REPO_ID))
 
 
-def build_engine(onnx_path: Path, profiles: list[dict], engine_path: Path) -> None:
+def build_engine(
+    onnx_path: Path,
+    profiles: list[dict],
+    engine_path: Path,
+    fp16: bool = True,
+) -> None:
     builder = trt.Builder(TRT_LOGGER)
     network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
     parser = trt.OnnxParser(network, TRT_LOGGER)
@@ -30,7 +34,8 @@ def build_engine(onnx_path: Path, profiles: list[dict], engine_path: Path) -> No
         raise RuntimeError(f"Failed to parse {onnx_path}")
 
     config = builder.create_builder_config()
-    config.set_flag(trt.BuilderFlag.FP16)
+    if fp16:
+        config.set_flag(trt.BuilderFlag.FP16)
     config.builder_optimization_level = 5
 
     for profile_spec in profiles:
@@ -52,7 +57,7 @@ def build_engine(onnx_path: Path, profiles: list[dict], engine_path: Path) -> No
 def main() -> None:
     onnx_dir = get_onnx_dir()
 
-    # Encoder: dynamic audio length
+    # Encoder: FP16. Supports up to ~120s audio (12000 mel frames).
     build_engine(
         onnx_dir / "encoder-model.onnx",
         profiles=[

@@ -11,23 +11,25 @@ CXXFLAGS = -std=c++17 -O3 -march=native -flto=auto -Wno-deprecated-declarations 
 NVFLAGS  = -std=c++17 -O3 -I$(CUDA_HOME)/include -Isrc --expt-relaxed-constexpr
 LDFLAGS  = -flto=auto -L$(CUDA_HOME)/lib64 -lcudart -lcufft -lcublas -lpthread $(TRT_LIBS)/libnvinfer.so.10 -Wl,-rpath,$(TRT_LIBS)
 
-.PHONY: run bench bench-cpp bench-cuda engines inspect-onnx weights clean
-
-run: src/parakeet-transcribe.py
-	arecord -f S16_LE -r 16000 -c 1 -t raw - | \
-	  ORT_LOG_LEVEL=3 uv run src/parakeet-transcribe.py --model $(PARAKEET_MODEL) --cuda
+.PHONY: bench-all bench-py bench-cpp bench-cuda engines inspect-onnx weights clean
 
 engines: engines/encoder.engine engines/decoder_joint.engine
 
 engines/encoder.engine engines/decoder_joint.engine: scripts/build_engines.py
 	uv run python scripts/build_engines.py
 
-bench: parakeet engines/encoder.engine engines/decoder_joint.engine
-	@echo "=== Python (onnx-asr + TRT EP) ==="
+BENCH_SEP = @printf '\n%s\n%s\n%s\n' '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━' '  $(1)'
+
+bench-all:
+	$(call BENCH_SEP,Python  ·  ONNX Runtime + TRT EP)
+	@uv run python tests/bench.py
+	$(call BENCH_SEP,C++ TRT ·  parakeet.cpp + TensorRT)
+	@uv run python tests/bench_cpp.py
+	$(call BENCH_SEP,C++ CUDA · parakeet_cuda.cpp + cuBLAS)
+	@uv run python tests/bench_cuda.py
+
+bench-py:
 	uv run python tests/bench.py
-	@echo ""
-	@echo "=== C++ (parakeet.cpp + TRT) ==="
-	uv run python tests/bench_cpp.py
 
 bench-cpp: parakeet engines/encoder.engine engines/decoder_joint.engine
 	uv run python tests/bench_cpp.py

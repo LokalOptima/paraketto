@@ -7,29 +7,16 @@ Usage:
     uv run python tests/bench.py
 """
 
-import json
 import sys
 import time
 from pathlib import Path
 
-from jiwer import Compose, ReduceToListOfListOfWords, RemovePunctuation, ToLowerCase, wer
+from jiwer import wer
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
-DATA_DIR = ROOT / "data"
-
-_normalize = Compose([ToLowerCase(), RemovePunctuation(), ReduceToListOfListOfWords()])
-
-DATASETS = ["librispeech", "earnings22", "long", "difficult"]
-
-
-def load_manifest(name: str) -> list[dict]:
-    manifest_path = DATA_DIR / name / "manifest.json"
-    manifest = json.loads(manifest_path.read_text())
-    for entry in manifest:
-        entry["audio_path"] = str(DATA_DIR / name / entry["audio_path"])
-    return manifest
+from bench_common import DATASETS, load_manifest, normalize, print_results
 
 
 def main():
@@ -40,6 +27,7 @@ def main():
     parakeet_trt.load_model()
     print(f"Model loaded in {time.monotonic() - t0:.1f}s\n")
 
+    rows = []
     for dataset in DATASETS:
         manifest = load_manifest(dataset)
         total_audio = sum(e["duration_s"] for e in manifest)
@@ -59,15 +47,17 @@ def main():
 
         wer_pct = wer(
             references, hypotheses,
-            reference_transform=_normalize,
-            hypothesis_transform=_normalize,
+            reference_transform=normalize,
+            hypothesis_transform=normalize,
         ) * 100
 
         rtfx = total_audio / total_inference if total_inference > 0 else 0
+        rows.append(dict(
+            name=dataset, wer=wer_pct, rtfx=rtfx,
+            utts=len(manifest), audio_s=total_audio, inference_s=total_inference,
+        ))
 
-        print(f"{dataset}: WER={wer_pct:.2f}% RTFx={rtfx:.0f}x "
-              f"({len(manifest)} utts, {total_audio:.0f}s audio)")
-
+    print_results(rows)
 
 
 if __name__ == "__main__":

@@ -869,10 +869,9 @@ static void run_server(Pipeline& pipeline, const std::string& host, int port) {
                  audio_dur, elapsed * 1000, audio_dur / elapsed, preview.c_str());
         t_log_detail = detail;
 
-        char body[4096];
-        snprintf(body, sizeof(body),
-                 "{\"text\":\"%s\",\"audio_duration_s\":%.2f,\"inference_time_s\":%.4f}",
-                 json_escape(text).c_str(), audio_dur, elapsed);
+        std::string body = "{\"text\":\"" + json_escape(text) +
+            "\",\"audio_duration_s\":" + std::to_string(audio_dur) +
+            ",\"inference_time_s\":" + std::to_string(elapsed) + "}";
         res.set_content(body, "application/json");
     });
 

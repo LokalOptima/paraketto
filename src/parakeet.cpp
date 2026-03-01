@@ -828,12 +828,12 @@ struct Pipeline {
         encoder.bind("encoded_lengths", d_enc_lens.ptr);
 
         encoder.enqueue(stream);
-
-        int64_t enc_len = 0;
-        CUDA_CHECK(cudaMemcpyAsync(&enc_len, d_enc_lens.ptr,
-                                    sizeof(int64_t), cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
-        if (enc_len > max_enc) enc_len = max_enc;
+
+        // Get actual output length from tensor shape (not encoded_lengths,
+        // which can be off-by-one in FP16 engines for certain input lengths).
+        auto out_dims = encoder.context->getTensorShape("outputs");
+        int64_t enc_len = out_dims.d[out_dims.nbDims - 1];  // last dim = T'
 
         auto t_enc = std::chrono::high_resolution_clock::now();
 
@@ -1003,10 +1003,9 @@ static void run_server(Pipeline& pipeline, const std::string& host, int port) {
                  audio_dur, elapsed * 1000, audio_dur / elapsed, preview.c_str());
         t_log_detail = detail;
 
-        char body[4096];
-        snprintf(body, sizeof(body),
-                 "{\"text\":\"%s\",\"audio_duration_s\":%.2f,\"inference_time_s\":%.4f}",
-                 json_escape(text).c_str(), audio_dur, elapsed);
+        std::string body = "{\"text\":\"" + json_escape(text) +
+            "\",\"audio_duration_s\":" + std::to_string(audio_dur) +
+            ",\"inference_time_s\":" + std::to_string(elapsed) + "}";
         res.set_content(body, "application/json");
     });
 

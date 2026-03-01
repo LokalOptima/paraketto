@@ -10,5 +10,8 @@ dependencies = [
     "tensorrt-cu12",
     "jiwer",
     "requests",
+    "onnx",
+    "datasets>=4.6.1",
+    "torchcodec>=0.10.0",
 ]
 

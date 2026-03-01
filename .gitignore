@@ -33,3 +33,6 @@ parakeet
 
 # TRT engines (GPU-specific, not portable)
 engines/
+
+# Downloaded dataset tarballs (re-downloadable via scripts/download_bench_data.py)
+data/*.tar.gz

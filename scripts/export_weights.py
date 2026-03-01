@@ -17,12 +17,12 @@ Header text format (one line per tensor):
 """
 
 import struct
+import subprocess
 import sys
 from pathlib import Path
 
 import numpy as np
 import onnx
-from huggingface_hub import snapshot_download
 
 REPO_ID = "istupakov/parakeet-tdt-0.6b-v2-onnx"
 MAGIC = b"PRKT"
@@ -165,7 +165,11 @@ def extract_tensors(onnx_path: Path, prefix: str) -> dict[str, np.ndarray]:
 def export_weights(output_path: Path) -> dict[str, np.ndarray]:
     """Export all ONNX weights to a flat binary file. Returns the tensor dict for verification."""
     print("Downloading ONNX models...")
-    onnx_dir = Path(snapshot_download(REPO_ID))
+    result = subprocess.run(
+        ["uvx", "hf", "download", REPO_ID],
+        capture_output=True, text=True, check=True,
+    )
+    onnx_dir = Path(result.stdout.strip())
     print(f"ONNX dir: {onnx_dir}")
 
     # Extract tensors from both FP32 models
