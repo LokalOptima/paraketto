@@ -20,7 +20,7 @@ engines/encoder.engine engines/decoder_joint.engine: scripts/build_engines.py
 
 BENCH_SEP = @printf '\n%s\n%s\n%s\n' '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━' '  $(1)'
 
-bench-all:
+bench-all: parakeet engines/encoder.engine engines/decoder_joint.engine parakeet.cuda
 	$(call BENCH_SEP,Python  ·  ONNX Runtime + TRT EP)
 	@uv run python tests/bench.py
 	$(call BENCH_SEP,C++ TRT ·  parakeet.cpp + TensorRT)
