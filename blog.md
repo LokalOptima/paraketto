@@ -895,3 +895,90 @@ C++ CUDA (cuBLAS):        librispeech=1.81%  earnings22=16.48%  long=1.92%  diff
 All three backends now agree on WER across all datasets. The TRT C++ backend is the fastest at 862x RTFx. The CUDA backend trades ~18% speed for eliminating the TRT dependency entirely.
 
 **Key lesson:** Never trust a model's self-reported output dimensions from a computed tensor. For TensorRT dynamic shape engines, always use `getTensorShape()` on the execution context to get actual tensor dimensions. The model's own length computation may have precision-dependent rounding behavior that doesn't match the engine's internal shape calculations.
+
+### Step 15: Fused GPU Mel Pipeline + GEMM Bias Epilogue
+
+#### The hidden bottleneck
+
+Both backends (TRT and CUDA) shared the same mel spectrogram pipeline: CPU pre-emphasis + windowing → GPU FFT → **GPU→CPU download** → CPU mel filterbank → CPU log → CPU normalize → **CPU→GPU upload** → encoder. The assumption was that mel computation was a small fixed cost. It wasn't.
+
+The real cost wasn't the CPU compute — it was the **GPU pipeline stalls**. After the FFT, the GPU sat idle waiting for `cudaMemcpy D2H` to complete, then waited for the CPU to churn through mel filterbank + log + normalize (iterating over thousands of frames × 128 channels with strided access), then waited for the `cudaMemcpy H2D` upload to finish before the encoder could start. Five synchronization barriers creating a bubble where the GPU did nothing.
+
+#### Fused mel kernels
+
+Two new CUDA kernels eliminate all CPU mel processing:
+
+**`fft512_mel_log`** — One block per frame, 256 threads. Fuses the entire FFT → power spectrum → mel filterbank → log pipeline in shared memory:
+
+1. Bit-reversal load + 9 butterfly stages (same as existing `fft512_power_kernel`)
+2. Power spectrum computed in-place in shared memory (`sr[0..256]`)
+3. Sparse mel filterbank via `atomicAdd` in shared memory — 504 filterbank entries stored in `__constant__` memory (~4KB), each thread handles ~2 entries, scatters weighted power to mel accumulator bins (`si[0..127]`)
+4. `logf(mel + eps)` written to output
+
+Total shared memory: 4KB (reusing the FFT's existing `sr[512] + si[512]`). The filterbank scatter has minimal contention — each mel bin receives ~4 atomic adds.
+
+**`mel_normalize`** — One block per mel channel (128 blocks), up to 1024 threads. Three-pass kernel:
+
+1. Parallel reduction for mean across `n_valid` frames
+2. Parallel reduction for variance (two-pass for numerical stability, Bessel correction with `n-1`)
+3. Normalize and write transposed: `mel_out[ch * T + f] = (x - mean) / std`
+
+Output writes directly to the encoder's GPU input buffer — zero intermediate copies.
+
+#### New mel pipeline
+
+```
+Before (6 GPU↔CPU transitions):
+  CPU: pre-emphasis + window → upload frames
+  GPU: FFT → download power spectrum
+  CPU: mel filterbank (504 sparse weights) → CPU
+  CPU: log → CPU
+  CPU: per-channel normalize + transpose → upload to encoder
+
+After (1 upload, 0 downloads):
+  CPU: pre-emphasis + window → upload frames [n_frames, 512]
+  GPU: fft512_mel_log → [n_frames, 128] log-mel on GPU
+  GPU: mel_normalize  → [128, n_valid] normalized features on GPU
+       (already on GPU, feed directly to encoder)
+```
+
+#### cublasLt GEMM bias epilogue
+
+Separate optimization for the encoder: the subsampling output layer does `GEMM([T, 4096] × [4096, 1024])` followed by `bias_add_inplace_fp16` — a separate kernel that reads and writes the entire `[T, 1024]` output just to add a bias vector. cublasLt's `CUBLASLT_EPILOGUE_BIAS` folds the bias addition into the GEMM's epilogue, eliminating one kernel launch and one full T×D read+write.
+
+Added `has_bias` to the GEMM plan cache key, set `CUBLASLT_MATMUL_DESC_EPILOGUE` + `CUBLASLT_MATMUL_DESC_BIAS_POINTER` on the matmul descriptor. New `gemm_nn_bias()` wrapper for the fused path.
+
+#### Dropped libcufft
+
+Both backends now use the custom 512-point FFT kernel exclusively. The TRT backend no longer links against `libcufft` — one fewer ~200MB dependency.
+
+#### Results
+
+| Backend | Before | After | Improvement |
+|---------|--------|-------|-------------|
+| C++ TRT (parakeet.cpp) | 858x | **1118x** | **+30%** |
+| C++ CUDA (parakeet_cuda.cpp) | 750x | **881x** | **+17%** |
+
+Per-dataset breakdown (C++ TRT):
+
+| Dataset | WER | RTFx |
+|---------|-----|------|
+| librispeech | 1.68% | 989x |
+| earnings22 | 16.48% | 816x |
+| long | 1.93% | 1166x |
+| difficult | 23.32% | 1081x |
+
+Per-dataset breakdown (C++ CUDA):
+
+| Dataset | WER | RTFx |
+|---------|-----|------|
+| librispeech | 1.68% | 810x |
+| earnings22 | 16.48% | 731x |
+| long | 1.92% | 901x |
+| difficult | 23.24% | 890x |
+
+WER is identical across all 240 utterances — zero numerical regression.
+
+The TRT backend benefits more (+30% vs +17%) because TensorRT's Myelin compiler already optimizes the encoder heavily, making the mel stall a proportionally larger fraction of total time. With mel fused on GPU, TRT's encoder advantage shines through without the preprocessing bottleneck dragging it down.
+
+**The CUDA backend now matches TRT** (881x vs pre-fusion TRT 858x). The TRT backend with fused mel pulls ahead to 1118x — the fastest result we've seen, and **2.1x faster than the original Python ORT+TRT baseline** (529x).

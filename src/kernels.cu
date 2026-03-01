@@ -5,6 +5,20 @@
 
 #include "kernels.h"
 #include <cfloat>
+#include <cstdio>
+#include <cstdlib>
+
+#ifndef CUDA_CHECK
+#define CUDA_CHECK(call)                                                       \
+    do {                                                                        \
+        cudaError_t err = (call);                                              \
+        if (err != cudaSuccess) {                                              \
+            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__,   \
+                    cudaGetErrorString(err));                                   \
+            std::exit(1);                                                      \
+        }                                                                      \
+    } while (0)
+#endif
 
 // ---------------------------------------------------------------------------
 // LayerNorm
@@ -1195,5 +1209,175 @@ __global__ void fft512_power_kernel(const float* __restrict__ frames,
 void fft512_power(const float* frames, float* power, int n_frames,
                   cudaStream_t stream) {
     fft512_power_kernel<<<n_frames, 256, 0, stream>>>(frames, power, n_frames);
+}
+
+// ---------------------------------------------------------------------------
+// Fused FFT + mel filterbank + log
+// One block per frame, 256 threads. Fuses FFT → power → sparse mel → log
+// in shared memory, eliminating GPU↔CPU roundtrips.
+// ---------------------------------------------------------------------------
+
+static constexpr int N_MEL_FB_ENTRIES = 504;
+
+__constant__ MelFBEntry c_mel_fb[N_MEL_FB_ENTRIES];
+
+void mel_init_filterbank(const MelFBEntry* entries, int count) {
+    CUDA_CHECK(cudaMemcpyToSymbol(c_mel_fb, entries, count * sizeof(MelFBEntry)));
+}
+
+__global__ void fft512_mel_log_kernel(const float* __restrict__ frames,
+                                       float* __restrict__ mel_out,
+                                       int n_frames) {
+    int frame = blockIdx.x;
+    if (frame >= n_frames) return;
+
+    __shared__ float sr[512], si[512];
+    int tid = threadIdx.x;  // 0..255
+
+    // 1. Bit-reversal load (identical to fft512_power_kernel)
+    const float* in = frames + frame * 512;
+    int i0 = tid, i1 = tid + 256;
+    int br0 = __brev(i0) >> 23;  // 9-bit reversal
+    int br1 = __brev(i1) >> 23;
+    sr[br0] = in[i0];  si[br0] = 0.0f;
+    sr[br1] = in[i1];  si[br1] = 0.0f;
+    __syncthreads();
+
+    // 2. 9 butterfly stages (identical to fft512_power_kernel)
+    for (int s = 0; s < 9; s++) {
+        int size = 1 << (s + 1);
+        int half_size = size >> 1;
+        int group = tid / half_size;
+        int k = tid % half_size;
+        int a = group * size + k;
+        int b = a + half_size;
+
+        float angle = -6.283185307179586f * k / size;
+        float wr, wi;
+        __sincosf(angle, &wi, &wr);
+
+        float tr = wr * sr[b] - wi * si[b];
+        float ti = wr * si[b] + wi * sr[b];
+        float ar = sr[a], ai = si[a];
+
+        sr[a] = ar + tr;  si[a] = ai + ti;
+        sr[b] = ar - tr;  si[b] = ai - ti;
+        __syncthreads();
+    }
+
+    // 3. Power spectrum → sr[0..256]
+    float power_tid = sr[tid] * sr[tid] + si[tid] * si[tid];
+    float power_256 = 0.0f;
+    if (tid == 0) power_256 = sr[256] * sr[256] + si[256] * si[256];
+    __syncthreads();
+
+    sr[tid] = power_tid;
+    if (tid == 0) sr[256] = power_256;
+    __syncthreads();
+
+    // 4. Mel filterbank: scatter with atomicAdd in shared memory
+    // Reuse si[0..127] as mel accumulators
+    if (tid < 128) si[tid] = 0.0f;
+    __syncthreads();
+
+    // Each thread handles ~2 filterbank entries (504 / 256 ≈ 2)
+    int fb_start = tid * N_MEL_FB_ENTRIES / 256;
+    int fb_end = (tid + 1) * N_MEL_FB_ENTRIES / 256;
+    for (int i = fb_start; i < fb_end; i++) {
+        MelFBEntry e = c_mel_fb[i];
+        atomicAdd(&si[e.mel], sr[e.freq] * e.weight);
+    }
+    __syncthreads();
+
+    // 5. Log + write output
+    if (tid < 128) {
+        mel_out[frame * 128 + tid] = logf(si[tid] + 5.9604645e-08f);
+    }
+}
+
+void fft512_mel_log(const float* frames, float* mel_out, int n_frames,
+                    cudaStream_t stream) {
+    fft512_mel_log_kernel<<<n_frames, 256, 0, stream>>>(frames, mel_out, n_frames);
+}
+
+// ---------------------------------------------------------------------------
+// Per-channel mel normalize + transpose
+// One block per mel channel (128 blocks). Two-pass: compute mean/var, then
+// normalize and write transposed [128, n_valid].
+// ---------------------------------------------------------------------------
+
+__global__ void mel_normalize_kernel(const float* __restrict__ mel_in,
+                                      float* __restrict__ mel_out,
+                                      int n_frames, int n_valid) {
+    int ch = blockIdx.x;  // 0..127
+    if (ch >= 128) return;
+
+    int T = n_valid;
+
+    // --- Pass 1: compute mean ---
+    float sum = 0.0f;
+    for (int f = threadIdx.x; f < T; f += blockDim.x)
+        sum += mel_in[f * 128 + ch];
+
+    // Warp reduction
+    for (int mask = 16; mask > 0; mask >>= 1)
+        sum += __shfl_xor_sync(0xffffffff, sum, mask);
+
+    // Block reduction
+    __shared__ float s_buf[32];
+    int warp_id = threadIdx.x / 32;
+    int lane = threadIdx.x % 32;
+    if (lane == 0) s_buf[warp_id] = sum;
+    __syncthreads();
+
+    if (warp_id == 0) {
+        int nwarps = (blockDim.x + 31) / 32;
+        sum = (lane < nwarps) ? s_buf[lane] : 0.0f;
+        for (int mask = 16; mask > 0; mask >>= 1)
+            sum += __shfl_xor_sync(0xffffffff, sum, mask);
+    }
+
+    __shared__ float s_mean, s_inv_std;
+    if (threadIdx.x == 0) s_mean = sum / T;
+    __syncthreads();
+    float mean = s_mean;
+
+    // --- Pass 2: compute variance ---
+    float sq = 0.0f;
+    for (int f = threadIdx.x; f < T; f += blockDim.x) {
+        float d = mel_in[f * 128 + ch] - mean;
+        sq += d * d;
+    }
+
+    for (int mask = 16; mask > 0; mask >>= 1)
+        sq += __shfl_xor_sync(0xffffffff, sq, mask);
+
+    if (lane == 0) s_buf[warp_id] = sq;
+    __syncthreads();
+
+    if (warp_id == 0) {
+        int nwarps = (blockDim.x + 31) / 32;
+        sq = (lane < nwarps) ? s_buf[lane] : 0.0f;
+        for (int mask = 16; mask > 0; mask >>= 1)
+            sq += __shfl_xor_sync(0xffffffff, sq, mask);
+    }
+
+    if (threadIdx.x == 0) {
+        float std_val = sqrtf(sq / (T > 1 ? T - 1 : 1)) + 1e-05f;
+        s_inv_std = 1.0f / std_val;
+    }
+    __syncthreads();
+    float inv_std = s_inv_std;
+
+    // --- Pass 3: normalize + write transposed ---
+    for (int f = threadIdx.x; f < T; f += blockDim.x)
+        mel_out[ch * T + f] = (mel_in[f * 128 + ch] - mean) * inv_std;
+}
+
+void mel_normalize(const float* mel_in, float* mel_out,
+                   int n_frames, int n_valid, cudaStream_t stream) {
+    int threads = n_valid < 1024 ? ((n_valid + 31) / 32 * 32) : 1024;
+    if (threads < 32) threads = 32;
+    mel_normalize_kernel<<<128, threads, 0, stream>>>(mel_in, mel_out, n_frames, n_valid);
 }
 

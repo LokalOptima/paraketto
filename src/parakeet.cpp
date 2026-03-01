@@ -27,8 +27,8 @@
 #include <unistd.h>
 
 #include <cuda_runtime.h>
-#include <cufft.h>
 #include "NvInfer.h"
+#include "kernels.h"
 #include "cpp-httplib/httplib.h"
 
 // ---------------------------------------------------------------------------
@@ -239,7 +239,7 @@ static WavData read_wav_from_memory(const char* buf, size_t len) {
 // Extracted from .venv/.../onnx_asr/preprocessors/nemo128.onnx (mel_filterbank node).
 
 static constexpr int N_MEL_ENTRIES = 504;
-static const struct { uint16_t freq, mel; float weight; } MEL_FILTERBANK[] = {
+static const MelFBEntry MEL_FILTERBANK[] = {
     {1,0,2.83775423e-02f},{1,1,1.43890111e-02f},{2,1,1.39885303e-02f},{2,2,2.87780222e-02f},
     {3,3,4.23660800e-02f},{3,4,4.00479796e-04f},{4,4,2.79770531e-02f},{4,5,1.47894993e-02f},
     {5,5,1.35880429e-02f},{5,6,2.91785114e-02f},{6,7,4.19655927e-02f},{6,8,8.00959882e-04f},
@@ -498,76 +498,50 @@ static const float HANN_WINDOW[N_FFT] = {
 };
 
 struct MelSpec {
-    // Sparse mel filterbank: for each freq bin k, list of (mel_bin, weight) pairs
-    struct MelEntry { int mel_bin; float weight; };
-    std::vector<std::vector<MelEntry>> sparse_fb;  // [N_FREQ]
-
-    // cuFFT plan (cached for a given batch size)
-    cufftHandle fft_plan = 0;
-    int fft_plan_batch = 0;
-    // GPU buffers for cuFFT (reused across calls, grow-only)
-    float* d_frames = nullptr;            // [n_frames, N_FFT] real input
-    cufftComplex* d_fft_out = nullptr;    // [n_frames, N_FREQ] complex output
-    size_t frames_cap = 0, fft_cap = 0;
+    // GPU buffers (reused across calls, grow-only)
+    float* d_frames = nullptr;   // [n_frames, N_FFT]
+    float* d_mel = nullptr;      // [n_frames, N_MELS]
+    size_t frames_cap = 0, mel_cap = 0;
 
     void init() {
-        sparse_fb.resize(N_FREQ);
-        for (int i = 0; i < N_MEL_ENTRIES; i++)
-            sparse_fb[MEL_FILTERBANK[i].freq].push_back(
-                {MEL_FILTERBANK[i].mel, MEL_FILTERBANK[i].weight});
+        mel_init_filterbank(MEL_FILTERBANK, N_MEL_ENTRIES);
     }
 
     ~MelSpec() {
-        if (fft_plan) cufftDestroy(fft_plan);
         if (d_frames) cudaFree(d_frames);
-        if (d_fft_out) cudaFree(d_fft_out);
+        if (d_mel) cudaFree(d_mel);
     }
 
-    // Ensure cuFFT plan and GPU buffers are large enough for n_frames
-    void ensure_fft(int n_frames) {
+    void ensure_buffers(int n_frames) {
         size_t need_frames = (size_t)n_frames * N_FFT * sizeof(float);
         if (need_frames > frames_cap) {
             if (d_frames) cudaFree(d_frames);
             CUDA_CHECK(cudaMalloc(&d_frames, need_frames));
             frames_cap = need_frames;
         }
-        size_t need_fft = (size_t)n_frames * N_FREQ * sizeof(cufftComplex);
-        if (need_fft > fft_cap) {
-            if (d_fft_out) cudaFree(d_fft_out);
-            CUDA_CHECK(cudaMalloc(&d_fft_out, need_fft));
-            fft_cap = need_fft;
-        }
-        if (n_frames != fft_plan_batch) {
-            if (fft_plan) cufftDestroy(fft_plan);
-            int n[] = {N_FFT};
-            cufftResult rc = cufftPlanMany(&fft_plan, 1, n,
-                n, 1, N_FFT,    // inembed, istride, idist
-                n, 1, N_FREQ,   // onembed, ostride, odist
-                CUFFT_R2C, n_frames);
-            if (rc != CUFFT_SUCCESS) {
-                fprintf(stderr, "cuFFT plan failed: %d\n", rc); std::exit(1);
-            }
-            fft_plan_batch = n_frames;
+        size_t need_mel = (size_t)n_frames * N_MELS * sizeof(float);
+        if (need_mel > mel_cap) {
+            if (d_mel) cudaFree(d_mel);
+            CUDA_CHECK(cudaMalloc(&d_mel, need_mel));
+            mel_cap = need_mel;
         }
     }
 
-    // Compute mel spectrogram features. Output: [N_MELS, n_valid] (channel-first)
+    // Compute mel spectrogram entirely on GPU.
+    // Writes normalized, transposed [128, n_valid] float32 to d_mel_out (GPU).
     void compute(const float* audio, int num_samples,
-                 std::vector<float>& features, int& n_frames, int& n_valid) {
-        // 1. Pre-emphasis
+                 float* d_mel_out, int& n_frames, int& n_valid,
+                 cudaStream_t stream) {
         std::vector<float> preemph(num_samples);
         preemph[0] = audio[0];
         for (int i = 1; i < num_samples; i++)
             preemph[i] = audio[i] - PREEMPH * audio[i - 1];
 
-        // 2. Frame count
         int pad = N_FFT / 2;
         int padded_len = num_samples + 2 * pad;
         n_frames = (padded_len - N_FFT) / HOP + 1;
         n_valid = num_samples / HOP;
 
-        // 3. Extract windowed frames into contiguous buffer (CPU)
-        //    frames[f][i] = padded[f*HOP + i] * HANN_WINDOW[i], with zero-padding
         std::vector<float> frames(n_frames * N_FFT, 0.0f);
         for (int f = 0; f < n_frames; f++) {
             float* row = frames.data() + f * N_FFT;
@@ -578,59 +552,13 @@ struct MelSpec {
             }
         }
 
-        // 4. Batched R2C FFT on GPU via cuFFT
-        ensure_fft(n_frames);
-        CUDA_CHECK(cudaMemcpy(d_frames, frames.data(),
-                               n_frames * N_FFT * sizeof(float),
-                               cudaMemcpyHostToDevice));
-        cufftResult rc = cufftExecR2C(fft_plan, d_frames, d_fft_out);
-        if (rc != CUFFT_SUCCESS) {
-            fprintf(stderr, "cuFFT exec failed: %d\n", rc); std::exit(1);
-        }
-        // Download complex output
-        std::vector<cufftComplex> fft_out(n_frames * N_FREQ);
-        CUDA_CHECK(cudaMemcpy(fft_out.data(), d_fft_out,
-                               n_frames * N_FREQ * sizeof(cufftComplex),
-                               cudaMemcpyDeviceToHost));
-
-        // 5. Power spectrum (CPU)
-        std::vector<float> power(n_frames * N_FREQ);
-        for (int i = 0; i < n_frames * N_FREQ; i++)
-            power[i] = fft_out[i].x * fft_out[i].x + fft_out[i].y * fft_out[i].y;
-
-        // 6. Sparse mel filterbank: power [n_frames, 257] → mel [n_frames, 128]
-        std::vector<float> mel(n_frames * N_MELS, 0.0f);
-        for (int f = 0; f < n_frames; f++) {
-            float* mel_row = mel.data() + f * N_MELS;
-            const float* pow_row = power.data() + f * N_FREQ;
-            for (int k = 0; k < N_FREQ; k++) {
-                float p = pow_row[k];
-                for (auto& e : sparse_fb[k])
-                    mel_row[e.mel_bin] += p * e.weight;
-            }
-        }
-
-        // 7. Log
-        for (auto& v : mel) v = logf(v + LOG_EPS);
-
-        // 8. Transpose to [128, n_valid] and normalize per channel
-        features.resize(N_MELS * n_valid);
-        for (int m = 0; m < N_MELS; m++) {
-            double sum = 0;
-            for (int f = 0; f < n_valid; f++)
-                sum += mel[f * N_MELS + m];
-            float mean = (float)(sum / n_valid);
-
-            double sq_sum = 0;
-            for (int f = 0; f < n_valid; f++) {
-                float d = mel[f * N_MELS + m] - mean;
-                sq_sum += d * d;
-            }
-            float std_val = sqrtf((float)(sq_sum / (n_valid - 1))) + NORM_EPS;
-
-            for (int f = 0; f < n_valid; f++)
-                features[m * n_valid + f] = (mel[f * N_MELS + m] - mean) / std_val;
-        }
+        // Upload windowed frames → fused FFT+mel+log → normalize+transpose
+        ensure_buffers(n_frames);
+        CUDA_CHECK(cudaMemcpyAsync(d_frames, frames.data(),
+                                    n_frames * N_FFT * sizeof(float),
+                                    cudaMemcpyHostToDevice, stream));
+        fft512_mel_log(d_frames, d_mel, n_frames, stream);
+        mel_normalize(d_mel, d_mel_out, n_frames, n_valid, stream);
     }
 };
 
@@ -771,7 +699,6 @@ struct Pipeline {
         auto t_eng = clk::now();
 
         mel.init();
-        mel.ensure_fft(1000);  // Pre-create cuFFT plan for ~10s audio
         CUDA_CHECK(cudaStreamCreate(&stream));
         auto t_mel = clk::now();
 
@@ -800,18 +727,15 @@ struct Pipeline {
     std::string transcribe(const float* samples, int num_samples) {
         auto t_start = std::chrono::high_resolution_clock::now();
 
-        // --- 1. Mel spectrogram (CPU) ---
-        std::vector<float> features;
+        // --- 1. Mel spectrogram (fused GPU pipeline) ---
         int n_frames, n_valid;
-        mel.compute(samples, num_samples, features, n_frames, n_valid);
+        d_features.resize(N_MELS * 12000 * sizeof(float));  // pre-size for max frames
+        mel.compute(samples, num_samples, (float*)d_features.ptr, n_frames, n_valid, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
 
         auto t_mel = std::chrono::high_resolution_clock::now();
 
-        // --- 2. Encoder (GPU) ---
-        d_features.resize(N_MELS * n_valid * sizeof(float));
-        CUDA_CHECK(cudaMemcpyAsync(d_features.ptr, features.data(),
-                                    N_MELS * n_valid * sizeof(float),
-                                    cudaMemcpyHostToDevice, stream));
+        // --- 2. Encoder (GPU, mel already on device) ---
 
         int64_t mel_len = n_valid;
         CUDA_CHECK(cudaMemcpyAsync(d_length.ptr, &mel_len,

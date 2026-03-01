@@ -188,7 +188,7 @@ static WavData read_wav_from_memory(const char* buf, size_t len) {
 // ---------------------------------------------------------------------------
 
 static constexpr int N_MEL_ENTRIES = 504;
-static const struct { uint16_t freq, mel; float weight; } MEL_FILTERBANK[] = {
+static const MelFBEntry MEL_FILTERBANK[] = {
     {1,0,2.83775423e-02f},{1,1,1.43890111e-02f},{2,1,1.39885303e-02f},{2,2,2.87780222e-02f},
     {3,3,4.23660800e-02f},{3,4,4.00479796e-04f},{4,4,2.79770531e-02f},{4,5,1.47894993e-02f},
     {5,5,1.35880429e-02f},{5,6,2.91785114e-02f},{6,7,4.19655927e-02f},{6,8,8.00959882e-04f},
@@ -446,24 +446,18 @@ static const float HANN_WINDOW[N_FFT] = {
 };
 
 struct MelSpec {
-    struct MelEntry { int mel_bin; float weight; };
-    std::vector<std::vector<MelEntry>> sparse_fb;  // [N_FREQ]
-
-    // GPU buffers for FFT (reused across calls, grow-only)
+    // GPU buffers (reused across calls, grow-only)
     float* d_frames = nullptr;   // [n_frames, N_FFT]
-    float* d_power = nullptr;    // [n_frames, N_FREQ]
-    size_t frames_cap = 0, power_cap = 0;
+    float* d_mel = nullptr;      // [n_frames, N_MELS]
+    size_t frames_cap = 0, mel_cap = 0;
 
     void init() {
-        sparse_fb.resize(N_FREQ);
-        for (int i = 0; i < N_MEL_ENTRIES; i++)
-            sparse_fb[MEL_FILTERBANK[i].freq].push_back(
-                {MEL_FILTERBANK[i].mel, MEL_FILTERBANK[i].weight});
+        mel_init_filterbank(MEL_FILTERBANK, N_MEL_ENTRIES);
     }
 
     ~MelSpec() {
         if (d_frames) cudaFree(d_frames);
-        if (d_power) cudaFree(d_power);
+        if (d_mel) cudaFree(d_mel);
     }
 
     void ensure_buffers(int n_frames) {
@@ -473,16 +467,19 @@ struct MelSpec {
             CUDA_CHECK(cudaMalloc(&d_frames, need_frames));
             frames_cap = need_frames;
         }
-        size_t need_power = (size_t)n_frames * N_FREQ * sizeof(float);
-        if (need_power > power_cap) {
-            if (d_power) cudaFree(d_power);
-            CUDA_CHECK(cudaMalloc(&d_power, need_power));
-            power_cap = need_power;
+        size_t need_mel = (size_t)n_frames * N_MELS * sizeof(float);
+        if (need_mel > mel_cap) {
+            if (d_mel) cudaFree(d_mel);
+            CUDA_CHECK(cudaMalloc(&d_mel, need_mel));
+            mel_cap = need_mel;
         }
     }
 
+    // Compute mel spectrogram entirely on GPU.
+    // Writes normalized, transposed [128, n_valid] float32 to d_mel_out (GPU).
     void compute(const float* audio, int num_samples,
-                 std::vector<float>& features, int& n_frames, int& n_valid) {
+                 float* d_mel_out, int& n_frames, int& n_valid,
+                 cudaStream_t stream) {
         std::vector<float> preemph(num_samples);
         preemph[0] = audio[0];
         for (int i = 1; i < num_samples; i++)
@@ -503,47 +500,13 @@ struct MelSpec {
             }
         }
 
-        // Batched FFT → power spectrum on GPU
+        // Upload windowed frames → fused FFT+mel+log → normalize+transpose
         ensure_buffers(n_frames);
-        CUDA_CHECK(cudaMemcpy(d_frames, frames.data(),
-                               n_frames * N_FFT * sizeof(float),
-                               cudaMemcpyHostToDevice));
-        fft512_power(d_frames, d_power, n_frames, nullptr);
-        std::vector<float> power(n_frames * N_FREQ);
-        CUDA_CHECK(cudaMemcpy(power.data(), d_power,
-                               n_frames * N_FREQ * sizeof(float),
-                               cudaMemcpyDeviceToHost));
-
-        std::vector<float> mel(n_frames * N_MELS, 0.0f);
-        for (int f = 0; f < n_frames; f++) {
-            float* mel_row = mel.data() + f * N_MELS;
-            const float* pow_row = power.data() + f * N_FREQ;
-            for (int k = 0; k < N_FREQ; k++) {
-                float p = pow_row[k];
-                for (auto& e : sparse_fb[k])
-                    mel_row[e.mel_bin] += p * e.weight;
-            }
-        }
-
-        for (auto& v : mel) v = logf(v + LOG_EPS);
-
-        features.resize(N_MELS * n_valid);
-        for (int m = 0; m < N_MELS; m++) {
-            double sum = 0;
-            for (int f = 0; f < n_valid; f++)
-                sum += mel[f * N_MELS + m];
-            float mean = (float)(sum / n_valid);
-
-            double sq_sum = 0;
-            for (int f = 0; f < n_valid; f++) {
-                float d = mel[f * N_MELS + m] - mean;
-                sq_sum += d * d;
-            }
-            float std_val = sqrtf((float)(sq_sum / (n_valid - 1))) + NORM_EPS;
-
-            for (int f = 0; f < n_valid; f++)
-                features[m * n_valid + f] = (mel[f * N_MELS + m] - mean) / std_val;
-        }
+        CUDA_CHECK(cudaMemcpyAsync(d_frames, frames.data(),
+                                    n_frames * N_FFT * sizeof(float),
+                                    cudaMemcpyHostToDevice, stream));
+        fft512_mel_log(d_frames, d_mel, n_frames, stream);
+        mel_normalize(d_mel, d_mel_out, n_frames, n_valid, stream);
     }
 };
 
@@ -688,20 +651,14 @@ struct Pipeline {
     std::string transcribe(const float* samples, int num_samples) {
         auto t_start = std::chrono::high_resolution_clock::now();
 
-        // --- 1. Mel spectrogram (CPU) ---
-        std::vector<float> features;
+        // --- 1. Mel spectrogram (fused GPU pipeline) ---
         int n_frames, n_valid;
-        mel.compute(samples, num_samples, features, n_frames, n_valid);
+        mel.compute(samples, num_samples, cuda_model.mel_fp32, n_frames, n_valid, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
         auto t_mel = std::chrono::high_resolution_clock::now();
 
-        // --- 2. Upload mel to GPU and run encoder ---
-        GpuBuf d_features(N_MELS * n_valid * sizeof(float));
-        CUDA_CHECK(cudaMemcpyAsync(d_features.ptr, features.data(),
-                                    N_MELS * n_valid * sizeof(float),
-                                    cudaMemcpyHostToDevice, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-
-        int T = cuda_model.encode((const float*)d_features.ptr, n_valid);
+        // --- 2. Encoder (mel_fp32 already on GPU) ---
+        int T = cuda_model.encode_gpu(n_valid);
         CUDA_CHECK(cudaStreamSynchronize(stream));
         auto t_enc = std::chrono::high_resolution_clock::now();
 

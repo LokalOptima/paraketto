@@ -262,6 +262,10 @@ struct CudaModel {
     /// Returns T' (number of encoder frames after 8x downsampling).
     int encode(const float* mel_fp32, int T_mel);
 
+    /// Run encoder from mel_fp32 already on GPU (skip host→device upload).
+    /// mel_fp32 member must be pre-populated with [128, T_mel] float data.
+    int encode_gpu(int T_mel);
+
     /// Reset decoder LSTM states to zero (call before greedy decode loop).
     void decoder_reset();
 

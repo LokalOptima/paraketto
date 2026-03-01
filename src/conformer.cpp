@@ -495,8 +495,10 @@ struct GemmKey {
     int m, n, k;
     cublasOperation_t opA, opB;
     bool accumulate;
+    bool has_bias;
     bool operator==(const GemmKey& o) const {
-        return m == o.m && n == o.n && k == o.k && opA == o.opA && opB == o.opB && accumulate == o.accumulate;
+        return m == o.m && n == o.n && k == o.k && opA == o.opA && opB == o.opB
+            && accumulate == o.accumulate && has_bias == o.has_bias;
     }
 };
 struct GemmKeyHash {
@@ -507,6 +509,7 @@ struct GemmKeyHash {
         h ^= std::hash<int>()(k.opA) * 73;
         h ^= std::hash<int>()(k.opB) * 131;
         h ^= std::hash<int>()(k.accumulate) * 257;
+        h ^= std::hash<int>()(k.has_bias) * 521;
         return h;
     }
 };
@@ -551,8 +554,8 @@ static GemmPlan& get_gemm_plan(cublasLtHandle_t lt, void* workspace, size_t ws_s
                                 int col_m, int col_n, int col_k,
                                 int ldA, int ldB, int ldC,
                                 cublasOperation_t opA, cublasOperation_t opB,
-                                bool accumulate) {
-    GemmKey key{col_m, col_n, col_k, opA, opB, accumulate};
+                                bool accumulate, bool has_bias = false) {
+    GemmKey key{col_m, col_n, col_k, opA, opB, accumulate, has_bias};
     auto it = gemm_cache.find(key);
     if (it != gemm_cache.end()) return it->second;
 
@@ -564,6 +567,12 @@ static GemmPlan& get_gemm_plan(cublasLtHandle_t lt, void* workspace, size_t ws_s
         CUBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof(opA)));
     CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(plan.matmul_desc,
         CUBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB)));
+
+    if (has_bias) {
+        cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_BIAS;
+        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(plan.matmul_desc,
+            CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
+    }
 
     CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&plan.layout_A, CUDA_R_16F,
         opA == CUBLAS_OP_N ? col_m : col_k,
@@ -602,20 +611,24 @@ static void lt_gemm(cublasLtHandle_t lt, cublasHandle_t h,
                       const half* A, int ldA,
                       const half* B, int ldB,
                       half* C, int ldC,
-                      bool accumulate) {
+                      bool accumulate, const half* bias = nullptr) {
     half alpha = __float2half(1.0f);
     half beta = __float2half(accumulate ? 1.0f : 0.0f);
 
     GemmPlan& plan = get_gemm_plan(lt, workspace, ws_size,
                                      col_m, col_n, col_k, ldA, ldB, ldC,
-                                     opA, opB, accumulate);
+                                     opA, opB, accumulate, bias != nullptr);
     if (plan.valid) {
+        if (bias) {
+            CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(plan.matmul_desc,
+                CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
+        }
         CUBLAS_CHECK(cublasLtMatmul(lt, plan.matmul_desc,
             &alpha, A, plan.layout_A, B, plan.layout_B,
             &beta, C, plan.layout_C, C, plan.layout_C,
             &plan.algo, workspace, ws_size, stream));
     } else {
-        // Fallback to cublasGemmEx
+        // Fallback to cublasGemmEx (no bias epilogue support)
         CUBLAS_CHECK(cublasGemmEx(h, opA, opB,
             col_m, col_n, col_k, &alpha, A, CUDA_R_16F, ldA,
             B, CUDA_R_16F, ldB, &beta, C, CUDA_R_16F, ldC,
@@ -632,6 +645,15 @@ static void gemm_nn(cublasLtHandle_t lt, cublasHandle_t h,
     // Col-major: Y'[n,m] = W'[n,k] @ X'[k,m]
     lt_gemm(lt, h, ws, ws_size, stream, CUBLAS_OP_N, CUBLAS_OP_N,
             n, m, k, W, n, X, k, Y, n, false);
+}
+
+// Y[m,n] = X[m,k] @ W[k,n] + bias[n]  (ONNX MatMul + bias epilogue)
+static void gemm_nn_bias(cublasLtHandle_t lt, cublasHandle_t h,
+                          void* ws, size_t ws_size, cudaStream_t stream,
+                          const half* X, int m, int k,
+                          const half* W, int n, const half* bias, half* Y) {
+    lt_gemm(lt, h, ws, ws_size, stream, CUBLAS_OP_N, CUBLAS_OP_N,
+            n, m, k, W, n, X, k, Y, n, false, bias);
 }
 
 // Y[m,n] = X[m,k] @ W[n,k]^T  (Conv/PyTorch convention: W is [output, input])
@@ -691,6 +713,13 @@ static void batched_gemm_nt(cublasHandle_t h,
 // ---------------------------------------------------------------------------
 
 int CudaModel::encode(const float* mel_fp32_host, int T_mel) {
+    // Upload mel from host then delegate to encode_gpu
+    CUDA_CHECK(cudaMemcpyAsync(mel_fp32, mel_fp32_host, 128 * T_mel * sizeof(float),
+                                cudaMemcpyHostToDevice, stream));
+    return encode_gpu(T_mel);
+}
+
+int CudaModel::encode_gpu(int T_mel) {
     // Local GEMM helpers that capture cublasLt context
     auto gnn = [&](const half* X, int m, int k, const half* W, int n, half* Y) {
         gemm_nn(cublaslt, cublas, lt_workspace, lt_workspace_size, stream, X, m, k, W, n, Y);
@@ -698,12 +727,13 @@ int CudaModel::encode(const float* mel_fp32_host, int T_mel) {
     auto gnt = [&](const half* X, int m, int k, const half* W, int n, half* Y) {
         gemm_nt(cublaslt, cublas, lt_workspace, lt_workspace_size, stream, X, m, k, W, n, Y);
     };
+    auto gnn_bias = [&](const half* X, int m, int k, const half* W, int n, const half* bias, half* Y) {
+        gemm_nn_bias(cublaslt, cublas, lt_workspace, lt_workspace_size, stream, X, m, k, W, n, bias, Y);
+    };
 
-    // 1. Upload and cast mel to FP16, then transpose
-    //    mel_fp32_host is [128, T_mel] on host
+    // 1. Cast mel to FP16, then transpose
+    //    mel_fp32 is [128, T_mel] on GPU
     //    ONNX model transposes to [T_mel, 128] before conv2d
-    CUDA_CHECK(cudaMemcpyAsync(mel_fp32, mel_fp32_host, 128 * T_mel * sizeof(float),
-                                cudaMemcpyHostToDevice, stream));
     cast_fp32_to_fp16(mel_fp32, mel_fp16, 128 * T_mel, stream);
 
     // Transpose mel from [128, T_mel] to [T_mel, 128]
@@ -742,10 +772,10 @@ int CudaModel::encode(const float* mel_fp32_host, int T_mel) {
     int T = H;  // encoder frames = time dim after 3x stride-2
     reshape_chw_to_hcw_fp16(sub_buf[1], sub_buf[0], SUB_CHANNELS, T, W, stream);
     // sub_buf[0] is now [T, 4096]
-    gnn(sub_buf[0], T, SUB_CHANNELS * W, w->sub_out_w, D_MODEL, x);
-    // Add bias
     if (w->sub_out_b)
-        bias_add_inplace_fp16(x, w->sub_out_b, T, D_MODEL, stream);
+        gnn_bias(sub_buf[0], T, SUB_CHANNELS * W, w->sub_out_w, D_MODEL, w->sub_out_b, x);
+    else
+        gnn(sub_buf[0], T, SUB_CHANNELS * W, w->sub_out_w, D_MODEL, x);
 
     // 3. Position encoding: slice from pre-computed T_max encoding
     //    pos_enc for T is at offset (T_max - T) * D_MODEL in the T_max encoding

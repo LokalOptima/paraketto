@@ -271,3 +271,38 @@ void split_transpose_qkv_bias_fp16(const half* in,
 // ---------------------------------------------------------------------------
 void fft512_power(const float* frames, float* power, int n_frames,
                   cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
+// Mel filterbank entry for fused GPU mel pipeline
+// ---------------------------------------------------------------------------
+struct MelFBEntry {
+    uint16_t freq;
+    uint16_t mel;
+    float weight;
+};
+
+// ---------------------------------------------------------------------------
+// Initialize mel filterbank data in GPU constant memory.
+// Must be called once before fft512_mel_log.
+//   entries: [count] MelFBEntry structs (504 for Parakeet)
+// ---------------------------------------------------------------------------
+void mel_init_filterbank(const MelFBEntry* entries, int count);
+
+// ---------------------------------------------------------------------------
+// Fused FFT + mel filterbank + log
+//   frames:  [n_frames, 512]  real windowed audio frames (float32)
+//   mel_out: [n_frames, 128]  log-mel spectrogram (float32)
+//   One block per frame, 256 threads. Fuses FFT → power → sparse mel → log.
+// ---------------------------------------------------------------------------
+void fft512_mel_log(const float* frames, float* mel_out, int n_frames,
+                    cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
+// Per-channel mel normalize + transpose
+//   mel_in:  [n_frames, 128]  log-mel from fft512_mel_log (float32)
+//   mel_out: [128, n_valid]   normalized, transposed (float32)
+//   One block per mel channel (128 blocks). Computes mean/variance over
+//   n_valid frames, normalizes with Bessel correction: (x - mean) / (std + eps).
+// ---------------------------------------------------------------------------
+void mel_normalize(const float* mel_in, float* mel_out,
+                   int n_frames, int n_valid, cudaStream_t stream);
