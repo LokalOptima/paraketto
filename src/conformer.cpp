@@ -5,6 +5,7 @@
 // by matching tensor names from the file header.
 
 #include "conformer.h"
+#include "common.h"
 #include "kernels.h"
 
 #include <cassert>
@@ -19,22 +20,6 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-
-// ---------------------------------------------------------------------------
-// CUDA error checking (same macro as parakeet.cpp)
-// ---------------------------------------------------------------------------
-
-#ifndef CUDA_CHECK
-#define CUDA_CHECK(call)                                                       \
-    do {                                                                        \
-        cudaError_t err = (call);                                              \
-        if (err != cudaSuccess) {                                              \
-            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__,   \
-                    cudaGetErrorString(err));                                   \
-            std::exit(1);                                                      \
-        }                                                                      \
-    } while (0)
-#endif
 
 // ---------------------------------------------------------------------------
 // Helper: align up

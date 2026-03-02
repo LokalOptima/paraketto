@@ -1,9 +1,15 @@
 """Shared utilities for benchmark scripts."""
 
 import json
+import signal
+import subprocess
+import sys
+import time
 from pathlib import Path
 
+import requests
 from jiwer import Compose, ReduceToListOfListOfWords, RemovePunctuation, ToLowerCase
+from jiwer import wer
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
@@ -68,3 +74,75 @@ def print_results(rows: list[dict]) -> None:
     print(row("Total", "", f"{grand_rtfx:.0f}x", str(sum(r["utts"] for r in rows)),
               f"{grand_audio:.0f}s", fmt_time(grand_inference)))
     print(sep("└", "┴", "┘"))
+
+
+def bench_server(binary: Path, binary_name: str, port: int = 18080) -> None:
+    """Start a server binary, run benchmarks, and print results."""
+    if not binary.exists():
+        print(f"Binary not found: {binary}", file=sys.stderr)
+        print(f"Run 'make {binary_name}' first.", file=sys.stderr)
+        sys.exit(1)
+
+    server_url = f"http://localhost:{port}"
+
+    def transcribe(path: str) -> dict:
+        with open(path, "rb") as f:
+            r = requests.post(f"{server_url}/transcribe", files={"file": f})
+        r.raise_for_status()
+        return r.json()
+
+    def wait_for_server(timeout: float = 30) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                r = requests.get(f"{server_url}/health", timeout=1)
+                if r.ok:
+                    return
+            except requests.ConnectionError:
+                pass
+            time.sleep(0.1)
+        print("Server failed to start", file=sys.stderr)
+        sys.exit(1)
+
+    server = subprocess.Popen(
+        [str(binary), "--server", f":{port}"],
+        stderr=subprocess.PIPE,
+    )
+    try:
+        wait_for_server()
+
+        # Warmup
+        manifest = load_manifest(DATASETS[0])
+        transcribe(manifest[0]["audio_path"])
+
+        # Bench each dataset
+        rows = []
+        for name in DATASETS:
+            manifest = load_manifest(name)
+            ds_audio = sum(e["duration_s"] for e in manifest)
+            ds_inference = 0.0
+            references = []
+            hypotheses = []
+
+            for entry in manifest:
+                result = transcribe(entry["audio_path"])
+                hypotheses.append(result["text"])
+                references.append(entry["reference"])
+                ds_inference += result["inference_time_s"]
+
+            wer_pct = wer(
+                references, hypotheses,
+                reference_transform=normalize,
+                hypothesis_transform=normalize,
+            ) * 100
+            rtfx = ds_audio / ds_inference if ds_inference > 0 else 0
+            rows.append(dict(
+                name=name, wer=wer_pct, rtfx=rtfx,
+                utts=len(manifest), audio_s=ds_audio, inference_s=ds_inference,
+            ))
+
+        print_results(rows)
+
+    finally:
+        server.send_signal(signal.SIGINT)
+        server.wait(timeout=5)

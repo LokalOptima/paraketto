@@ -58,15 +58,17 @@ weights.bin: scripts/export_weights.py
 src/kernels.o: src/kernels.cu src/kernels.h
 	$(NVCC) $(NVFLAGS) -c $< -o $@
 
+SHARED_HEADERS = src/common.h src/wav.h src/mel.h src/vocab.h src/server.h
+
 # TRT backend (reference)
-parakeet: src/parakeet.cpp src/kernels.o src/kernels.h
+parakeet: src/parakeet.cpp src/kernels.o src/kernels.h $(SHARED_HEADERS)
 	$(CXX) $(CXXFLAGS) src/parakeet.cpp src/kernels.o $(LDFLAGS) -o $@
 
 # CUDA backend (no TensorRT dependency)
 CUDA_CXXFLAGS = -std=c++17 -O3 -march=native -flto=auto -Wno-deprecated-declarations -I$(CUDA_HOME)/include -Ithird_party -Isrc
 CUDA_LDFLAGS  = -flto=auto -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lpthread
 
-parakeet.cuda: src/parakeet_cuda.cpp src/conformer.cpp src/conformer.h src/kernels.o src/kernels.h
+parakeet.cuda: src/parakeet_cuda.cpp src/conformer.cpp src/conformer.h src/kernels.o src/kernels.h $(SHARED_HEADERS)
 	$(CXX) $(CUDA_CXXFLAGS) src/parakeet_cuda.cpp src/conformer.cpp src/kernels.o $(CUDA_LDFLAGS) -o $@
 
 clean:
