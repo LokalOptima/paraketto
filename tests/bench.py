@@ -20,11 +20,11 @@ from bench_common import DATASETS, load_manifest, normalize, print_results
 
 
 def main():
-    import parakeet_trt
+    import paraketto_trt
 
     print("Loading model...")
     t0 = time.monotonic()
-    parakeet_trt.load_model()
+    paraketto_trt.load_model()
     print(f"Model loaded in {time.monotonic() - t0:.1f}s\n")
 
     rows = []
@@ -38,7 +38,7 @@ def main():
 
         for entry in manifest:
             t0 = time.perf_counter()
-            hyp = parakeet_trt.transcribe_file(entry["audio_path"])
+            hyp = paraketto_trt.transcribe_file(entry["audio_path"])
             elapsed = time.perf_counter() - t0
 
             references.append(entry["reference"])

@@ -1,5 +1,5 @@
 [project]
-name = "parakeet"
+name = "paraketto"
 version = "0.1.0"
 description = "Local voice dictation using Parakeet V2 via onnx-asr"
 requires-python = ">=3.10"

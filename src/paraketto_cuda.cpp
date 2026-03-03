@@ -1,7 +1,7 @@
-// parakeet_cuda.cpp — Custom CUDA/cuBLAS runtime for Parakeet TDT 0.6B V2
+// paraketto_cuda.cpp — Custom CUDA/cuBLAS runtime for Parakeet TDT 0.6B V2
 //
-// Build: make parakeet.cuda
-// Usage: ./parakeet.cuda [--weights FILE] audio.wav
+// Build: make paraketto.cuda
+// Usage: ./paraketto.cuda [--weights FILE] audio.wav
 
 #include <chrono>
 #include <cstdio>

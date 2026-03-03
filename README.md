@@ -1,4 +1,4 @@
-# parakeet
+# paraketto
 
 Single-file C++ speech-to-text using NVIDIA's [Parakeet TDT 0.6B V2](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) model. Two backends: TensorRT and pure CUDA (cuBLAS + custom kernels).
 
@@ -14,7 +14,7 @@ TRT:         638x     1.81%         392ms
 CUDA:        600x     1.81%         238ms
 ```
 
-## parakeet.cuda (recommended)
+## paraketto.cuda (recommended)
 
 Pure CUDA backend — no TensorRT or cuDNN dependency. Only requires CUDA toolkit (cudart, cuBLAS, cuFFT).
 
@@ -28,18 +28,18 @@ Pure CUDA backend — no TensorRT or cuDNN dependency. Only requires CUDA toolki
 ```bash
 uv sync                          # install Python deps (for weight export)
 make weights                     # export model weights to weights.bin (~1.2GB)
-make parakeet.cuda               # compile the CUDA binary
-./parakeet.cuda audio.wav        # transcribe a 16kHz mono WAV file
-./parakeet.cuda *.wav            # multiple files
-./parakeet.cuda --weights FILE audio.wav  # custom weights path
+make paraketto.cuda              # compile the CUDA binary
+./paraketto.cuda audio.wav       # transcribe a 16kHz mono WAV file
+./paraketto.cuda *.wav           # multiple files
+./paraketto.cuda --weights FILE audio.wav  # custom weights path
 ```
 
 ### Server mode
 
 ```bash
-./parakeet.cuda --server              # listen on 0.0.0.0:8080
-./parakeet.cuda --server :5001        # listen on 0.0.0.0:5001
-./parakeet.cuda --server 127.0.0.1:5001  # bind to localhost only
+./paraketto.cuda --server              # listen on 0.0.0.0:8080
+./paraketto.cuda --server :5001        # listen on 0.0.0.0:5001
+./paraketto.cuda --server 127.0.0.1:5001  # bind to localhost only
 ```
 
 ### Benchmarks
@@ -48,15 +48,15 @@ make parakeet.cuda               # compile the CUDA binary
 make bench-cuda  # WER + RTFx on librispeech and earnings22
 ```
 
-## parakeet (TensorRT backend)
+## paraketto (TensorRT backend)
 
 Reference TensorRT backend. Requires TensorRT runtime libraries.
 
 ```bash
 uv sync                          # install Python deps (includes TensorRT)
 make engines                     # build TRT engines from ONNX models
-make parakeet                    # compile the TRT binary
-./parakeet audio.wav             # transcribe
+make paraketto                   # compile the TRT binary
+./paraketto audio.wav            # transcribe
 ```
 
 ```bash
@@ -78,10 +78,10 @@ curl -F file=@audio.wav localhost:8080/transcribe
 ## Project structure
 
 ```
-src/parakeet_cuda.cpp    # CUDA backend main (mel + server + greedy decode)
+src/paraketto_cuda.cpp   # CUDA backend main (mel + server + greedy decode)
 src/conformer.cpp        # conformer encoder + decoder (cuBLAS + custom kernels)
 src/kernels.cu           # custom CUDA kernels (LayerNorm, SiLU, GLU, conv, LSTM, etc.)
-src/parakeet.cpp         # TensorRT backend (reference)
+src/paraketto.cpp        # TensorRT backend (reference)
 scripts/export_weights.py  # NeMo → weights.bin converter
 scripts/build_engines.py   # ONNX → TRT engine builder
 ```

@@ -1,8 +1,8 @@
 """Parakeet TDT 0.6B speech-to-text with TensorRT acceleration.
 
 Handles model loading and transcription. TensorRT engines are compiled on first
-inference and cached at PARAKEET_TRT_CACHE_DIR (default ~/.cache/parakeet-trt-cache/).
-Set PARAKEET_MODEL_PATH to use a local model directory instead of downloading from HF.
+inference and cached at PARAKETTO_TRT_CACHE_DIR (default ~/.cache/paraketto-trt-cache/).
+Set PARAKETTO_MODEL_PATH to use a local model directory instead of downloading from HF.
 """
 
 import logging
@@ -13,14 +13,14 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-logger = logging.getLogger("parakeet_trt")
+logger = logging.getLogger("paraketto_trt")
 
 # Suppress ONNX Runtime warnings (memcpy / EP assignment noise)
 os.environ["ORT_LOG_LEVEL"] = "3"
 
 MODEL_NAME = "nemo-parakeet-tdt-0.6b-v2"
-MODEL_PATH = os.environ.get("PARAKEET_MODEL_PATH")
-TRT_CACHE_DIR = Path(os.environ.get("PARAKEET_TRT_CACHE_DIR", Path.home() / ".cache" / "parakeet-trt-cache"))
+MODEL_PATH = os.environ.get("PARAKETTO_MODEL_PATH")
+TRT_CACHE_DIR = Path(os.environ.get("PARAKETTO_TRT_CACHE_DIR", Path.home() / ".cache" / "paraketto-trt-cache"))
 
 _model = None
 

@@ -11,15 +11,25 @@ CXXFLAGS = -std=c++17 -O3 -march=native -flto=auto -Wno-deprecated-declarations 
 NVFLAGS  = -std=c++17 -O3 -I$(CUDA_HOME)/include -Isrc --expt-relaxed-constexpr
 LDFLAGS  = -flto=auto -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lpthread $(TRT_LIBS)/libnvinfer.so.10 -Wl,-rpath,$(TRT_LIBS)
 
-.PHONY: bench-all bench-py bench-cpp bench-cuda engines inspect-onnx weights download-data clean
+.PHONY: bench-all bench-py bench-cpp bench-cuda engines inspect-onnx weights download-data download-weights clean
 
-download-data:
-	@if [ -d data/librispeech ]; then echo "data/ already exists"; else \
-		gh release download bench-data --pattern 'bench-data.tar.gz' && \
+# Download benchmark data from GitHub release
+data/librispeech/manifest.json:
+	@echo "Downloading benchmark data..."
+	@gh release download bench-data --pattern 'bench-data.tar.gz' && \
 		tar xzf bench-data.tar.gz && \
 		rm bench-data.tar.gz && \
-		echo "Downloaded $$(find data/ -name '*.wav' | wc -l) wav files"; \
-	fi
+		echo "Downloaded $$(find data/ -name '*.wav' | wc -l) wav files"
+
+download-data: data/librispeech/manifest.json
+
+# Download pre-exported weights from GitHub release
+weights.bin:
+	@echo "Downloading weights..."
+	@gh release download bench-data --pattern 'weights.bin'
+	@echo "Downloaded weights.bin ($$(du -h weights.bin | cut -f1))"
+
+download-weights: weights.bin
 
 engines: engines/encoder.engine engines/decoder_joint.engine
 
@@ -28,21 +38,21 @@ engines/encoder.engine engines/decoder_joint.engine: scripts/build_engines.py
 
 BENCH_SEP = @printf '\n%s\n%s\n%s\n' '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━' '  $(1)'
 
-bench-all: parakeet engines/encoder.engine engines/decoder_joint.engine parakeet.cuda
+bench-all: paraketto engines/encoder.engine engines/decoder_joint.engine paraketto.cuda data/librispeech/manifest.json weights.bin
 	$(call BENCH_SEP,Python  ·  ONNX Runtime + TRT EP)
 	@uv run python tests/bench.py
-	$(call BENCH_SEP,C++ TRT ·  parakeet.cpp + TensorRT)
+	$(call BENCH_SEP,C++ TRT ·  paraketto.cpp + TensorRT)
 	@uv run python tests/bench_cpp.py
-	$(call BENCH_SEP,C++ CUDA · parakeet_cuda.cpp + cuBLAS)
+	$(call BENCH_SEP,C++ CUDA · paraketto_cuda.cpp + cuBLAS)
 	@uv run python tests/bench_cuda.py
 
-bench-py:
+bench-py: data/librispeech/manifest.json
 	uv run python tests/bench.py
 
-bench-cpp: parakeet engines/encoder.engine engines/decoder_joint.engine
+bench-cpp: paraketto engines/encoder.engine engines/decoder_joint.engine data/librispeech/manifest.json
 	uv run python tests/bench_cpp.py
 
-bench-cuda: parakeet.cuda
+bench-cuda: paraketto.cuda data/librispeech/manifest.json weights.bin
 	uv run python tests/bench_cuda.py
 
 # ONNX inspection and weight export
@@ -51,9 +61,6 @@ inspect-onnx:
 
 weights: weights.bin
 
-weights.bin: scripts/export_weights.py
-	uv run python scripts/export_weights.py
-
 # C++ / CUDA build
 src/kernels.o: src/kernels.cu src/kernels.h
 	$(NVCC) $(NVFLAGS) -c $< -o $@
@@ -61,15 +68,15 @@ src/kernels.o: src/kernels.cu src/kernels.h
 SHARED_HEADERS = src/common.h src/wav.h src/mel.h src/vocab.h src/server.h
 
 # TRT backend (reference)
-parakeet: src/parakeet.cpp src/kernels.o src/kernels.h $(SHARED_HEADERS)
-	$(CXX) $(CXXFLAGS) src/parakeet.cpp src/kernels.o $(LDFLAGS) -o $@
+paraketto: src/paraketto.cpp src/kernels.o src/kernels.h $(SHARED_HEADERS)
+	$(CXX) $(CXXFLAGS) src/paraketto.cpp src/kernels.o $(LDFLAGS) -o $@
 
 # CUDA backend (no TensorRT dependency)
 CUDA_CXXFLAGS = -std=c++17 -O3 -march=native -flto=auto -Wno-deprecated-declarations -I$(CUDA_HOME)/include -Ithird_party -Isrc
 CUDA_LDFLAGS  = -flto=auto -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lpthread
 
-parakeet.cuda: src/parakeet_cuda.cpp src/conformer.cpp src/conformer.h src/kernels.o src/kernels.h $(SHARED_HEADERS)
-	$(CXX) $(CUDA_CXXFLAGS) src/parakeet_cuda.cpp src/conformer.cpp src/kernels.o $(CUDA_LDFLAGS) -o $@
+paraketto.cuda: src/paraketto_cuda.cpp src/conformer.cpp src/conformer.h src/kernels.o src/kernels.h $(SHARED_HEADERS)
+	$(CXX) $(CUDA_CXXFLAGS) src/paraketto_cuda.cpp src/conformer.cpp src/kernels.o $(CUDA_LDFLAGS) -o $@
 
 clean:
-	rm -f parakeet parakeet.cuda src/kernels.o
+	rm -f paraketto paraketto.cuda src/kernels.o

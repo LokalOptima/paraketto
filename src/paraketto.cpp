@@ -1,7 +1,7 @@
-// parakeet.cpp — TensorRT C++ runtime for Parakeet TDT 0.6B V2
+// paraketto.cpp — TensorRT C++ runtime for Parakeet TDT 0.6B V2
 //
-// Build: make parakeet
-// Usage: ./parakeet audio.wav
+// Build: make paraketto
+// Usage: ./paraketto audio.wav
 
 #include <chrono>
 #include <cstdio>
