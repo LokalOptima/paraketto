@@ -1,4 +1,4 @@
-// paraketto_cuda.cpp — Custom CUDA/cuBLAS runtime for Parakeet TDT 0.6B V2
+// paraketto_cuda.cpp — Custom CUDA runtime with FP8 CUTLASS GEMMs for Parakeet TDT 0.6B V2
 //
 // Build: make paraketto.cuda
 // Usage: ./paraketto.cuda [--weights FILE] audio.wav
@@ -202,7 +202,7 @@ int main(int argc, char** argv) {
         double weights_mb = file_size_mb(weights_path);
 
         fprintf(stderr, "\n");
-        fprintf(stderr, "model:     parakeet-tdt-0.6b-v2 (custom CUDA)\n");
+        fprintf(stderr, "model:     parakeet-tdt-0.6b-v2 (custom CUDA + FP8)\n");
         fprintf(stderr, "weights:   %s (%.0f MB)\n", weights_path.c_str(), weights_mb);
         fprintf(stderr, "device:    %s (compute %d.%d, %.0f MB VRAM, %.0f MB free)\n",
                 prop.name, prop.major, prop.minor,

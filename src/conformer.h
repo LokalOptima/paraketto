@@ -1,8 +1,10 @@
 // conformer.h — Weight loading + CUDA inference for Parakeet conformer
 //
+// FP8 E4M3 quantized weights with CUTLASS FP8 GEMMs on SM120 (Blackwell).
+//
 // Defines:
-//   Weights  — pointers into GPU weight allocation (loaded from weights.bin)
-//   CudaModel — pre-allocated buffers + cuBLAS handle for forward passes
+//   Weights   — pointers into GPU weight allocation (loaded from weights.bin)
+//   CudaModel — pre-allocated buffers for forward passes
 
 #pragma once
 
@@ -249,6 +251,41 @@ struct CudaModel {
     half* joint_act     = nullptr;  // [D_JOINT]
     half* joint_out     = nullptr;  // [D_OUTPUT]
     int*  argmax_out    = nullptr;  // [2] — token, step (for GPU argmax)
+
+    // --- FP8 quantized weights (carved from fp8_pool) ---
+    static constexpr int N_FP8_SCALES = N_BLOCKS * 9 + 6;  // 222
+    void* fp8_pool = nullptr;
+    uint8_t* fp8_qkv_w[N_BLOCKS];       // [D_MODEL, 3*D_MODEL] per block
+    uint8_t* fp8_ff1_w1[N_BLOCKS];      // [D_MODEL, D_FF]
+    uint8_t* fp8_ff1_w2[N_BLOCKS];      // [D_FF, D_MODEL]
+    uint8_t* fp8_ff2_w1[N_BLOCKS];      // [D_MODEL, D_FF]
+    uint8_t* fp8_ff2_w2[N_BLOCKS];      // [D_FF, D_MODEL]
+    uint8_t* fp8_pos_w[N_BLOCKS];       // [D_MODEL, D_MODEL]
+    uint8_t* fp8_out_w[N_BLOCKS];       // [D_MODEL, D_MODEL]
+    uint8_t* fp8_conv_pw1_w[N_BLOCKS];  // [D_CONV_PW, D_MODEL]
+    uint8_t* fp8_conv_pw2_w[N_BLOCKS];  // [D_MODEL, D_MODEL]
+    uint8_t* fp8_sub_out_w = nullptr;   // [SUB_CHANNELS*W, D_MODEL]
+    uint8_t* fp8_enc_proj_w = nullptr;  // [D_MODEL, D_JOINT]
+    uint8_t* fp8_lstm_combined_w[2];    // [4*D_PRED, 2*D_PRED]
+    uint8_t* fp8_dec_proj_w = nullptr;  // [D_PRED, D_JOINT]
+    uint8_t* fp8_out_proj_w = nullptr;  // [D_JOINT, D_OUTPUT]
+    float* fp8_scales = nullptr;        // [N_FP8_SCALES] on GPU
+    uint8_t* fp8_act_buf = nullptr;     // activation quantization temp
+    int* fp8_amax_buf = nullptr;        // [1] scratch for atomicMax in quantize kernel
+
+    // Per-activation-site cached scales for calibrated mode
+    // Sites: 9 per block (ff1_w1, ff1_w2, qkv, pos, out, conv_pw1, conv_pw2, ff2_w1, ff2_w2)
+    //        + sub_out + enc_proj = N_BLOCKS*9 + 2
+    static constexpr int N_FP8_ACT_SITES = N_BLOCKS * 9 + 2;  // 218
+    float* fp8_act_site_scales = nullptr;  // [N_FP8_ACT_SITES] on GPU
+    bool fp8_calibrated = false;
+
+    // --- CUTLASS FP8 GEMM (used after calibration) ---
+    void* cutlass_workspace = nullptr;
+    size_t cutlass_workspace_size = 0;
+    float host_wt_scales[N_FP8_SCALES];
+    float host_act_scales[N_FP8_ACT_SITES];
+    bool cutlass_ready = false;
 
     // --- Methods ---
     void init(const Weights& weights, cudaStream_t s, int max_mel_frames);

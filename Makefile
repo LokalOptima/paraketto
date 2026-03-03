@@ -43,7 +43,7 @@ bench-all: paraketto engines/encoder.engine engines/decoder_joint.engine paraket
 	@uv run python tests/bench.py
 	$(call BENCH_SEP,C++ TRT ·  paraketto.cpp + TensorRT)
 	@uv run python tests/bench_cpp.py
-	$(call BENCH_SEP,C++ CUDA · paraketto_cuda.cpp + cuBLAS)
+	$(call BENCH_SEP,C++ CUDA · paraketto_cuda.cpp + CUTLASS FP8)
 	@uv run python tests/bench_cuda.py
 
 bench-py: data/librispeech/manifest.json
@@ -71,12 +71,19 @@ SHARED_HEADERS = src/common.h src/wav.h src/mel.h src/vocab.h src/server.h
 paraketto: src/paraketto.cpp src/kernels.o src/kernels.h $(SHARED_HEADERS)
 	$(CXX) $(CXXFLAGS) src/paraketto.cpp src/kernels.o $(LDFLAGS) -o $@
 
-# CUDA backend (no TensorRT dependency)
+# CUDA backend (CUTLASS FP8 GEMM + cuBLAS FP16, no TensorRT dependency)
 CUDA_CXXFLAGS = -std=c++17 -O3 -march=native -flto=auto -Wno-deprecated-declarations -I$(CUDA_HOME)/include -Ithird_party -Isrc
 CUDA_LDFLAGS  = -flto=auto -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcublasLt -lpthread
+CUTLASS_INC   = -Ithird_party/cutlass/include -Ithird_party/cutlass/tools/util/include
 
-paraketto.cuda: src/paraketto_cuda.cpp src/conformer.cpp src/conformer.h src/kernels.o src/kernels.h $(SHARED_HEADERS)
-	$(CXX) $(CUDA_CXXFLAGS) src/paraketto_cuda.cpp src/conformer.cpp src/kernels.o $(CUDA_LDFLAGS) -o $@
+src/kernels_fp8.o: src/kernels_fp8.cu src/kernels_fp8.h
+	$(NVCC) $(NVFLAGS) -arch=sm_120a -c $< -o $@
+
+src/cutlass_gemm.o: src/cutlass_gemm.cu src/cutlass_gemm.h
+	$(NVCC) $(NVFLAGS) -arch=sm_120a $(CUTLASS_INC) -c $< -o $@
+
+paraketto.cuda: src/paraketto_cuda.cpp src/conformer.cpp src/conformer.h src/kernels.o src/kernels_fp8.o src/cutlass_gemm.o src/kernels.h src/kernels_fp8.h src/cutlass_gemm.h $(SHARED_HEADERS)
+	$(CXX) $(CUDA_CXXFLAGS) src/paraketto_cuda.cpp src/conformer.cpp src/kernels.o src/kernels_fp8.o src/cutlass_gemm.o $(CUDA_LDFLAGS) -o $@
 
 clean:
-	rm -f paraketto paraketto.cuda src/kernels.o
+	rm -f paraketto paraketto.cuda src/kernels.o src/kernels_fp8.o src/cutlass_gemm.o
