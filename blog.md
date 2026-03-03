@@ -1120,3 +1120,187 @@ Per-dataset breakdown:
 | **Total** | | **1253x** | **240** | **7236s** | **5.78s** |
 
 WER identical across all 240 utterances. The CUDA backend is now **2.4x faster than the original Python baseline** (529x).
+
+---
+
+## Iteration 8: FP8 E4M3 GEMMs
+
+GEMMs account for ~60% of GPU time (7.6ms out of 12.7ms, 826 calls). The RTX 5070 Ti (sm_120, Blackwell GeForce) has FP8 E4M3 tensor cores with 2× the throughput of FP16. FP8 weights are also half the size, which helps memory-bound decoder GEMMs.
+
+### Attempt 1: Naive per-GEMM activation quantization
+
+**Approach**: Weights quantized FP16→FP8 at init time (one-time cost, per-tensor absmax scaling). Activations quantized FP16→FP8 on-the-fly before every GEMM via a multi-block absmax+quantize kernel. GEMMs via `cublasLtMatmul` with FP8 inputs, FP32 accumulation, FP16 output, descaled via `A_SCALE_POINTER`/`B_SCALE_POINTER`.
+
+**Results** (10.4s audio, encoder time):
+
+| Backend | Enc time | RTFx |
+|---------|----------|------|
+| FP16 baseline | 4.8ms | 1133× |
+| FP8 naive | 5.5ms | 1058× |
+
+**15% slower.** The FP8 GEMMs themselves are fine, but the per-GEMM activation quantization kills performance.
+
+**Why**: Each of the ~220 encoder GEMMs needs a two-pass quantization kernel (absmax reduction then quantize). This reads every activation tensor twice. Total extra memory I/O: ~550MB across all GEMMs. At ~500 GB/s bandwidth, that's ~1.1ms theoretical minimum — close to the measured 0.7ms penalty. The FP8 tensor core throughput gains can't overcome this I/O tax.
+
+**Other issues discovered**:
+- `CUBLASLT_EPILOGUE_BIAS` returns `CUBLAS_STATUS_NOT_SUPPORTED` with FP8 on Blackwell. Bias must be added via separate kernel launch.
+- cublasLt FP8 doesn't support N=1 GEMMs (decoder single-vector matvecs). Decoder stays FP16.
+
+### Options to reduce quantization overhead
+
+Three approaches to eliminate the activation quantization bottleneck:
+
+#### Option A: Fixed/cached activation scales
+
+Skip the absmax pass entirely. Use a scale computed during warmup (or from the previous inference). Only a single-pass quantize kernel remains: 1 read + 1 write instead of 2 reads + 1 write. Halves the I/O overhead from ~0.7ms to ~0.35ms.
+
+- **Pro**: Simple, ~50% overhead reduction
+- **Con**: Accuracy risk if activations exceed cached max (FP8 saturation clips outliers). Scale staleness across varying inputs.
+
+#### Option B: Fuse quantization into producing kernels
+
+The kernels that produce activations (layer_norm, silu, residual_add, glu, etc.) already read and write every element. If they write FP8 output alongside FP16, the quantize cost is zero extra memory I/O — no separate kernel, no extra reads.
+
+- **Pro**: Zero extra I/O, zero extra kernel launches
+- **Con**: Still has the two-pass problem — can't write FP8 until the global absmax is known. Must combine with option A (cached scales) to make it truly single-pass. Requires modifying ~6 kernels to dual-output FP16+FP8.
+
+#### Option C: CUTLASS GEMM with inline FP16→FP8 conversion
+
+CUTLASS allows custom prologues that convert FP16→FP8 during the GEMM's global→shared memory tile load. The activation is never materialized as FP8 in global memory.
+
+CUTLASS 4.x supports sm_120 (`examples/79_blackwell_geforce_gemm/`), with FP8 via `mma.sync.aligned.kind::f8f6f4`. Constraints: TN-layout only, no TMA, cluster 1×1×1.
+
+- **Pro**: Zero overhead, most elegant, no separate quantize kernel
+- **Con**: TN-only means rearranging weight storage. Tensor core instruction is FP8×FP8 so the prologue must do the cast — not a stock CUTLASS feature. Heavy engineering, steep learning curve. Previous CUTLASS attempts on this project failed.
+
+### Attempt 2: Cached scales + fused FP8 output (A+B combined)
+
+**Approach**: Combine options A and B. Each activation-producing kernel (layer_norm, silu, etc.) writes FP8 output using a cached scale from warmup. No absmax pass, no separate quantize kernel, no extra memory reads. The FP8 GEMM reads directly from the fused FP8 buffer.
+
+**Scale management**: During warmup, run a full absmax pass per activation site to establish initial scales. At runtime, the producing kernel uses the cached scale with `__NV_SATFINITE` mode (clamps outliers gracefully). Scales are stable because the model's activation distributions don't change much across inputs.
+
+**Kernels to modify** (dual FP16+FP8 output):
+- `layer_norm_fp16` — feeds QKV, FF1, FF2, conv projections
+- `silu_inplace_fp16` — feeds FF1/FF2 linear2
+- `residual_add_layer_norm_fp16` — feeds MHSA, conv, FF2
+- `glu_fp16` — feeds depthwise conv
+- `depthwise_conv1d_k9_silu_fp16` — feeds pointwise conv2
+- Position encoding — written once, quantize at init (already free)
+
+**Expected result**: ~0ms quantization overhead. FP8 GEMMs run at full tensor core throughput. If the FP8 GEMMs are genuinely 2× faster than FP16 for these matrix sizes (60-125 rows × 1024-4096 cols), encoder time should drop from 4.8ms to ~3-4ms.
+
+**What was actually implemented**: Cached scales only (option A), without fusing into producing kernels (option B). Each activation is still quantized via a separate `quantize_fp8_static` kernel, but using the cached scale from the warmup pass — eliminating the absmax reduction (1 kernel + memset per GEMM). This was sufficient to make FP8 faster than FP16.
+
+**Additional issues**: cublasLt FP8 doesn't support `cublasLtMatmul` for some dimension combinations even when the heuristic reports a valid algorithm. Pre-quantized position encoding GEMMs failed at runtime — reverted to per-call quantization with cached scales, which works fine. Decoder GEMMs (N=1, single-vector matvecs) also unsupported by FP8 — kept as FP16.
+
+**Results**:
+
+| Backend | RTFx | librispeech WER | earnings22 WER |
+|---------|------|-----------------|----------------|
+| C++ CUDA FP16 | 1253x | 1.68% | 16.48% |
+| C++ CUDA FP8 | **1289x** | 1.94% | 15.76% |
+
+Per-dataset breakdown:
+
+| Dataset | WER | RTFx | Utts | Audio | Time |
+|---------|-----|------|------|-------|------|
+| librispeech | 1.94% | 1128x | 100 | 896s | 794ms |
+| earnings22 | 15.76% | 1009x | 40 | 253s | 251ms |
+| long | 2.16% | 1337x | 50 | 5578s | 4.17s |
+| difficult | 19.21% | 1278x | 50 | 509s | 398ms |
+| **Total** | | **1289x** | **240** | **7236s** | **5.61s** |
+
+**+2.9% throughput improvement** over FP16 baseline. WER changes are mixed: slightly worse on librispeech/long (+0.26%), but actually better on earnings22 (-0.72%) and difficult (-4.03%). The modest throughput gain reflects the fact that these GEMMs are memory-bandwidth-bound (arithmetic intensity ~100-200 FLOPs/byte, well below the 992 FLOPs/byte compute-bound threshold). FP8 weights are half the size, saving ~600MB of DRAM reads per encoder pass, but cublasLt's FP8 kernel has its own overhead that partially offsets the memory savings.
+
+### Profiling: Why is cublasLt FP8 barely faster?
+
+`nsys` profiling reveals the culprit. Comparing the weight-matrix GEMM kernels (218 per encoder pass, excluding batched attention GEMMs which stay FP16):
+
+**FP16 kernels** — cublasLt selects mature CUTLASS cutlass_80 tensor op kernels:
+
+| Kernel | Tile | Instances | Avg (μs) | Total (ms) |
+|--------|------|-----------|----------|------------|
+| `cutlass_80_tensorop_h16816gemm_128x128_32x5_nn` | 128×128 | 72/inf | 15.1 | 1.09 |
+| `cutlass_80_tensorop_h16816gemm_256x64_32x4_nn` | 256×64 | 49/inf | 13.9 | 0.68 |
+| `cutlass_80_tensorop_h16816gemm_128x64_64x4_tn` | 128×64 | 24/inf | 9.2 | 0.22 |
+| `cutlass_80_tensorop_h16816gemm_128x64_64x4_nn` | 128×64 | 24/inf | 8.7 | 0.21 |
+| `nvjet_sm120_hhh_mma_64x64x128_3_NN` | 64×64 | 24/inf | 7.6 | 0.18 |
+| `nvjet_sm120_hhh_mma_64x64x128_3_TN` | 64×64 | 24/inf | 7.1 | 0.17 |
+| `splitKreduce` (for split-K GEMMs) | — | 48/inf | 2.7 | 0.13 |
+| **Total FP16 weight GEMMs** | | **~217/inf** | | **~2.69** |
+
+**FP8 kernels** — cublasLt selects newer nvjet sm120 kernels:
+
+| Kernel | Tile | Instances | Avg (μs) | Total (ms) |
+|--------|------|-----------|----------|------------|
+| `nvjet_sm120_qqhsh_mma_64x64x64_12_NN` | 64×64 | 121/inf | 11.2 | 1.36 |
+| `nvjet_sm120_qqhsh_mma_128x64x64_8_NN` | 128×64 | 48/inf | 10.2 | 0.49 |
+| `nvjet_sm120_qqhsh_mma_128x64x64_8_TN` | 128×64 | 24/inf | 9.7 | 0.23 |
+| `nvjet_sm120_qqhsh_mma_64x64x64_12_TN` | 64×64 | 24/inf | 6.3 | 0.15 |
+| **Total FP8 weight GEMMs** | | **~217/inf** | | **~2.23** |
+| `quantize_fp8_static` (cached quant) | — | 218/inf | 1.4 | 0.30 |
+| **Total FP8 (GEMMs + quantize)** | | | | **~2.53** |
+
+**Net savings: 2.69 − 2.53 = 0.16ms per inference (6% of GEMM time).**
+
+The FP8 GEMMs are only **17% faster** per-kernel (2.23 vs 2.69ms), not 2×. And `quantize_fp8_static` eats 0.30ms of the 0.46ms savings, leaving just 0.16ms.
+
+**Why FP8 GEMMs are only 17% faster — not 2×:**
+
+These GEMMs are memory-bandwidth-bound at M≈125 (sequence length after 8× downsampling). The roofline model explains everything:
+
+| GEMM (example) | M | N | K | FP8 weight | Theoretical read time | Measured FP8 | Efficiency |
+|----------------|---|---|---|------------|----------------------|--------------|------------|
+| FF1 linear1 | 125 | 4096 | 1024 | 4.0 MB | 7.9 μs | ~10.2 μs | 77% |
+| QKV | 125 | 3072 | 1024 | 3.0 MB | 6.0 μs | ~11.2 μs | 54% |
+| Out proj | 125 | 1024 | 1024 | 1.0 MB | 2.0 μs | ~11.2 μs* | 18%* |
+| FF2 linear2 | 125 | 1024 | 4096 | 4.0 MB | 7.9 μs | ~11.2 μs* | 71%* |
+
+*The 64×64 NN kernel averages 11.2μs across ALL NN shapes (N=1024 through N=3072). The small-N GEMMs (N=1024, weight=1MB) take nearly as long as the large-N ones — a sign of high fixed overhead or poor occupancy.
+
+**The FP16 kernels use 128×128 and 256×64 tiles** with excellent data reuse and near-perfect bandwidth utilization (~100% for the largest GEMMs). The FP8 `nvjet` kernels use **64×64 tiles** — smaller tiles mean more kernel launches per element, worse shared-memory reuse, and lower bandwidth efficiency. CublasLt's FP8 kernels for sm_120 are simply less mature than its FP16 CUTLASS kernels, which have been tuned for years.
+
+### Attempt 3: Custom CUTLASS FP8 GEMM
+
+If cublasLt's built-in FP8 kernels are poorly tuned for sm_120, write our own using CUTLASS 4.x — the same template library that generates the fast FP16 kernels.
+
+**Constraints on sm_120 (GeForce Blackwell):**
+- **TN layout only**: A = RowMajor, B = ColumnMajor. No NN/NT/TT.
+- **Cluster shape 1×1×1**: No multi-SM cooperation.
+- **K-dimension fixed at 128** for all FP8 tile shapes.
+- **Valid tiles**: 64×64×128, 64×128×128, 128×64×128, 128×128×128.
+- **Pingpong schedule** required for tile M < 128 (Cooperative needs M ≥ 128).
+
+**Layout mapping** — corrected after debugging (see results below):
+- **NN GEMMs** (Y = X·W, W stored row-major [K,N]): W must be **transposed** to W^T[N,K] so K is contiguous.
+- **NT GEMMs** (Y = X·Wᵀ, W stored row-major [N,K]): W is already K-contiguous — no transpose needed.
+
+**Dequantization via alpha**: Fold the dequant into the GEMM's alpha parameter: `alpha = act_scale × wt_scale`. After calibration (first inference), copy scales to CPU and pre-compute alphas.
+
+**Tile selection**: 128×128×128 with Cooperative schedule (matching vLLM's SM120 configuration).
+
+#### Results
+
+**SM120 B-layout discovery**: Despite declaring `LayoutB = ColumnMajor`, SM120's MMA reads B with K-contiguous access. `tag_to_umma_major_B<ColumnMajor>` returns `UMMA::Major::K`. The practical effect: NN weights W[K,N] must be transposed to W^T[N,K] before passing to CUTLASS — the opposite of what the layout name suggests. NT weights W[N,K] are already correct.
+
+Confirmed with non-square test matrices (M=256, N=512, K=384):
+```
+Method 1: W as-is (RowMajor [K,N])     → rel_err=0.505  FAIL
+Method 2: W transposed to [N,K]        → max_err=0.000  PASS
+```
+
+This was the root cause of the rel_err ≈ √2 observed across all non-uniform data: with uniform data (all-ones), any access order gives the same value, masking the bug. With non-uniform data, the permuted access pattern produces uncorrelated output.
+
+**Benchmark** (RTX 5070 Ti, same test set):
+
+```
+                FP8 CUTLASS          FP16 cuBLAS
+Dataset         RTFx    WER          RTFx    WER
+librispeech      803x   2.07%        1013x   1.68%
+earnings22       650x  15.19%         916x  16.48%
+long            1273x   2.20%        1309x   1.92%
+difficult        899x  19.13%        1261x  23.24%
+Total           1122x                1242x
+```
+
+FP8 CUTLASS is 10% slower overall than FP16 cuBLAS, with comparable WER. The CUTLASS FP8 GEMM kernel averages 23μs per call vs ~17μs for cuBLAS FP16 on the same matrix shapes (218 encoder GEMMs per pass, T≈125).

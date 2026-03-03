@@ -737,6 +737,26 @@ void bias_relu_nchw_fp16(half* x, const half* bias, int C, int spatial,
 }
 
 // ---------------------------------------------------------------------------
+// Row-broadcast bias add: x[i,j] += bias[j]
+// ---------------------------------------------------------------------------
+
+__global__ void bias_add_kernel(half* __restrict__ x, const half* __restrict__ bias,
+                                int rows, int cols) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= rows * cols) return;
+    int j = idx % cols;
+    x[idx] = __hadd(x[idx], bias[j]);
+}
+
+void bias_add_fp16(half* x, const half* bias, int rows, int cols,
+                   cudaStream_t stream) {
+    int total = rows * cols;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    bias_add_kernel<<<blocks, threads, 0, stream>>>(x, bias, rows, cols);
+}
+
+// ---------------------------------------------------------------------------
 // Reshape [C, H, W] -> [H, C*W]  (permute(1,0,2) then flatten last two)
 //   Reads element (c, h, w) and writes to (h, c*W + w)
 // ---------------------------------------------------------------------------
