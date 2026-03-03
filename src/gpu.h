@@ -836,10 +836,18 @@ public:
 
     bool pb_started = false;
 
+    // Dependent QMD chaining state
+    uint32_t* last_qmd_cpu = nullptr;   // CPU pointer to last QMD (for chaining)
+    uint64_t  last_qmd_gpu = 0;         // GPU address of last QMD
+    bool      first_dispatch = true;     // Is next launch the first in this batch?
+
     void begin_commands() {
         init_semaphore();
         cmd_begin();
         pb_started = true;
+        first_dispatch = true;
+        last_qmd_cpu = nullptr;
+        last_qmd_gpu = 0;
 
         if (!channel_setup_done) {
             nvm(1, 0x0000, 1); nvm_data(0xCEC0);  // SET_OBJECT subchannel 1 = COMPUTE
@@ -863,7 +871,8 @@ public:
                        uint32_t reg_count, uint32_t shared_mem,
                        uint32_t grid_x, uint32_t grid_y, uint32_t grid_z,
                        uint32_t block_x, uint32_t block_y, uint32_t block_z,
-                       uint64_t cbuf0_gpu_addr, uint32_t cbuf0_size) {
+                       uint64_t cbuf0_gpu_addr, uint32_t cbuf0_size,
+                       uint64_t cbuf2_gpu_addr = 0, uint32_t cbuf2_size = 0) {
         // Auto-start pushbuffer if needed
         if (!pb_started) begin_commands();
 
@@ -907,10 +916,19 @@ public:
         qmd.dw[41] = grid_z;
 
         // Constant buffer 0
-        uint64_t cb_addr_s6 = cbuf0_gpu_addr >> 6;
-        uint32_t cb_size_s4 = (cbuf0_size + 15) / 16;
-        qmd.dw[42] = (uint32_t)(cb_addr_s6 & 0xFFFFFFFF);
-        qmd.dw[43] = ((uint32_t)(cb_addr_s6 >> 32) & 0x7FFFF) | (cb_size_s4 << 19);
+        uint64_t cb0_addr_s6 = cbuf0_gpu_addr >> 6;
+        uint32_t cb0_size_s4 = (cbuf0_size + 15) / 16;
+        qmd.dw[42] = (uint32_t)(cb0_addr_s6 & 0xFFFFFFFF);
+        qmd.dw[43] = ((uint32_t)(cb0_addr_s6 >> 32) & 0x7FFFF) | (cb0_size_s4 << 19);
+
+        // Constant buffer 2 (optional — for __constant__ data like mel filterbank)
+        if (cbuf2_size > 0 && cbuf2_gpu_addr != 0) {
+            uint64_t cb2_addr_s6 = cbuf2_gpu_addr >> 6;
+            uint32_t cb2_size_s4 = (cbuf2_size + 15) / 16;
+            qmd.dw[46] = (uint32_t)(cb2_addr_s6 & 0xFFFFFFFF);
+            qmd.dw[47] = ((uint32_t)(cb2_addr_s6 >> 32) & 0x7FFFF) | (cb2_size_s4 << 19);
+            qmd.dw[58] |= (1 << 8);  // cbuf2 valid bit
+        }
 
         // Program prefetch
         qmd.dw[59] = (uint32_t)(code_gpu_addr >> 8);
@@ -921,26 +939,59 @@ public:
         memcpy(qmd_mem.cpu_ptr, &qmd, sizeof(qmd));
         __sync_synchronize();
 
-        // Append SEND_PCAS to current pushbuffer (no submit yet)
-        nvm(1, 0x02B4, 1); nvm_data((uint32_t)(qmd_mem.gpu_addr >> 8));
-        nvm(1, 0x02C0, 1); nvm_data(9);
+        // Dependent QMD chaining: only the first kernel uses SEND_PCAS.
+        // Subsequent kernels are linked via dependent_qmd0 in the previous QMD,
+        // so the GPU auto-dispatches them when the previous kernel completes.
+        // This removes the 16-dispatch-per-pushbuffer limit.
+        if (first_dispatch) {
+            // First kernel: emit SEND_PCAS
+            nvm(1, 0x02B4, 1); nvm_data((uint32_t)(qmd_mem.gpu_addr >> 8));
+            nvm(1, 0x02C0, 1); nvm_data(9);  // SEND_PCAS2_B = PREFETCH_SCHEDULE
+            first_dispatch = false;
+        } else {
+            // Subsequent: link from previous QMD via dependent_qmd0
+            // QMD v5 fields: ENABLE=bit336, ACTION=bits339:337, PREFETCH=bit340, POINTER=bits415:384
+            QMD* prev = (QMD*)last_qmd_cpu;
+            prev->set(336, 336, 1);           // DEPENDENT_QMD0_ENABLE
+            prev->set(339, 337, 1);           // DEPENDENT_QMD0_ACTION = QMD_SCHEDULE
+            prev->set(340, 340, 1);           // DEPENDENT_QMD0_PREFETCH
+            prev->set(415, 384, (uint32_t)(qmd_mem.gpu_addr >> 8)); // DEPENDENT_QMD0_POINTER
+            __sync_synchronize();
+        }
+
+        last_qmd_cpu = (uint32_t*)qmd_mem.cpu_ptr;
+        last_qmd_gpu = qmd_mem.gpu_addr;
     }
 
     void wait_kernel() {
         if (!pb_started) return;
 
-        // Append HOST semaphore release to the SAME pushbuffer
         sem_counter++;
+
+        // Set QMD release semaphore on the LAST dispatched kernel.
+        // This fires when the kernel actually completes — no usleep needed.
+        if (last_qmd_cpu) {
+            QMD* last = (QMD*)last_qmd_cpu;
+            last->set_release_semaphore(0, sem_alloc.gpu_addr, sem_counter);
+            __sync_synchronize();
+        }
+
+        // Also append HOST semaphore with RELEASE_WFI as a backup.
+        // RELEASE_WFI (bit 20) makes the HOST wait for all in-flight work
+        // to complete before writing the semaphore.
         nvm(0, 0x005C, 5);
         nvm_data((uint32_t)(sem_alloc.gpu_addr & 0xFFFFFFFF));
         nvm_data((uint32_t)(sem_alloc.gpu_addr >> 32));
         nvm_data((uint32_t)(sem_counter & 0xFFFFFFFF));
         nvm_data((uint32_t)(sem_counter >> 32));
-        nvm_data(0x01000001);  // SEM_EXECUTE: RELEASE + 64BIT
+        nvm_data(0x01100001);  // SEM_EXECUTE: RELEASE + RELEASE_WFI + 64BIT
 
         // Submit entire pushbuffer as ONE GPFIFO entry
         submit_compute();
         pb_started = false;
+        first_dispatch = true;
+        last_qmd_cpu = nullptr;
+        last_qmd_gpu = 0;
 
         // Poll semaphore
         volatile uint64_t* sem64 = (volatile uint64_t*)sem_alloc.cpu_ptr;
@@ -953,10 +1004,6 @@ public:
                 break;
             }
         }
-
-        // HOST semaphore fires before kernel completion (no WFI available).
-        // Small sleep ensures all dispatched kernels finish writing output.
-        usleep(100);
         __sync_synchronize();
     }
 

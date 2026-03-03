@@ -97,6 +97,10 @@ CUDALESS_LDFLAGS  = -lpthread
 gpu_test: tests/gpu_test.cpp src/gpu.h
 	$(CXX) $(CUDALESS_CXXFLAGS) $< -o $@
 
+# All-kernel test (zero CUDA deps, dependent QMD chaining)
+test_kernels: tests/test_kernels.cpp src/gpu.h src/cubin_loader.h
+	$(CXX) $(CUDALESS_CXXFLAGS) $< -o $@ -lm
+
 # Compile kernels to CUBIN for cudaless loading
 kernels.cubin: src/kernels.cu src/kernels.h src/common.h
 	$(NVCC) -std=c++17 -O3 --cubin -arch=sm_120 -I$(CUDA_HOME)/include -Isrc $< -o $@
@@ -107,5 +111,20 @@ test_cudaless: tests/test_cudaless.cpp src/gpu.h src/cubin_loader.h src/kernels.
 	    tests/test_cudaless.cpp src/kernels.o \
 	    -L$(CUDA_HOME)/lib64 -lcudart -o $@
 
+# CUTLASS cubin + params bridge
+cutlass_gemm.cubin: src/cutlass_gemm.cu src/cutlass_gemm.h
+	$(NVCC) -std=c++17 -O3 --cubin -arch=sm_120 -I$(CUDA_HOME)/include -Isrc $(CUTLASS_INC) $< -o $@
+
+src/cutlass_params.o: src/cutlass_params.cu
+	$(NVCC) -std=c++17 -O3 -arch=sm_80 --expt-relaxed-constexpr $(CUTLASS_INC) -I$(CUDA_HOME)/include -Isrc -c $< -o $@
+
+# CUDA runtime stubs (avoids linking libcudart for nvcc-compiled objects)
+src/cuda_stubs.o: src/cuda_stubs.cpp
+	$(CXX) -std=c++17 -O2 -c $< -o $@
+
+# CUTLASS cudaless test (needs cutlass_params.o for Params construction, no libcudart)
+test_cutlass_cudaless: tests/test_cutlass_cudaless.cpp src/cutlass_cudaless.h src/gpu.h src/cubin_loader.h src/cutlass_params.o src/cuda_stubs.o cutlass_gemm.cubin
+	$(CXX) $(CUDALESS_CXXFLAGS) tests/test_cutlass_cudaless.cpp src/cutlass_params.o src/cuda_stubs.o -o $@ -lm
+
 clean:
-	rm -f paraketto paraketto.cuda src/kernels.o src/cutlass_gemm.o gpu_test kernels.cubin test_cudaless
+	rm -f paraketto paraketto.cuda src/kernels.o src/cutlass_gemm.o src/cutlass_params.o src/cuda_stubs.o gpu_test kernels.cubin cutlass_gemm.cubin test_cudaless test_kernels test_cutlass_cudaless

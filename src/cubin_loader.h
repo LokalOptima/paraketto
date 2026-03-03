@@ -32,6 +32,9 @@ struct CubinKernel {
     uint32_t local_mem_low;
     uint32_t local_mem_high;
 
+    // From .nv.constant2.<name>
+    uint32_t cbuf2_size;        // total cbuf2 size (from .nv.constant2, 0 if none)
+
     // From .nv.shared.<name>
     uint32_t shared_mem_size;
 
@@ -197,7 +200,17 @@ private:
             k.cbuf0_size = shdr(i)->sh_size;
         }
 
-        // Pass 7: collect relocations
+        // Pass 7: parse .nv.constant2.<name> for cbuf2 size
+        for (int i = 0; i < e->e_shnum; i++) {
+            std::string sname = section_name(i);
+            if (sname.substr(0, 14) != ".nv.constant2.") continue;
+            std::string kname = sname.substr(14);
+            auto it = kernel_by_mangled.find(kname);
+            if (it == kernel_by_mangled.end()) continue;
+            kernels[it->second].cbuf2_size = shdr(i)->sh_size;
+        }
+
+        // Pass 8: collect relocations
         for (int i = 0; i < e->e_shnum; i++) {
             auto* sh = shdr(i);
             if (sh->sh_type != SHT_RELA) continue;

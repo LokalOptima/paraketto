@@ -122,13 +122,15 @@ static void fill_fp32(float* buf, int n, float lo, float hi) {
 static void launch_only(GPU& gpu, CubinKernel* k, uint64_t cubin_base,
                         const void* args, uint32_t args_size,
                         uint32_t gx, uint32_t gy, uint32_t gz,
-                        uint32_t bx, uint32_t by, uint32_t bz) {
+                        uint32_t bx, uint32_t by, uint32_t bz,
+                        uint64_t cbuf2_gpu = 0, uint32_t cbuf2_size = 0) {
     auto cbuf = gpu.prepare_cbuf0(args, args_size, k->cbuf0_size, k->param_base,
                                   bx, by, bz);
     gpu.launch_kernel(cubin_base + k->code_offset, k->code_size,
                       k->reg_count, k->shared_mem_size,
                       gx, gy, gz, bx, by, bz,
-                      cbuf.gpu_addr, k->cbuf0_size);
+                      cbuf.gpu_addr, k->cbuf0_size,
+                      cbuf2_gpu, cbuf2_size);
 }
 
 // =========================================================================
@@ -1044,16 +1046,119 @@ static TestSetup setup_transpose(GPU& gpu, CubinLoader& cubin, uint64_t base) {
 }
 
 // =========================================================================
-// Main — batched single-pushbuffer execution
+// 24. fft512_mel_log_kernel (cbuf2: constant memory for mel filterbank)
+// =========================================================================
+
+// Mel filterbank entry (matches kernels.h MelFBEntry, no CUDA deps)
+struct MelFBEntry {
+    uint16_t freq;
+    uint16_t mel;
+    float weight;
+};
+
+static TestSetup setup_fft512_mel_log(GPU& gpu, CubinLoader& cubin, uint64_t base) {
+    auto* k = cubin.find_kernel("fft512_mel_log_kernel");
+    if (!k) return {"fft512_mel_log_kernel", 0, nullptr};
+
+    const int n_frames = 4;
+    const int n_mel_entries = 504;
+    const int out_sz = n_frames * 128;
+
+    // Allocate GPU buffers
+    auto bframes = gpu.gpu_malloc(n_frames * 512 * sizeof(float));
+    auto bmel = gpu.gpu_malloc(out_sz * sizeof(float));
+    uint32_t cbuf2_sz = k->cbuf2_size;
+    if (cbuf2_sz < n_mel_entries * (uint32_t)sizeof(MelFBEntry))
+        cbuf2_sz = n_mel_entries * sizeof(MelFBEntry);
+    auto bcbuf2 = gpu.gpu_malloc(cbuf2_sz);
+
+    auto* frames = (float*)bframes.cpu_ptr;
+    auto* mel_out = (float*)bmel.cpu_ptr;
+    auto* mel_fb = (MelFBEntry*)bcbuf2.cpu_ptr;
+
+    // Fill input frames with small random values
+    fill_fp32(frames, n_frames * 512, -0.5f, 0.5f);
+    memset(mel_out, 0, out_sz * sizeof(float));
+
+    // Generate deterministic mel filterbank entries
+    memset(mel_fb, 0, cbuf2_sz);
+    for (int i = 0; i < n_mel_entries; i++) {
+        mel_fb[i].freq = (uint16_t)((i * 257) / n_mel_entries);
+        mel_fb[i].mel = (uint16_t)((i * 128) / n_mel_entries);
+        mel_fb[i].weight = 0.01f + 0.001f * (float)(i % 20);
+    }
+    __sync_synchronize();
+
+    // Kernel args: (frames*, mel_out*, n_frames)
+    struct __attribute__((packed)) { uint64_t frames, mel_out; int32_t n_frames; } args =
+        {bframes.gpu_addr, bmel.gpu_addr, n_frames};
+    launch_only(gpu, k, base, &args, sizeof(args),
+                n_frames, 1, 1, 256, 1, 1,
+                bcbuf2.gpu_addr, cbuf2_sz);
+
+    return {"fft512_mel_log_kernel", out_sz,
+        [frames, mel_out, mel_fb, n_frames, n_mel_entries, out_sz]() {
+        std::vector<float> ref(out_sz);
+        for (int frame = 0; frame < n_frames; frame++) {
+            const float* in = frames + frame * 512;
+
+            // 1. Bit-reversal load
+            float sr[512], si[512];
+            for (int i = 0; i < 512; i++) {
+                int br = 0;
+                for (int b = 0; b < 9; b++)
+                    br |= ((i >> b) & 1) << (8 - b);
+                sr[br] = in[i];
+                si[br] = 0.0f;
+            }
+
+            // 2. 9 butterfly stages
+            for (int s = 0; s < 9; s++) {
+                int sz = 1 << (s + 1);
+                int half = sz >> 1;
+                for (int tid = 0; tid < 256; tid++) {
+                    int group = tid / half;
+                    int kk = tid % half;
+                    int a = group * sz + kk;
+                    int b = a + half;
+                    float angle = -6.283185307179586f * kk / sz;
+                    float wr = cosf(angle), wi = sinf(angle);
+                    float tr = wr * sr[b] - wi * si[b];
+                    float ti = wr * si[b] + wi * sr[b];
+                    float ar = sr[a], ai = si[a];
+                    sr[a] = ar + tr;  si[a] = ai + ti;
+                    sr[b] = ar - tr;  si[b] = ai - ti;
+                }
+            }
+
+            // 3. Power spectrum [0..256]
+            for (int i = 0; i <= 256; i++)
+                sr[i] = sr[i] * sr[i] + si[i] * si[i];
+
+            // 4. Mel filterbank
+            float mel[128] = {};
+            for (int i = 0; i < n_mel_entries; i++)
+                mel[mel_fb[i].mel] += sr[mel_fb[i].freq] * mel_fb[i].weight;
+
+            // 5. Log
+            for (int i = 0; i < 128; i++)
+                ref[frame * 128 + i] = logf(mel[i] + 5.9604645e-08f);
+        }
+        return compare_fp32(mel_out, ref.data(), out_sz, 0.02f, 0.01f, "fft512_mel_log");
+    }};
+}
+
+// =========================================================================
+// Main — single-batch execution with dependent QMD chaining
 //
-// Hardware limit: Blackwell allows at most 16 SEND_PCAS dispatches per
-// pushbuffer. Beyond that, the extra dispatches are silently dropped.
-// We batch into groups of ≤16, using a fresh GPU instance per batch
-// (since the GPFIFO also stalls after processing any PB with SEND_PCAS).
+// Dependent QMD chaining removes the 16-dispatch-per-pushbuffer limit.
+// Only the first kernel uses SEND_PCAS; subsequent kernels are auto-
+// dispatched via dependent_qmd0 pointers. All kernels run on a single
+// GPU instance in one GPFIFO entry.
 // =========================================================================
 
 int main() {
-    fprintf(stderr, "=== test_kernels: all 23 kernels via cudaless ===\n\n");
+    fprintf(stderr, "=== test_kernels: all 24 kernels via cudaless ===\n\n");
 
     CubinLoader cubin;
     if (!cubin.load("kernels.cubin")) {
@@ -1063,6 +1168,13 @@ int main() {
     fprintf(stderr, "Loaded %zu kernels from CUBIN\n\n", cubin.kernels.size());
 
     srand(42);
+
+    GPU gpu;
+    if (!gpu.init()) {
+        fprintf(stderr, "FATAL: GPU init failed\n");
+        return 1;
+    }
+    uint64_t cubin_base = gpu.upload_cubin(cubin.image.data(), cubin.image.size());
 
     using SetupFn = TestSetup(*)(GPU&, CubinLoader&, uint64_t);
     SetupFn setups[] = {
@@ -1089,59 +1201,36 @@ int main() {
         setup_dual_argmax,
         setup_mel_normalize,
         setup_transpose,
+        setup_fft512_mel_log,
     };
     int n_tests = sizeof(setups) / sizeof(setups[0]);
 
-    const int BATCH_SIZE = 16;  // max SEND_PCAS per pushbuffer on Blackwell
-    int pass = 0, fail = 0, skip = 0;
+    // Launch ALL kernels in one batch — dependent QMD chaining removes
+    // the old 16-dispatch limit.  Single GPU instance, single GPFIFO entry.
+    gpu.begin_commands();
     std::vector<TestSetup> all_tests;
+    for (int i = 0; i < n_tests; i++)
+        all_tests.push_back(setups[i](gpu, cubin, cubin_base));
+    gpu.wait_kernel();
 
-    for (int batch_start = 0; batch_start < n_tests; batch_start += BATCH_SIZE) {
-        int batch_end = batch_start + BATCH_SIZE;
-        if (batch_end > n_tests) batch_end = n_tests;
-        int batch_sz = batch_end - batch_start;
-
-        fprintf(stderr, "--- Batch %d: kernels %d-%d (%d dispatches) ---\n",
-                batch_start / BATCH_SIZE + 1, batch_start + 1, batch_end, batch_sz);
-
-        GPU gpu;
-        if (!gpu.init()) {
-            fprintf(stderr, "FATAL: GPU init failed for batch\n");
-            return 1;
-        }
-        uint64_t cubin_base = gpu.upload_cubin(cubin.image.data(), cubin.image.size());
-
-        // Setup + launch (all appended to one pushbuffer)
-        gpu.begin_commands();
-        std::vector<TestSetup> batch_tests;
-        for (int i = batch_start; i < batch_end; i++)
-            batch_tests.push_back(setups[i](gpu, cubin, cubin_base));
-
-        // Submit + wait
-        gpu.wait_kernel();
-        usleep(5000);
-        __sync_synchronize();
-
-        // Verify this batch
-        for (auto& t : batch_tests) {
-            if (!t.verify) {
-                fprintf(stderr, "[SKIP] %-40s  (not found in CUBIN)\n", t.name);
-                skip++;
+    int pass = 0, fail = 0, skip = 0;
+    for (auto& t : all_tests) {
+        if (!t.verify) {
+            fprintf(stderr, "[SKIP] %-40s  (not found in CUBIN)\n", t.name);
+            skip++;
+        } else {
+            int mis = t.verify();
+            if (mis == 0) {
+                fprintf(stderr, "[PASS] %-40s  %d/%d\n", t.name, t.total, t.total);
+                pass++;
             } else {
-                int mis = t.verify();
-                if (mis == 0) {
-                    fprintf(stderr, "[PASS] %-40s  %d/%d\n", t.name, t.total, t.total);
-                    pass++;
-                } else {
-                    fprintf(stderr, "[FAIL] %-40s  %d/%d mismatches\n", t.name, mis, t.total);
-                    fail++;
-                }
+                fprintf(stderr, "[FAIL] %-40s  %d/%d mismatches\n", t.name, mis, t.total);
+                fail++;
             }
         }
-        fprintf(stderr, "\n");
     }
 
-    fprintf(stderr, "%d/%d PASS", pass, n_tests);
+    fprintf(stderr, "\n%d/%d PASS", pass, n_tests);
     if (fail) fprintf(stderr, ", %d FAIL", fail);
     if (skip) fprintf(stderr, ", %d SKIP", skip);
     fprintf(stderr, "\n");
