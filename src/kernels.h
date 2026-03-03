@@ -147,6 +147,13 @@ void im2col_2d_fp16(const half* input, half* col,
                     int H_out, int W_out, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
+// Row-broadcast bias add: x[i,j] += bias[j] for i in [0,rows), j in [0,cols)
+//   x: [rows, cols] row-major, bias: [cols]
+// ---------------------------------------------------------------------------
+void bias_add_fp16(half* x, const half* bias, int rows, int cols,
+                   cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
 // Per-channel bias + ReLU for NCHW data (in-place)
 //   x[c, s] = max(x[c, s] + bias[c], 0) for s in [0, spatial)
 // ---------------------------------------------------------------------------

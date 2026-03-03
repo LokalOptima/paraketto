@@ -7,6 +7,7 @@
 #include "conformer.h"
 #include "common.h"
 #include "kernels.h"
+#include "cutlass_gemm.h"
 
 #include <cassert>
 #include <cmath>
@@ -308,17 +309,6 @@ void Weights::print_info() const {
 // CudaModel — encoder + decoder forward pass
 // =========================================================================
 
-// cuBLAS error checking
-#define CUBLAS_CHECK(call)                                                     \
-    do {                                                                       \
-        cublasStatus_t stat = (call);                                         \
-        if (stat != CUBLAS_STATUS_SUCCESS) {                                  \
-            fprintf(stderr, "cuBLAS error at %s:%d: %d\n",                    \
-                    __FILE__, __LINE__, (int)stat);                            \
-            std::exit(1);                                                     \
-        }                                                                     \
-    } while (0)
-
 // ---------------------------------------------------------------------------
 // CudaModel::init
 // ---------------------------------------------------------------------------
@@ -328,15 +318,7 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames)
     stream = s;
     T_max = max_mel_frames / 8 + 10;  // encoder frames after 8x downsampling
 
-    CUBLAS_CHECK(cublasCreate(&cublas));
-    CUBLAS_CHECK(cublasSetStream(cublas, stream));
-    CUBLAS_CHECK(cublasSetMathMode(cublas, CUBLAS_TENSOR_OP_MATH));
-    CUBLAS_CHECK(cublasLtCreate(&cublaslt));
-
-    // Shared workspace for cublasLt algorithm search and matmul
-    lt_workspace_size = 32 * 1024 * 1024;  // 32MB workspace
-    CUDA_CHECK(cudaMalloc(&lt_workspace, lt_workspace_size));
-    CUBLAS_CHECK(cublasSetWorkspace(cublas, lt_workspace, lt_workspace_size));
+    cutlass_gemm_init(stream);
 
     // --- Single pooled GPU allocation for all inference buffers ---
     // Replaces ~35 individual cudaMalloc calls with one.
@@ -506,235 +488,33 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames)
 }
 
 // ---------------------------------------------------------------------------
-// cublasLt GEMM algorithm cache (forward declaration for free())
-// ---------------------------------------------------------------------------
-
-struct GemmKey {
-    int m, n, k;
-    cublasOperation_t opA, opB;
-    bool accumulate;
-    bool has_bias;
-    bool operator==(const GemmKey& o) const {
-        return m == o.m && n == o.n && k == o.k && opA == o.opA && opB == o.opB
-            && accumulate == o.accumulate && has_bias == o.has_bias;
-    }
-};
-struct GemmKeyHash {
-    size_t operator()(const GemmKey& k) const {
-        size_t h = std::hash<int>()(k.m);
-        h ^= std::hash<int>()(k.n) * 2654435761ULL;
-        h ^= std::hash<int>()(k.k) * 40343;
-        h ^= std::hash<int>()(k.opA) * 73;
-        h ^= std::hash<int>()(k.opB) * 131;
-        h ^= std::hash<int>()(k.accumulate) * 257;
-        h ^= std::hash<int>()(k.has_bias) * 521;
-        return h;
-    }
-};
-struct GemmPlan {
-    cublasLtMatmulDesc_t matmul_desc;
-    cublasLtMatrixLayout_t layout_A, layout_B, layout_C;
-    cublasLtMatmulAlgo_t algo;
-    bool valid;
-};
-static std::unordered_map<GemmKey, GemmPlan, GemmKeyHash> gemm_cache;
-
-// ---------------------------------------------------------------------------
 // CudaModel::free
 // ---------------------------------------------------------------------------
 
 void CudaModel::free() {
-    if (cublas) { cublasDestroy(cublas); cublas = nullptr; }
-    if (cublaslt) { cublasLtDestroy(cublaslt); cublaslt = nullptr; }
-    // Clean up cached cublasLt plans
-    for (auto& [key, plan] : gemm_cache) {
-        cublasLtMatmulDescDestroy(plan.matmul_desc);
-        cublasLtMatrixLayoutDestroy(plan.layout_A);
-        cublasLtMatrixLayoutDestroy(plan.layout_B);
-        cublasLtMatrixLayoutDestroy(plan.layout_C);
-    }
-    gemm_cache.clear();
-    if (lt_workspace) { cudaFree(lt_workspace); lt_workspace = nullptr; }
+    cutlass_gemm_free();
     // All inference buffers are carved from a single pooled allocation
     if (gpu_pool) { cudaFree(gpu_pool); gpu_pool = nullptr; }
 }
 
-// ---------------------------------------------------------------------------
-// cublasLt GEMM with algorithm caching
-// ---------------------------------------------------------------------------
+// GEMM wrappers — thin forwarders to cutlass_gemm.h functions.
+// These exist so the encoder/decoder code doesn't need to change its call patterns.
 
-static GemmPlan& get_gemm_plan(cublasLtHandle_t lt, void* workspace, size_t ws_size,
-                                int col_m, int col_n, int col_k,
-                                int ldA, int ldB, int ldC,
-                                cublasOperation_t opA, cublasOperation_t opB,
-                                bool accumulate, bool has_bias = false) {
-    GemmKey key{col_m, col_n, col_k, opA, opB, accumulate, has_bias};
-    auto it = gemm_cache.find(key);
-    if (it != gemm_cache.end()) return it->second;
-
-    GemmPlan plan;
-    plan.valid = false;
-
-    CUBLAS_CHECK(cublasLtMatmulDescCreate(&plan.matmul_desc, CUBLAS_COMPUTE_16F, CUDA_R_16F));
-    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(plan.matmul_desc,
-        CUBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof(opA)));
-    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(plan.matmul_desc,
-        CUBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB)));
-
-    if (has_bias) {
-        cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_BIAS;
-        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(plan.matmul_desc,
-            CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
-    }
-
-    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&plan.layout_A, CUDA_R_16F,
-        opA == CUBLAS_OP_N ? col_m : col_k,
-        opA == CUBLAS_OP_N ? col_k : col_m, ldA));
-    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&plan.layout_B, CUDA_R_16F,
-        opB == CUBLAS_OP_N ? col_k : col_n,
-        opB == CUBLAS_OP_N ? col_n : col_k, ldB));
-    CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&plan.layout_C, CUDA_R_16F, col_m, col_n, ldC));
-
-    // Search for best algorithm
-    cublasLtMatmulPreference_t pref;
-    CUBLAS_CHECK(cublasLtMatmulPreferenceCreate(&pref));
-    CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(pref,
-        CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws_size, sizeof(ws_size)));
-
-    cublasLtMatmulHeuristicResult_t results[8];
-    int n_results = 0;
-    CUBLAS_CHECK(cublasLtMatmulAlgoGetHeuristic(lt, plan.matmul_desc,
-        plan.layout_A, plan.layout_B, plan.layout_C, plan.layout_C,
-        pref, 8, results, &n_results));
-    cublasLtMatmulPreferenceDestroy(pref);
-
-    if (n_results > 0) {
-        plan.algo = results[0].algo;
-        plan.valid = true;
-    }
-
-    return gemm_cache.emplace(key, plan).first->second;
-}
-
-// Core cublasLt GEMM call using cached plan
-static void lt_gemm(cublasLtHandle_t lt, cublasHandle_t h,
-                      void* workspace, size_t ws_size, cudaStream_t stream,
-                      cublasOperation_t opA, cublasOperation_t opB,
-                      int col_m, int col_n, int col_k,
-                      const half* A, int ldA,
-                      const half* B, int ldB,
-                      half* C, int ldC,
-                      bool accumulate, const half* bias = nullptr) {
-    half alpha = __float2half(1.0f);
-    half beta = __float2half(accumulate ? 1.0f : 0.0f);
-
-    GemmPlan& plan = get_gemm_plan(lt, workspace, ws_size,
-                                     col_m, col_n, col_k, ldA, ldB, ldC,
-                                     opA, opB, accumulate, bias != nullptr);
-    if (plan.valid) {
-        if (bias) {
-            CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(plan.matmul_desc,
-                CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias, sizeof(bias)));
-        }
-        CUBLAS_CHECK(cublasLtMatmul(lt, plan.matmul_desc,
-            &alpha, A, plan.layout_A, B, plan.layout_B,
-            &beta, C, plan.layout_C, C, plan.layout_C,
-            &plan.algo, workspace, ws_size, stream));
-    } else {
-        // Fallback to cublasGemmEx (no bias epilogue support)
-        CUBLAS_CHECK(cublasGemmEx(h, opA, opB,
-            col_m, col_n, col_k, &alpha, A, CUDA_R_16F, ldA,
-            B, CUDA_R_16F, ldB, &beta, C, CUDA_R_16F, ldC,
-            CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-    }
-}
-
-// Y[m,n] = X[m,k] @ W[k,n]   (ONNX MatMul convention: W is [input, output])
-static void gemm_nn(cublasLtHandle_t lt, cublasHandle_t h,
-                     void* ws, size_t ws_size, cudaStream_t stream,
-                     const half* X, int m, int k,
+static void gemm_nn(cudaStream_t stream, const half* X, int m, int k,
                      const half* W, int n, half* Y) {
-    // Row-major: Y[m,n] = X[m,k] @ W[k,n]
-    // Col-major: Y'[n,m] = W'[n,k] @ X'[k,m]
-    lt_gemm(lt, h, ws, ws_size, stream, CUBLAS_OP_N, CUBLAS_OP_N,
-            n, m, k, W, n, X, k, Y, n, false);
+    cutlass_gemm_nn(stream, X, m, k, W, n, Y);
 }
-
-// Y[m,n] = X[m,k] @ W[k,n] + bias[n]  (ONNX MatMul + bias epilogue)
-static void gemm_nn_bias(cublasLtHandle_t lt, cublasHandle_t h,
-                          void* ws, size_t ws_size, cudaStream_t stream,
-                          const half* X, int m, int k,
+static void gemm_nn_bias(cudaStream_t stream, const half* X, int m, int k,
                           const half* W, int n, const half* bias, half* Y) {
-    lt_gemm(lt, h, ws, ws_size, stream, CUBLAS_OP_N, CUBLAS_OP_N,
-            n, m, k, W, n, X, k, Y, n, false, bias);
+    cutlass_gemm_nn_bias(stream, X, m, k, W, n, bias, Y);
 }
-
-// Y[m,n] = X[m,k] @ W[n,k]^T  (Conv/PyTorch convention: W is [output, input])
-static void gemm_nt(cublasLtHandle_t lt, cublasHandle_t h,
-                     void* ws, size_t ws_size, cudaStream_t stream,
-                     const half* X, int m, int k,
+static void gemm_nt(cudaStream_t stream, const half* X, int m, int k,
                      const half* W, int n, half* Y) {
-    // Row-major: Y[m,n] = X[m,k] @ W[n,k]^T
-    // Col-major: Y'[n,m] = W_T'[n,k] @ X'[k,m], W_T = CUBLAS_OP_T on W[k,n]-col
-    lt_gemm(lt, h, ws, ws_size, stream, CUBLAS_OP_T, CUBLAS_OP_N,
-            n, m, k, W, k, X, k, Y, n, false);
+    cutlass_gemm_nt(stream, X, m, k, W, n, Y);
 }
-
-// Y += X @ W[n,k]^T  (accumulate, Conv/PyTorch convention)
-static void gemm_nt_accum(cublasLtHandle_t lt, cublasHandle_t h,
-                            void* ws, size_t ws_size, cudaStream_t stream,
-                            const half* X, int m, int k,
-                            const half* W, int n, half* Y) {
-    lt_gemm(lt, h, ws, ws_size, stream, CUBLAS_OP_T, CUBLAS_OP_N,
-            n, m, k, W, k, X, k, Y, n, true);
-}
-
-// Y[m,n] = X[m,k] @ W[n,k]^T + bias[n]  (NT with bias epilogue)
-static void gemm_nt_bias(cublasLtHandle_t lt, cublasHandle_t h,
-                           void* ws, size_t ws_size, cudaStream_t stream,
-                           const half* X, int m, int k,
+static void gemm_nt_bias(cudaStream_t stream, const half* X, int m, int k,
                            const half* W, int n, const half* bias, half* Y) {
-    lt_gemm(lt, h, ws, ws_size, stream, CUBLAS_OP_T, CUBLAS_OP_N,
-            n, m, k, W, k, X, k, Y, n, false, bias);
-}
-
-// Y += X @ W[n,k]^T + bias[n]  (NT accumulate with bias epilogue)
-static void gemm_nt_accum_bias(cublasLtHandle_t lt, cublasHandle_t h,
-                                 void* ws, size_t ws_size, cudaStream_t stream,
-                                 const half* X, int m, int k,
-                                 const half* W, int n, const half* bias, half* Y) {
-    lt_gemm(lt, h, ws, ws_size, stream, CUBLAS_OP_T, CUBLAS_OP_N,
-            n, m, k, W, k, X, k, Y, n, true, bias);
-}
-
-// Batched strided GEMM: C[b,m,n] = A[b,m,k] @ B[b,k,n]
-// A is [b,m,k], B is [b,k,n], C is [b,m,n]
-static void batched_gemm_nn(cublasHandle_t h,
-                             const half* A, const half* B, half* C,
-                             int batch, int m, int n, int k,
-                             long long strideA, long long strideB, long long strideC) {
-    half alpha = __float2half(1.0f), beta = __float2half(0.0f);
-    // Row-major C[m,n] = A[m,k] @ B[k,n]
-    // Col-major: C'[n,m] = B'[n,k] @ A'[k,m]
-    CUBLAS_CHECK(cublasGemmStridedBatchedEx(h, CUBLAS_OP_N, CUBLAS_OP_N,
-        n, m, k, &alpha, B, CUDA_R_16F, n, strideB,
-        A, CUDA_R_16F, k, strideA, &beta, C, CUDA_R_16F, n, strideC,
-        batch, CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-}
-
-// Batched strided GEMM: C[b,m,n] = A[b,m,k] @ B[b,n,k]^T  (B transposed)
-// A is [b,m,k], B is [b,n,k], C is [b,m,n]
-static void batched_gemm_nt(cublasHandle_t h,
-                             const half* A, const half* B, half* C,
-                             int batch, int m, int n, int k,
-                             long long strideA, long long strideB, long long strideC) {
-    half alpha = __float2half(1.0f), beta = __float2half(0.0f);
-    // Row-major C[m,n] = A[m,k] @ B[n,k]^T
-    // Col-major: C'[n,m] = B_T'[n,k] @ A'[k,m], B_T = CUBLAS_OP_T
-    CUBLAS_CHECK(cublasGemmStridedBatchedEx(h, CUBLAS_OP_T, CUBLAS_OP_N,
-        n, m, k, &alpha, B, CUDA_R_16F, k, strideB,
-        A, CUDA_R_16F, k, strideA, &beta, C, CUDA_R_16F, n, strideC,
-        batch, CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    cutlass_gemm_nt_bias(stream, X, m, k, W, n, bias, Y);
 }
 
 // Position encoding generation moved to GPU kernel (generate_pos_encoding_gpu)
@@ -751,15 +531,15 @@ int CudaModel::encode(const float* mel_fp32_host, int T_mel) {
 }
 
 int CudaModel::encode_gpu(int T_mel) {
-    // Local GEMM helpers that capture cublasLt context
+    // Local GEMM helpers that capture stream
     auto gnn = [&](const half* X, int m, int k, const half* W, int n, half* Y) {
-        gemm_nn(cublaslt, cublas, lt_workspace, lt_workspace_size, stream, X, m, k, W, n, Y);
+        gemm_nn(stream, X, m, k, W, n, Y);
     };
     auto gnt = [&](const half* X, int m, int k, const half* W, int n, half* Y) {
-        gemm_nt(cublaslt, cublas, lt_workspace, lt_workspace_size, stream, X, m, k, W, n, Y);
+        gemm_nt(stream, X, m, k, W, n, Y);
     };
     auto gnn_bias = [&](const half* X, int m, int k, const half* W, int n, const half* bias, half* Y) {
-        gemm_nn_bias(cublaslt, cublas, lt_workspace, lt_workspace_size, stream, X, m, k, W, n, bias, Y);
+        gemm_nn_bias(stream, X, m, k, W, n, bias, Y);
     };
 
     // 1. Cast mel to FP16, then transpose
@@ -773,15 +553,11 @@ int CudaModel::encode_gpu(int T_mel) {
 
     // 2. Subsampling: [1, T_mel, 128] → [T', 1024]
     //    conv.0 (1→256, 3x3, s=2) → bias+ReLU
-    //    im2col + cuBLAS GEMM replaces naive conv2d (256x input reuse via GEMM)
     int H = T_mel, W = 128;
     int H2 = (H + 2 * 1 - 3) / 2 + 1;
     int W2 = (W + 2 * 1 - 3) / 2 + 1;  // 64
-    // im2col: [1, H, W] → [9, H2*W2] into ff_mid (free during subsampling)
-    im2col_2d_fp16(sub_buf[0], ff_mid, 1, H, W, 3, 3, 2, 1, H2, W2, stream);
-    // GEMM: output[256, H2*W2] = weight[256, 9] @ im2col[9, H2*W2]
-    gnn(/*X=*/w->sub_conv[0].weight, SUB_CHANNELS, 9,
-        /*W=*/ff_mid, H2 * W2, /*Y=*/sub_buf[1]);
+    conv2d_fp16(sub_buf[0], w->sub_conv[0].weight, nullptr,
+                sub_buf[1], 1, H, W, SUB_CHANNELS, 3, 3, 2, 1, 1, stream);
     bias_relu_nchw_fp16(sub_buf[1], w->sub_conv[0].bias, SUB_CHANNELS, H2 * W2, stream);
     H = H2; W = W2;
 
@@ -850,31 +626,26 @@ int CudaModel::encode_gpu(int T_mel) {
             half* pos_temp = pos_proj;
             gnn(pos_enc_T, pos_len, D_MODEL, b.pos_w, D_MODEL, pos_temp);
 
-            // Position scores via strided batched GEMM (no pointer arrays/H2D copies)
-            {
-                half alpha_h = __float2half(1.0f), beta_h = __float2half(0.0f);
-                CUBLAS_CHECK(cublasGemmStridedBatchedEx(cublas,
-                    CUBLAS_OP_T, CUBLAS_OP_N,
-                    pos_len, T, HEAD_DIM,
-                    &alpha_h,
-                    pos_temp, CUDA_R_16F, D_MODEL, (long long)HEAD_DIM,
-                    q_v_buf, CUDA_R_16F, HEAD_DIM, (long long)T * HEAD_DIM,
-                    &beta_h,
-                    pos_scores, CUDA_R_16F, pos_len, (long long)T * pos_len,
-                    N_HEADS, CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-            }
+            // Position scores via strided batched GEMM
+            // Row-major NT: pos_scores[h,T,pos_len] = q_v[h,T,HEAD_DIM] @ pos[h,pos_len,HEAD_DIM]^T
+            // pos_temp has non-standard ld=D_MODEL (interleaved heads), stride=HEAD_DIM between heads
+            cutlass_batched_gemm_nt_ex(stream,
+                q_v_buf, HEAD_DIM, (long long)T * HEAD_DIM,        // A: [T, HEAD_DIM] per head
+                pos_temp, D_MODEL, (long long)HEAD_DIM,            // B: [pos_len, HEAD_DIM] ld=D_MODEL
+                pos_scores, pos_len, (long long)T * pos_len,       // C: [T, pos_len] per head
+                N_HEADS, T, pos_len, HEAD_DIM);
 
             float scale = 1.0f / sqrtf((float)HEAD_DIM);
 
             // Content attention scores: [8, T, T] = q_u @ K^T
-            batched_gemm_nt(cublas, q_u, K_h, scores,
+            cutlass_batched_gemm_nt(stream, q_u, K_h, scores,
                             N_HEADS, T, T, HEAD_DIM,
                             (long long)T * HEAD_DIM, (long long)T * HEAD_DIM, (long long)T * T);
             // Fused: (content + pos_skew) * scale + softmax
             fused_score_softmax_fp16(scores, pos_scores, scores,
                                       N_HEADS, T, scale, stream);
             // Weighted sum: [8, T, 128] = scores @ V
-            batched_gemm_nn(cublas, scores, V_h, attn_out,
+            cutlass_batched_gemm_nn(stream, scores, V_h, attn_out,
                             N_HEADS, T, HEAD_DIM, T,
                             (long long)T * T, (long long)T * HEAD_DIM, (long long)T * HEAD_DIM);
             // Transpose [8, T, 128] → [T, 8, 128] = [T, 1024]
@@ -937,10 +708,10 @@ void CudaModel::decoder_reset() {
 
 half* CudaModel::decode_step(int enc_frame_idx, int prev_token) {
     auto gnn_b = [&](const half* X, int m, int k, const half* W, int n, const half* bias, half* Y) {
-        gemm_nn_bias(cublaslt, cublas, lt_workspace, lt_workspace_size, stream, X, m, k, W, n, bias, Y);
+        gemm_nn_bias(stream, X, m, k, W, n, bias, Y);
     };
     auto gnt_b = [&](const half* X, int m, int k, const half* W, int n, const half* bias, half* Y) {
-        gemm_nt_bias(cublaslt, cublas, lt_workspace, lt_workspace_size, stream, X, m, k, W, n, bias, Y);
+        gemm_nt_bias(stream, X, m, k, W, n, bias, Y);
     };
 
     // 1. Embed + concat with h[0] for LSTM0 input: lstm_input = [embed; h[0]]

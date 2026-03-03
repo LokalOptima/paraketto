@@ -15,8 +15,6 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
-#include <cublas_v2.h>
-#include <cublasLt.h>
 
 // ---------------------------------------------------------------------------
 // Weight file format constants
@@ -193,10 +191,6 @@ static constexpr int D_JOINT    = 640;
 static constexpr int D_OUTPUT   = 1030;  // joint output (vocab + durations)
 
 struct CudaModel {
-    cublasHandle_t cublas = nullptr;
-    cublasLtHandle_t cublaslt = nullptr;
-    void* lt_workspace = nullptr;
-    size_t lt_workspace_size = 0;
     cudaStream_t   stream = nullptr;
     const Weights* w = nullptr;
 
