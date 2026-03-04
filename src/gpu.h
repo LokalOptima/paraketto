@@ -882,8 +882,8 @@ public:
 
         qmd.dw[4] = 0x013f0000;   // qmd_type=GRID_CTA, group_id=0x3F
         qmd.dw[9] = 0x00000000;   // QMD release disabled
-        qmd.dw[10] = 0x00190000;
-        qmd.dw[12] = 0x02070100;
+        qmd.dw[10] = 0x00000000;  // dependent_qmd0 fields — set by chaining code, not template
+        qmd.dw[12] = 0x00000000;  // dependent_qmd0 pointer — set by chaining code, not template
         qmd.dw[14] = 0x2f5003a4;  // sass_version=0xa4, sampler_index=1, major=5
         qmd.dw[19] = 0x80610000;  // cwd_membar_type=1
         qmd.dw[20] = 0x00000008;
@@ -972,6 +972,7 @@ public:
         // This fires when the kernel actually completes — no usleep needed.
         if (last_qmd_cpu) {
             QMD* last = (QMD*)last_qmd_cpu;
+            last->set(336, 336, 0);  // Disable dependent_qmd0 on last kernel (no successor)
             last->set_release_semaphore(0, sem_alloc.gpu_addr, sem_counter);
             __sync_synchronize();
         }
