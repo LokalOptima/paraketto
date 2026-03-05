@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="paraketto.png" width="256" alt="parakettő">
+</p>
+
 # parakettő
 
 Batch-1 speech-to-text inference for NVIDIA's [Parakeet TDT 0.6B V2](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2), written in C++ with custom CUDA kernels. No frameworks, no Python at runtime.
