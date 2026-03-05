@@ -24,6 +24,15 @@
 #include "vocab.h"
 #include "server.h"
 
+#ifdef EMBEDDED_WEIGHTS
+extern "C" {
+    extern const uint8_t _binary_weights_bin_start[];
+    extern const uint8_t _binary_weights_bin_end[];
+}
+static const uint8_t* paraketto_weights_start = _binary_weights_bin_start;
+static const uint8_t* paraketto_weights_end   = _binary_weights_bin_end;
+#endif
+
 // ---------------------------------------------------------------------------
 // Inference pipeline (CUDA backend)
 // ---------------------------------------------------------------------------
@@ -172,11 +181,20 @@ int main(int argc, char** argv) {
     using clk = std::chrono::high_resolution_clock;
     auto t_main_start = clk::now();
 
-    // Prefetch weights (mmap + populate pages) in background while CUDA inits
     Weights prefetched;
-    std::thread prefetch_thread([&]() {
+    std::thread prefetch_thread;
+
+#ifdef EMBEDDED_WEIGHTS
+    // Embedded weights: parse header (fast, no I/O)
+    prefetched = Weights::from_embedded(
+        paraketto_weights_start,
+        paraketto_weights_end - paraketto_weights_start);
+#else
+    // Prefetch weights (mmap + populate pages) in background while CUDA inits
+    prefetch_thread = std::thread([&]() {
         prefetched = Weights::prefetch(weights_path);
     });
+#endif
 
     // Force CUDA driver/context initialization (overlaps with prefetch)
     cudaFree(0);
@@ -187,7 +205,7 @@ int main(int argc, char** argv) {
         if (wav_fd >= 0) { posix_fadvise(wav_fd, 0, 0, POSIX_FADV_WILLNEED); close(wav_fd); }
     }
 
-    prefetch_thread.join();
+    if (prefetch_thread.joinable()) prefetch_thread.join();
     auto t_prefetch = clk::now();
 
     Pipeline pipeline;

@@ -48,6 +48,7 @@ struct Weights {
     void* mmap_ptr = nullptr;
     size_t mmap_size = 0;
     size_t data_offset = 0;          // offset to data section within mmap
+    const uint8_t* embedded_ptr = nullptr;  // non-null if from_embedded()
 
     // Parsed index (kept for diagnostics)
     std::vector<TensorDesc> tensors;
@@ -159,7 +160,10 @@ struct Weights {
     /// Call upload() after CUDA context is ready.
     static Weights prefetch(const std::string& path);
 
-    /// Phase 2: cudaMalloc + cudaMemcpy from prefetched mmap, then assign pointers.
+    /// Phase 1 (embedded): parse header from in-memory data (no mmap, no file).
+    static Weights from_embedded(const uint8_t* data, size_t size);
+
+    /// Phase 2: cudaMalloc + cudaMemcpy from prefetched/embedded data, then assign pointers.
     void upload(cudaStream_t stream = nullptr);
 
     /// Free the GPU allocation.

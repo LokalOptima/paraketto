@@ -23,7 +23,6 @@ static cublasHandle_t   s_cublas   = nullptr;
 static cublasLtHandle_t s_cublaslt = nullptr;
 static void*  s_workspace      = nullptr;
 static size_t s_workspace_size = 0;
-static cudaStream_t s_stream   = nullptr;
 
 // =========================================================================
 // cublasLt algorithm cache
@@ -64,7 +63,6 @@ static std::unordered_map<GemmKey, GemmPlan, GemmKeyHash> s_gemm_cache;
 // =========================================================================
 
 void gemm_init(cudaStream_t stream) {
-    s_stream = stream;
     CUBLAS_CHECK(cublasCreate(&s_cublas));
     CUBLAS_CHECK(cublasSetStream(s_cublas, stream));
     CUBLAS_CHECK(cublasSetMathMode(s_cublas, CUBLAS_TENSOR_OP_MATH));

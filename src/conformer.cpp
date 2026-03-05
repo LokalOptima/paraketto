@@ -198,11 +198,62 @@ Weights Weights::prefetch(const std::string& path) {
 }
 
 // ---------------------------------------------------------------------------
+// Weights::from_embedded — parse header from in-memory data (no mmap).
+// ---------------------------------------------------------------------------
+
+Weights Weights::from_embedded(const uint8_t* data, size_t size) {
+    Weights w;
+    const uint8_t* base = data;
+
+    uint32_t magic;
+    memcpy(&magic, base, 4);
+    if (magic != PRKT_MAGIC) {
+        fprintf(stderr, "Bad magic in embedded weights\n");
+        std::exit(1);
+    }
+
+    uint32_t version;
+    memcpy(&version, base + 4, 4);
+    if (version != PRKT_VERSION) {
+        fprintf(stderr, "Unsupported embedded weight version %u (expected %u)\n", version, PRKT_VERSION);
+        std::exit(1);
+    }
+
+    uint64_t header_len;
+    memcpy(&header_len, base + 8, 8);
+    w.tensors = parse_header((const char*)(base + 16), header_len);
+
+    for (size_t i = 0; i < w.tensors.size(); i++)
+        w.name_to_idx[w.tensors[i].name] = i;
+
+    size_t header_end = 16 + header_len;
+    size_t data_start = align_up(header_end, HEADER_ALIGN);
+
+    size_t total_data = 0;
+    for (auto& td : w.tensors) {
+        size_t end = td.offset + td.size_bytes;
+        if (end > total_data) total_data = end;
+    }
+    if (!w.tensors.empty()) {
+        auto& last = w.tensors.back();
+        total_data = std::max(total_data, align_up(last.offset + last.size_bytes, 256));
+    }
+
+    w.gpu_data_size = total_data;
+    w.mmap_ptr = nullptr;       // not mmap'd — don't munmap
+    w.mmap_size = 0;
+    w.data_offset = data_start;
+    w.embedded_ptr = data;       // store for upload
+
+    return w;
+}
+
+// ---------------------------------------------------------------------------
 // Weights::upload — cudaMalloc + cudaMemcpy from prefetched mmap, assign ptrs.
 // ---------------------------------------------------------------------------
 
 void Weights::upload(cudaStream_t stream) {
-    const uint8_t* base = (const uint8_t*)mmap_ptr;
+    const uint8_t* base = embedded_ptr ? embedded_ptr : (const uint8_t*)mmap_ptr;
 
     CUDA_CHECK(cudaMalloc(&gpu_data, gpu_data_size));
     if (stream) {
@@ -214,9 +265,12 @@ void Weights::upload(cudaStream_t stream) {
                                cudaMemcpyHostToDevice));
     }
 
-    munmap(mmap_ptr, mmap_size);
-    mmap_ptr = nullptr;
-    mmap_size = 0;
+    if (mmap_ptr) {
+        munmap(mmap_ptr, mmap_size);
+        mmap_ptr = nullptr;
+        mmap_size = 0;
+    }
+    embedded_ptr = nullptr;
     data_offset = 0;
 
     assign_weight_pointers(*this);
@@ -480,6 +534,8 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames)
                               lstm_combined_bias[layer], 4 * D_PRED, 1.0f, stream);
         }
     }
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
 
     // Pre-compute position encoding for T_max (reused via offset for any T <= T_max)
     generate_pos_encoding_gpu(pos_enc, T_max, D_MODEL, stream);

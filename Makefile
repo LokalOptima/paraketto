@@ -98,5 +98,18 @@ src/cublas_gemm.o: src/cublas_gemm.cu src/gemm.h src/kernels.h
 paraketto.cublas: $(CONFORMER_DEPS) src/kernels.o src/cublas_gemm.o
 	$(CXX) $(CUDA_CXXFLAGS) src/paraketto_cuda.cpp src/conformer.cpp src/kernels.o src/cublas_gemm.o $(CUDA_LDFLAGS) -lcublas -lcublasLt -o $@
 
+# Static build with embedded weights (single file, only needs NVIDIA driver)
+weights_embedded.o: weights.bin
+	objcopy -I binary -O elf64-x86-64 -B i386:x86-64 \
+		--rename-section .data=.rodata,alloc,load,readonly,data,contents \
+		$< $@
+
+paraketto.static: $(CONFORMER_DEPS) src/kernels.o src/cutlass_gemm.o src/cutlass_gemm.h weights_embedded.o
+	$(CXX) $(CUDA_CXXFLAGS) -DEMBEDDED_WEIGHTS \
+		src/paraketto_cuda.cpp src/conformer.cpp src/kernels.o src/cutlass_gemm.o weights_embedded.o \
+		-static-libstdc++ -static-libgcc \
+		-L$(CUDA_HOME)/lib64 $(CUDA_HOME)/lib64/libcudart_static.a -ldl -lpthread -lrt \
+		-o $@
+
 clean:
-	rm -f paraketto paraketto.cuda paraketto.cublas src/kernels.o src/cutlass_gemm.o src/cublas_gemm.o
+	rm -f paraketto paraketto.cuda paraketto.cublas paraketto.static src/kernels.o src/cutlass_gemm.o src/cublas_gemm.o weights_embedded.o

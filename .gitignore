@@ -32,6 +32,7 @@ Thumbs.db
 paraketto
 paraketto.cuda
 paraketto.cublas
+paraketto.static
 paraketto.fp8
 *.o
 
