@@ -1351,3 +1351,69 @@ vector-matrix products) are the biggest win.
 6. **SM80 vs SM120a compilation doesn't matter.** Same CUTLASS templates compiled with `-arch=sm_80` vs `-arch=sm_120a` — no meaningful difference.
 
 The final state is two build targets: `paraketto.cuda` (CUTLASS only, `cudart` as the sole dependency) and `paraketto.cublas` (cuBLAS, ~2% faster). Both share the same `conformer.cpp` via a `gemm.h` abstraction layer.
+
+---
+
+### Step 20: FF Linear2 Split-K Tuning — 1204x → 1258x
+
+After replacing cuBLAS with CUTLASS, the one persistent gap was the FF linear2 shape: `1024×T×4096`, called 48 times per utterance (24 encoder blocks × 2 FF modules). T varies with audio length — at 10 seconds it's around 125 frames.
+
+#### What cuBLAS was doing
+
+Used `ncu --print-summary per-kernel` to profile cuBLAS on specific T values. At small T, cuBLAS uses split-K parallel GEMM with varying tile sizes:
+
+- T≤64: `128x128_32x5_nn` with split_k=4
+- T=65–128: `128x64_32x4_nn` with split_k=4
+- T=129–256: `256x64_32x4_nn` with split_k=3/4
+- T=257–448: `64x128_32x5_nn` (regular)
+- T=449–800: `128x128_32x5_nn` with split_k=2/3/4
+
+#### The swizzle problem
+
+`GemmSplitKParallel` in CUTLASS 2.x uses `GemmSplitKHorizontalThreadblockSwizzle`, which maps the grid as `(ceil(M/TbN), ceil(N/TbM), sk)` — swapping the M and N tile counts. For a 256×64 tile on a 1024×260 problem, this gives `(ceil(1024/64), ceil(260/256), 3)` = `(16, 2, 3)` = 96 blocks, instead of the correct `(ceil(1024/256) × ceil(260/64), 1, 3)` = `(20, 1, 3)` = 60 blocks. 60% wasted work.
+
+cuBLAS uses `GemmIdentityThreadblockSwizzle` with split-K — the correct grid. This is not exposed through `GemmSplitKParallel`.
+
+#### What we found
+
+After profiling with ncu and running benchmarks across T=63–800:
+
+| T range | cuBLAS kernel | Our kernel | Ratio |
+|---------|--------------|------------|-------|
+| ≤64 | 128x128 sk=4 | 64x64 sk=4 | −20% (cuBLAS wins) |
+| 65–128 | 128x64 sk=4 | 128x64 sk=4 | −14% (we win) |
+| 129–192 | 256x64 sk=3 | 64x64 s6 | −11% (we win) |
+| 193–256 | 256x64 sk=4 | 128x64 sk=4 | tied at 20.5μs |
+| 257–279 | 256x64 sk=3 | 64x128 s5 | −8.5% (cuBLAS wins, wrong swizzle) |
+| 280–448 | 64x128 s5 | 64x128 s5 | tied |
+| 449–512 | 128x128 sk=2 | 128x128 sk=2 | −7% (we win) |
+| 513–640 | 128x128 sk=3 | 128x128 sk=3 | −9% (we win) |
+| 641–800 | 128x128 sk=4 | 128x128 sk=4 | −12–19% (we win) |
+
+The T=257–279 gap (corresponding to ~20–22 second utterances) is a fundamental CUTLASS 2.x limitation — the swizzle inflates the grid and can't be fixed without using `GemmUniversal`. For the benchmark dataset, this range is rare enough that it barely affects overall RTFx.
+
+#### Dispatch update
+
+Updated `nn_dispatch()` in `cutlass_gemm.cu` with correct boundaries. Added `GemmSplitKNN_128x64_32_s5` for T=65–128 and T=193–256, `GemmNN_64x128_k32_s5` for T=257–448, and `GemmSplitKNN_128x128_32_s5` with split_k=2/3/4 for T=449–800.
+
+#### Results
+
+```
+                 CUTLASS (cudart only)          cuBLAS (+ libcublas)
+              ────────────────────────────   ────────────────────────────
+               RTFx    WER    Audio  Time     RTFx    WER    Audio  Time
+librispeech   1083x   1.68%   896s  827ms    1042x   1.68%   896s  860ms
+earnings22     982x  16.48%   253s  258ms     965x  16.48%   253s  262ms
+long          1313x   1.92%  5578s  4.25s    1277x   1.90%  5578s  4.37s
+difficult     1215x  23.41%   509s  419ms    1226x  23.32%   509s  415ms
+              ────────────────────────────   ────────────────────────────
+Total         1258x          7236s  5.75s    1226x          7236s  5.90s
+```
+
+**CUTLASS now outperforms cuBLAS overall: 1258x vs 1226x (+2.6%).** The split-K tuning recovered the gap in the medium-T range and added gains at large T through 128x128 split-K parallelism that cuBLAS's heuristics miss.
+
+#### On CUTLASS 3.x/4.x and TMA
+
+CUTLASS 4.4.1 does have `sm120_mma_tma.hpp` — a TMA-based mainloop for the RTX 5070 Ti. But the `CollectiveBuilder` for sm_120 enforces a hard `static_assert` refusing FP16: it only supports FP4/FP6/FP8 (block-scaled narrow precision). For FP16, sm_120 uses the same `mma.sync m16n8k16` instruction as Ampere, and CUTLASS 4.x provides no TMA-accelerated FP16 path for it. WGMMA (Hopper's asynchronous tensor core) is not available on sm_120 either — that's H100-only.
+
+The conclusion: CUTLASS 2.x `device::Gemm` templates compiled with `-arch=sm_120` are the correct approach for FP16 on consumer Blackwell. The identity-swizzle split-K gap (T=257–279) remains, but it covers a narrow slice of real-world audio lengths and has negligible RTFx impact.
