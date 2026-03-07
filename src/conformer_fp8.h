@@ -7,6 +7,7 @@
 #ifndef CONFORMER_H_
 #define CONFORMER_H_
 // FP8 variant — includes extra CudaModel members for FP8 quantization
+#define PARAKETTO_FP8 1
 
 #include <cstddef>
 #include <cstdint>
@@ -162,13 +163,18 @@ struct Weights {
 
     /// Phase 1: mmap + parse header + populate pages (CPU only, no CUDA needed).
     /// Call upload() after CUDA context is ready.
-    static Weights prefetch(const std::string& path);
+    /// If populate=false, skips MAP_POPULATE/madvise (fast header-only parse for FP8 path).
+    static Weights prefetch(const std::string& path, bool populate = true);
 
     /// Phase 1 (embedded): parse header from in-memory data (no mmap, no file).
     static Weights from_embedded(const uint8_t* data, size_t size);
 
     /// Phase 2: cudaMalloc + cudaMemcpy from prefetched/embedded data, then assign pointers.
     void upload(cudaStream_t stream = nullptr);
+
+    /// Phase 2 (FP8 path): cudaMalloc + assign pointers only — no data copy.
+    /// weights_fp8.bin is self-contained and will populate GPU memory via fp8_load.
+    void allocate_only();
 
     /// Free the GPU allocation.
     void free();

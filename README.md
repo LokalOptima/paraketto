@@ -12,11 +12,11 @@ RTX 5070 Ti (SM120 Blackwell), 240 utterances / 7236s audio:
 
 ```
                  RTFx    WER (libri)   startup
-Python+TRT:      818x    1.68%         2.5s
-C++ TRT:        1126x    1.68%         ~400ms
-C++ CUTLASS:    1232x    1.68%         ~600ms
-C++ cuBLAS:     1237x    1.68%         ~600ms
-C++ FP8:        1238x    1.68%         631ms   (588MB weights_fp8.bin)
+Python+TRT:      794x    1.68%         2.5s
+C++ TRT:        1121x    1.68%         ~400ms
+C++ CUTLASS:    1209x    1.68%         ~600ms
+C++ cuBLAS:     1225x    1.68%         ~600ms
+C++ FP8:        1224x    1.68%         191ms   (604MB weights_fp8.bin)
 ```
 
 ## Backends
@@ -54,7 +54,7 @@ make weights-fp8                 # quantize weights.bin → weights_fp8.bin (588
 ./paraketto.fp8 audio.wav        # 631ms startup, same throughput as FP16
 ```
 
-On first run without `weights_fp8.bin`, `paraketto.fp8` auto-generates it and saves for future runs.
+On first run without `weights_fp8.bin`, `paraketto.fp8` generates it from `weights.bin` and saves for future runs. Subsequent runs only load `weights_fp8.bin` (604MB) — no `weights.bin` needed.
 
 ### Server mode
 

@@ -44,10 +44,19 @@ struct Pipeline {
     cudaStream_t stream = nullptr;
 
     // Initialize with already-prefetched weights (upload to GPU + build model).
-    void init(Weights&& prefetched) {
+    // have_fp8: if true, weights_fp8.bin is self-contained — skip weights.bin upload.
+    void init(Weights&& prefetched, bool have_fp8 = false) {
         CUDA_CHECK(cudaStreamCreate(&stream));
         weights = std::move(prefetched);
+
+#ifdef PARAKETTO_FP8
+        if (have_fp8)
+            weights.allocate_only();   // GPU alloc + set up pointers; fp8_load fills data
+        else
+            weights.upload(stream);    // first run: need FP16 weights to quantize from
+#else
         weights.upload(stream);
+#endif
 
         mel.init();
 
@@ -184,15 +193,36 @@ int main(int argc, char** argv) {
     Weights prefetched;
     std::thread prefetch_thread;
 
+    // Check for FP8 weights before starting prefetch — if present, we only need
+    // weights.bin for the tensor layout (header), not the actual weight data.
+    bool have_fp8 = false;
+#if defined(PARAKETTO_FP8) && !defined(EMBEDDED_WEIGHTS)
+    {
+        int fd = open("weights_fp8.bin", O_RDONLY);
+        if (fd >= 0) {
+            char hdr[20];
+            if (read(fd, hdr, 20) == 20 && memcmp(hdr, "PRKTFP8", 8) == 0) {
+                uint32_t n; memcpy(&n, hdr + 16, 4);
+                if (n == CudaModel::N_FP8_SCALES) have_fp8 = true;
+            }
+            close(fd);
+        }
+    }
+#endif
+
 #ifdef EMBEDDED_WEIGHTS
+#  ifdef PARAKETTO_FP8
+    have_fp8 = true;  // embedded fp8 binary always present
+#  endif
     // Embedded weights: parse header (fast, no I/O)
     prefetched = Weights::from_embedded(
         paraketto_weights_start,
         paraketto_weights_end - paraketto_weights_start);
 #else
-    // Prefetch weights (mmap + populate pages) in background while CUDA inits
+    // Prefetch weights.bin in background while CUDA inits.
+    // If FP8 weights exist, skip MAP_POPULATE — we only need the header for tensor layout.
     prefetch_thread = std::thread([&]() {
-        prefetched = Weights::prefetch(weights_path);
+        prefetched = Weights::prefetch(weights_path, /*populate=*/!have_fp8);
     });
 #endif
 
@@ -209,7 +239,7 @@ int main(int argc, char** argv) {
     auto t_prefetch = clk::now();
 
     Pipeline pipeline;
-    pipeline.init(std::move(prefetched));
+    pipeline.init(std::move(prefetched), have_fp8);
     auto t_init_done = clk::now();
 
     if (server_mode) {

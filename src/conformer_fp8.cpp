@@ -16,6 +16,11 @@
 #include <cublas_v2.h>
 #include <cublasLt.h>
 
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 // Weight loading is in weights.cpp (shared with FP16 backends).
 
 #ifdef EMBEDDED_WEIGHTS
@@ -298,112 +303,163 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames)
 
 
         // ---------------------------------------------------------------------------
-        // FP8 cache save/load helpers
-        // Format: "PRKTFP8\0" + uint64 data_bytes + uint32 n_scales + uint32 pad
-        //         + packed weight data (no alignment gaps) + float32 scales
+        // FP8 cache save/load — weights_fp8.bin is self-contained:
+        //   "PRKTFP8\0" + uint64 pool_size + uint32 n_scales + uint32 pad   (24B header)
+        //   [fp8_pool blob: all FP8 GEMM weights + scales, pool layout]
+        //   [non-GEMM FP16 blob: LN, biases, conv_dw, embed — packed, fixed order]
         // ---------------------------------------------------------------------------
+
+        // Compute pool weights size once (fp8_pool through end of fp8_scales)
+        size_t pool_weights_size = (size_t)((char*)(fp8_scales + N_FP8_SCALES) - (char*)fp8_pool);
+
         auto fp8_save = [&](const char* path) {
             CUDA_CHECK(cudaStreamSynchronize(stream));
-            std::vector<uint8_t> buf(fp8_total);
-            size_t off = 0;
-            auto dl = [&](const uint8_t* src, size_t n) {
-                CUDA_CHECK(cudaMemcpy(buf.data() + off, src, n, cudaMemcpyDeviceToHost));
-                off += n;
-            };
-            for (int b = 0; b < N_BLOCKS; b++) {
-                dl(fp8_qkv_w[b],      D_MODEL * 3 * D_MODEL);
-                dl(fp8_ff1_w1[b],     D_MODEL * D_FF);
-                dl(fp8_ff1_w2[b],     D_FF * D_MODEL);
-                dl(fp8_ff2_w1[b],     D_MODEL * D_FF);
-                dl(fp8_ff2_w2[b],     D_FF * D_MODEL);
-                dl(fp8_pos_w[b],      D_MODEL * D_MODEL);
-                dl(fp8_out_w[b],      D_MODEL * D_MODEL);
-                dl(fp8_conv_pw1_w[b], D_CONV_PW * D_MODEL);
-                dl(fp8_conv_pw2_w[b], D_MODEL * D_MODEL);
-            }
-            dl(fp8_sub_out_w,           SUB_CHANNELS * 16 * D_MODEL);
-            dl(fp8_enc_proj_w,          D_MODEL * D_JOINT);
-            dl(fp8_lstm_combined_w[0],  4 * D_PRED * 2 * D_PRED);
-            dl(fp8_lstm_combined_w[1],  4 * D_PRED * 2 * D_PRED);
-            dl(fp8_dec_proj_w,          D_PRED * D_JOINT);
-            dl(fp8_out_proj_w,          D_JOINT * D_OUTPUT);
-            assert(off == fp8_total);
 
-            std::vector<float> scales(N_FP8_SCALES);
-            CUDA_CHECK(cudaMemcpy(scales.data(), fp8_scales, N_FP8_SCALES * sizeof(float), cudaMemcpyDeviceToHost));
+            // Part 1: fp8_pool blob (single download — pool layout includes alignment gaps)
+            std::vector<uint8_t> pool_buf(pool_weights_size);
+            CUDA_CHECK(cudaMemcpy(pool_buf.data(), fp8_pool, pool_weights_size, cudaMemcpyDeviceToHost));
+
+            // Part 2: non-GEMM FP16 weights (all remaining weights needed at runtime)
+            std::vector<half> fp16_buf;
+            auto save16 = [&](const half* ptr, size_t n) {
+                size_t old = fp16_buf.size();
+                fp16_buf.resize(old + n);
+                CUDA_CHECK(cudaMemcpy(fp16_buf.data() + old, ptr, n * sizeof(half), cudaMemcpyDeviceToHost));
+            };
+            // Subsampling conv (depthwise + pointwise, but NOT sub_out_w which is FP8)
+            for (int i : {0, 2, 3, 5, 6}) {
+                size_t wn = (i == 3 || i == 6) ? (size_t)SUB_CHANNELS * SUB_CHANNELS
+                                                : (size_t)SUB_CHANNELS * 9;
+                save16(weights.sub_conv[i].weight, wn);
+                save16(weights.sub_conv[i].bias,   SUB_CHANNELS);
+            }
+            save16(weights.sub_out_b, D_MODEL);  // bias for FP8-quantized sub_out_w
+            // Per conformer block
+            for (int b = 0; b < N_BLOCKS; b++) {
+                auto& blk = weights.blocks[b];
+                save16(blk.ff1_ln_w,   D_MODEL); save16(blk.ff1_ln_b,   D_MODEL);
+                save16(blk.mhsa_ln_w,  D_MODEL); save16(blk.mhsa_ln_b,  D_MODEL);
+                save16(blk.pos_bias_u, N_HEADS * HEAD_DIM);
+                save16(blk.pos_bias_v, N_HEADS * HEAD_DIM);
+                save16(blk.conv_ln_w,  D_MODEL); save16(blk.conv_ln_b,  D_MODEL);
+                save16(blk.conv_dw_w,  D_MODEL * CONV_K);
+                save16(blk.conv_dw_b,  D_MODEL);
+                save16(blk.ff2_ln_w,   D_MODEL); save16(blk.ff2_ln_b,   D_MODEL);
+                save16(blk.final_ln_w, D_MODEL); save16(blk.final_ln_b, D_MODEL);
+            }
+            // Decoder
+            save16(weights.embed_w, N_VOCAB * D_PRED);
+            // LSTM combined weights/biases (FP16 GEMM in decode_step — FP8 N=1 not supported)
+            save16(lstm_combined_w[0],    4 * D_PRED * 2 * D_PRED);
+            save16(lstm_combined_w[1],    4 * D_PRED * 2 * D_PRED);
+            save16(lstm_combined_bias[0], 4 * D_PRED);
+            save16(lstm_combined_bias[1], 4 * D_PRED);
+            // Projection weights used as FP16 in decode_step (FP8 N=1 not supported)
+            save16(weights.dec_proj_w, D_PRED  * D_JOINT);
+            save16(weights.out_proj_w, D_JOINT * D_OUTPUT);
+            // Biases
+            save16(weights.enc_proj_b, D_JOINT);
+            save16(weights.dec_proj_b, D_JOINT);
+            save16(weights.out_proj_b, D_OUTPUT);
 
             FILE* f = fopen(path, "wb");
             if (!f) { fprintf(stderr, "  warning: cannot write %s\n", path); return; }
             const char magic[8] = "PRKTFP8";
-            uint64_t data_bytes = fp8_total;
-            uint32_t n_scales = N_FP8_SCALES, pad = 0;
-            fwrite(magic, 8, 1, f);
-            fwrite(&data_bytes, 8, 1, f);
-            fwrite(&n_scales, 4, 1, f);
-            fwrite(&pad, 4, 1, f);
-            fwrite(buf.data(), 1, fp8_total, f);
-            fwrite(scales.data(), 4, N_FP8_SCALES, f);
+            uint64_t pws = pool_weights_size;
+            uint32_t n_scales   = N_FP8_SCALES;
+            uint32_t fp16_bytes = (uint32_t)(fp16_buf.size() * sizeof(half));
+            fwrite(magic,            8,                    1, f);
+            fwrite(&pws,             8,                    1, f);
+            fwrite(&n_scales,        4,                    1, f);
+            fwrite(&fp16_bytes,      4,                    1, f);
+            fwrite(pool_buf.data(),  1,   pool_weights_size, f);
+            fwrite(fp16_buf.data(),  sizeof(half), fp16_buf.size(), f);
             fclose(f);
-            fprintf(stderr, "  saved FP8 weight cache to %s (%.0f MB)\n", path, fp8_total / 1048576.0);
+            size_t total_mb = (pool_weights_size + fp16_buf.size() * sizeof(half)) / (1024*1024);
+            fprintf(stderr, "  saved FP8 weight cache to %s (%zu MB)\n", path, total_mb);
         };
 
         auto fp8_load = [&](const char* path) -> bool {
-            const uint8_t* mem_data = nullptr;
-            size_t mem_size = 0;
+            const uint8_t* base = nullptr;
+            size_t map_size = 0;
+            void* mmap_ptr = nullptr;
+
 #ifdef EMBEDDED_WEIGHTS
-            mem_data = _binary_weights_fp8_bin_start;
-            mem_size = (size_t)(_binary_weights_fp8_bin_end - _binary_weights_fp8_bin_start);
+            base     = _binary_weights_fp8_bin_start;
+            map_size = (size_t)(_binary_weights_fp8_bin_end - _binary_weights_fp8_bin_start);
+#else
+            int fd = open(path, O_RDONLY);
+            if (fd < 0) return false;
+            struct stat st; fstat(fd, &st);
+            map_size = (size_t)st.st_size;
+            mmap_ptr = mmap(nullptr, map_size, PROT_READ, MAP_PRIVATE, fd, 0);
+            close(fd);
+            if (mmap_ptr == MAP_FAILED) return false;
+            madvise(mmap_ptr, map_size, MADV_SEQUENTIAL);
+            base = (const uint8_t*)mmap_ptr;
 #endif
-            std::vector<uint8_t> buf(fp8_total);
-            std::vector<float> scales(N_FP8_SCALES);
 
-            if (mem_data && mem_size > 24) {
-                // Load from embedded blob
-                const uint8_t* p = mem_data;
-                if (memcmp(p, "PRKTFP8", 8) != 0) return false;
-                uint64_t data_bytes; memcpy(&data_bytes, p + 8, 8);
-                uint32_t n_scales;   memcpy(&n_scales,   p + 16, 4);
-                if (data_bytes != fp8_total || n_scales != (uint32_t)N_FP8_SCALES) return false;
-                memcpy(buf.data(), p + 24, fp8_total);
-                memcpy(scales.data(), p + 24 + fp8_total, N_FP8_SCALES * sizeof(float));
-                fprintf(stderr, "  loaded embedded FP8 weight cache (%.0f MB)\n", fp8_total / 1048576.0);
-            } else {
-                FILE* f = fopen(path, "rb");
-                if (!f) return false;
-                char magic[8]; uint64_t data_bytes; uint32_t n_scales, pad;
-                if (fread(magic, 8, 1, f) != 1 || memcmp(magic, "PRKTFP8", 8) != 0) { fclose(f); return false; }
-                if (fread(&data_bytes, 8, 1, f) != 1 || data_bytes != fp8_total)      { fclose(f); return false; }
-                if (fread(&n_scales, 4, 1, f) != 1 || n_scales != N_FP8_SCALES)       { fclose(f); return false; }
-                fread(&pad, 4, 1, f);
-                if (fread(buf.data(), 1, fp8_total, f) != fp8_total) { fclose(f); return false; }
-                if (fread(scales.data(), 4, N_FP8_SCALES, f) != (size_t)N_FP8_SCALES) { fclose(f); return false; }
-                fclose(f);
+            // Validate header
+            if (map_size < 24 || memcmp(base, "PRKTFP8", 8) != 0) {
+                if (mmap_ptr) munmap(mmap_ptr, map_size);
+                return false;
+            }
+            uint64_t pws;         memcpy(&pws,         base + 8,  8);
+            uint32_t n_scales;    memcpy(&n_scales,    base + 16, 4);
+            uint32_t fp16_bytes;  memcpy(&fp16_bytes,  base + 20, 4);
+            if (pws != pool_weights_size || n_scales != (uint32_t)N_FP8_SCALES
+                    || map_size < 24 + pws + fp16_bytes) {
+                if (mmap_ptr) munmap(mmap_ptr, map_size);
+                return false;
             }
 
+            // Single cudaMemcpy for entire fp8_pool (FP8 weights + scales at their aligned offsets)
+            CUDA_CHECK(cudaMemcpyAsync(fp8_pool, base + 24, pool_weights_size,
+                                       cudaMemcpyHostToDevice, stream));
+
+            // Non-GEMM FP16 weights — same fixed order as fp8_save
+            const uint8_t* p = base + 24 + pool_weights_size;
             size_t off = 0;
-            auto ul = [&](uint8_t* dst, size_t n) {
-                CUDA_CHECK(cudaMemcpyAsync(dst, buf.data() + off, n, cudaMemcpyHostToDevice, stream));
-                off += n;
+            auto ul16 = [&](half* dst, size_t n) {
+                CUDA_CHECK(cudaMemcpyAsync(dst, p + off, n * sizeof(half),
+                                           cudaMemcpyHostToDevice, stream));
+                off += n * sizeof(half);
             };
-            for (int b = 0; b < N_BLOCKS; b++) {
-                ul(fp8_qkv_w[b],      D_MODEL * 3 * D_MODEL);
-                ul(fp8_ff1_w1[b],     D_MODEL * D_FF);
-                ul(fp8_ff1_w2[b],     D_FF * D_MODEL);
-                ul(fp8_ff2_w1[b],     D_MODEL * D_FF);
-                ul(fp8_ff2_w2[b],     D_FF * D_MODEL);
-                ul(fp8_pos_w[b],      D_MODEL * D_MODEL);
-                ul(fp8_out_w[b],      D_MODEL * D_MODEL);
-                ul(fp8_conv_pw1_w[b], D_CONV_PW * D_MODEL);
-                ul(fp8_conv_pw2_w[b], D_MODEL * D_MODEL);
+            for (int i : {0, 2, 3, 5, 6}) {
+                size_t wn = (i == 3 || i == 6) ? (size_t)SUB_CHANNELS * SUB_CHANNELS
+                                                : (size_t)SUB_CHANNELS * 9;
+                ul16(weights.sub_conv[i].weight, wn);
+                ul16(weights.sub_conv[i].bias,   SUB_CHANNELS);
             }
-            ul(fp8_sub_out_w,           SUB_CHANNELS * 16 * D_MODEL);
-            ul(fp8_enc_proj_w,          D_MODEL * D_JOINT);
-            ul(fp8_lstm_combined_w[0],  4 * D_PRED * 2 * D_PRED);
-            ul(fp8_lstm_combined_w[1],  4 * D_PRED * 2 * D_PRED);
-            ul(fp8_dec_proj_w,          D_PRED * D_JOINT);
-            ul(fp8_out_proj_w,          D_JOINT * D_OUTPUT);
-            CUDA_CHECK(cudaMemcpyAsync(fp8_scales, scales.data(), N_FP8_SCALES * sizeof(float), cudaMemcpyHostToDevice, stream));
-            fprintf(stderr, "  loaded FP8 weight cache from %s (%.0f MB)\n", path, fp8_total / 1048576.0);
+            ul16(weights.sub_out_b, D_MODEL);
+            for (int b = 0; b < N_BLOCKS; b++) {
+                auto& blk = weights.blocks[b];
+                ul16(blk.ff1_ln_w,   D_MODEL); ul16(blk.ff1_ln_b,   D_MODEL);
+                ul16(blk.mhsa_ln_w,  D_MODEL); ul16(blk.mhsa_ln_b,  D_MODEL);
+                ul16(blk.pos_bias_u, N_HEADS * HEAD_DIM);
+                ul16(blk.pos_bias_v, N_HEADS * HEAD_DIM);
+                ul16(blk.conv_ln_w,  D_MODEL); ul16(blk.conv_ln_b,  D_MODEL);
+                ul16(blk.conv_dw_w,  D_MODEL * CONV_K);
+                ul16(blk.conv_dw_b,  D_MODEL);
+                ul16(blk.ff2_ln_w,   D_MODEL); ul16(blk.ff2_ln_b,   D_MODEL);
+                ul16(blk.final_ln_w, D_MODEL); ul16(blk.final_ln_b, D_MODEL);
+            }
+            ul16(weights.embed_w, N_VOCAB * D_PRED);
+            ul16(lstm_combined_w[0],    4 * D_PRED * 2 * D_PRED);
+            ul16(lstm_combined_w[1],    4 * D_PRED * 2 * D_PRED);
+            ul16(lstm_combined_bias[0], 4 * D_PRED);
+            ul16(lstm_combined_bias[1], 4 * D_PRED);
+            ul16(weights.dec_proj_w, D_PRED  * D_JOINT);
+            ul16(weights.out_proj_w, D_JOINT * D_OUTPUT);
+            ul16(weights.enc_proj_b, D_JOINT);
+            ul16(weights.dec_proj_b, D_JOINT);
+            ul16(weights.out_proj_b, D_OUTPUT);
+
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            if (mmap_ptr) munmap(mmap_ptr, map_size);
+
+            size_t total_mb = (pool_weights_size + off) / (1024*1024);
+            fprintf(stderr, "  loaded FP8 weight cache from %s (%zu MB)\n", path, total_mb);
             return true;
         };
 

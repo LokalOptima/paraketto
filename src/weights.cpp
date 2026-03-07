@@ -132,7 +132,7 @@ static void assign_weight_pointers(Weights& w) {
 // Weights::prefetch — CPU only, no CUDA. mmap + populate pages + parse header.
 // ---------------------------------------------------------------------------
 
-Weights Weights::prefetch(const std::string& path) {
+Weights Weights::prefetch(const std::string& path, bool populate) {
     Weights w;
 
     int fd = open(path.c_str(), O_RDONLY);
@@ -143,13 +143,14 @@ Weights Weights::prefetch(const std::string& path) {
     struct stat st;
     fstat(fd, &st);
     size_t file_size = st.st_size;
-    void* mapped = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0);
+    int flags = MAP_PRIVATE | (populate ? MAP_POPULATE : 0);
+    void* mapped = mmap(nullptr, file_size, PROT_READ, flags, fd, 0);
     close(fd);
     if (mapped == MAP_FAILED) {
         fprintf(stderr, "mmap failed: %s\n", path.c_str());
         std::exit(1);
     }
-    madvise(mapped, file_size, MADV_SEQUENTIAL);
+    if (populate) madvise(mapped, file_size, MADV_SEQUENTIAL);
     const uint8_t* base = (const uint8_t*)mapped;
 
     // Parse file header
@@ -249,6 +250,23 @@ Weights Weights::from_embedded(const uint8_t* data, size_t size) {
 }
 
 // ---------------------------------------------------------------------------
+// Weights::allocate_only — cudaMalloc without data copy (FP8 path: data comes
+// from weights_fp8.bin which is self-contained).
+// ---------------------------------------------------------------------------
+
+void Weights::allocate_only() {
+    CUDA_CHECK(cudaMalloc(&gpu_data, gpu_data_size));
+    if (mmap_ptr) {
+        munmap(mmap_ptr, mmap_size);
+        mmap_ptr = nullptr;
+        mmap_size = 0;
+    }
+    embedded_ptr = nullptr;
+    data_offset = 0;
+    assign_weight_pointers(*this);
+}
+
+// ---------------------------------------------------------------------------
 // Weights::upload — cudaMalloc + cudaMemcpy from prefetched mmap, assign ptrs.
 // ---------------------------------------------------------------------------
 
@@ -256,6 +274,7 @@ void Weights::upload(cudaStream_t stream) {
     const uint8_t* base = embedded_ptr ? embedded_ptr : (const uint8_t*)mmap_ptr;
 
     CUDA_CHECK(cudaMalloc(&gpu_data, gpu_data_size));
+
     if (stream) {
         CUDA_CHECK(cudaMemcpyAsync(gpu_data, base + data_offset, gpu_data_size,
                                     cudaMemcpyHostToDevice, stream));
