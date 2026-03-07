@@ -18,6 +18,13 @@
 
 // Weight loading is in weights.cpp (shared with FP16 backends).
 
+#ifdef EMBEDDED_WEIGHTS
+extern "C" {
+    extern const uint8_t _binary_weights_fp8_bin_start[];
+    extern const uint8_t _binary_weights_fp8_bin_end[];
+}
+#endif
+
 // =========================================================================
 // CudaModel — encoder + decoder forward pass
 // =========================================================================
@@ -290,30 +297,142 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames)
         fp8p += N_FP8_ACT_SITES * sizeof(float);
 
 
-        // Quantize all weight matrices
-        int si = 0;  // scale index
-        for (int b = 0; b < N_BLOCKS; b++) {
-            auto& blk = weights.blocks[b];
-            quantize_absmax_fp16_to_fp8(qkv_w[b],        fp8_qkv_w[b],      &fp8_scales[si++], D_MODEL * 3 * D_MODEL, fp8_amax_buf, stream);
-            quantize_absmax_fp16_to_fp8(blk.ff1_w1,      fp8_ff1_w1[b],     &fp8_scales[si++], D_MODEL * D_FF,        fp8_amax_buf, stream);
-            quantize_absmax_fp16_to_fp8(blk.ff1_w2,      fp8_ff1_w2[b],     &fp8_scales[si++], D_FF * D_MODEL,        fp8_amax_buf, stream);
-            quantize_absmax_fp16_to_fp8(blk.ff2_w1,      fp8_ff2_w1[b],     &fp8_scales[si++], D_MODEL * D_FF,        fp8_amax_buf, stream);
-            quantize_absmax_fp16_to_fp8(blk.ff2_w2,      fp8_ff2_w2[b],     &fp8_scales[si++], D_FF * D_MODEL,        fp8_amax_buf, stream);
-            quantize_absmax_fp16_to_fp8(blk.pos_w,       fp8_pos_w[b],      &fp8_scales[si++], D_MODEL * D_MODEL,     fp8_amax_buf, stream);
-            quantize_absmax_fp16_to_fp8(blk.out_w,       fp8_out_w[b],      &fp8_scales[si++], D_MODEL * D_MODEL,     fp8_amax_buf, stream);
-            quantize_absmax_fp16_to_fp8(blk.conv_pw1_w,  fp8_conv_pw1_w[b], &fp8_scales[si++], D_CONV_PW * D_MODEL,   fp8_amax_buf, stream);
-            quantize_absmax_fp16_to_fp8(blk.conv_pw2_w,  fp8_conv_pw2_w[b], &fp8_scales[si++], D_MODEL * D_MODEL,     fp8_amax_buf, stream);
-        }
-        quantize_absmax_fp16_to_fp8(weights.sub_out_w,   fp8_sub_out_w,     &fp8_scales[si++], SUB_CHANNELS * 16 * D_MODEL, fp8_amax_buf, stream);
-        quantize_absmax_fp16_to_fp8(weights.enc_proj_w,  fp8_enc_proj_w,    &fp8_scales[si++], D_MODEL * D_JOINT,           fp8_amax_buf, stream);
-        quantize_absmax_fp16_to_fp8(lstm_combined_w[0],  fp8_lstm_combined_w[0], &fp8_scales[si++], 4 * D_PRED * 2 * D_PRED, fp8_amax_buf, stream);
-        quantize_absmax_fp16_to_fp8(lstm_combined_w[1],  fp8_lstm_combined_w[1], &fp8_scales[si++], 4 * D_PRED * 2 * D_PRED, fp8_amax_buf, stream);
-        quantize_absmax_fp16_to_fp8(weights.dec_proj_w,  fp8_dec_proj_w,    &fp8_scales[si++], D_PRED * D_JOINT,            fp8_amax_buf, stream);
-        quantize_absmax_fp16_to_fp8(weights.out_proj_w,  fp8_out_proj_w,    &fp8_scales[si++], D_JOINT * D_OUTPUT,          fp8_amax_buf, stream);
-        assert(si == N_FP8_SCALES);
+        // ---------------------------------------------------------------------------
+        // FP8 cache save/load helpers
+        // Format: "PRKTFP8\0" + uint64 data_bytes + uint32 n_scales + uint32 pad
+        //         + packed weight data (no alignment gaps) + float32 scales
+        // ---------------------------------------------------------------------------
+        auto fp8_save = [&](const char* path) {
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            std::vector<uint8_t> buf(fp8_total);
+            size_t off = 0;
+            auto dl = [&](const uint8_t* src, size_t n) {
+                CUDA_CHECK(cudaMemcpy(buf.data() + off, src, n, cudaMemcpyDeviceToHost));
+                off += n;
+            };
+            for (int b = 0; b < N_BLOCKS; b++) {
+                dl(fp8_qkv_w[b],      D_MODEL * 3 * D_MODEL);
+                dl(fp8_ff1_w1[b],     D_MODEL * D_FF);
+                dl(fp8_ff1_w2[b],     D_FF * D_MODEL);
+                dl(fp8_ff2_w1[b],     D_MODEL * D_FF);
+                dl(fp8_ff2_w2[b],     D_FF * D_MODEL);
+                dl(fp8_pos_w[b],      D_MODEL * D_MODEL);
+                dl(fp8_out_w[b],      D_MODEL * D_MODEL);
+                dl(fp8_conv_pw1_w[b], D_CONV_PW * D_MODEL);
+                dl(fp8_conv_pw2_w[b], D_MODEL * D_MODEL);
+            }
+            dl(fp8_sub_out_w,           SUB_CHANNELS * 16 * D_MODEL);
+            dl(fp8_enc_proj_w,          D_MODEL * D_JOINT);
+            dl(fp8_lstm_combined_w[0],  4 * D_PRED * 2 * D_PRED);
+            dl(fp8_lstm_combined_w[1],  4 * D_PRED * 2 * D_PRED);
+            dl(fp8_dec_proj_w,          D_PRED * D_JOINT);
+            dl(fp8_out_proj_w,          D_JOINT * D_OUTPUT);
+            assert(off == fp8_total);
 
-        fprintf(stderr, "  FP8 quantized %d weight matrices (%.0f MB)\n",
-                N_FP8_SCALES, fp8_total / (1024.0 * 1024.0));
+            std::vector<float> scales(N_FP8_SCALES);
+            CUDA_CHECK(cudaMemcpy(scales.data(), fp8_scales, N_FP8_SCALES * sizeof(float), cudaMemcpyDeviceToHost));
+
+            FILE* f = fopen(path, "wb");
+            if (!f) { fprintf(stderr, "  warning: cannot write %s\n", path); return; }
+            const char magic[8] = "PRKTFP8";
+            uint64_t data_bytes = fp8_total;
+            uint32_t n_scales = N_FP8_SCALES, pad = 0;
+            fwrite(magic, 8, 1, f);
+            fwrite(&data_bytes, 8, 1, f);
+            fwrite(&n_scales, 4, 1, f);
+            fwrite(&pad, 4, 1, f);
+            fwrite(buf.data(), 1, fp8_total, f);
+            fwrite(scales.data(), 4, N_FP8_SCALES, f);
+            fclose(f);
+            fprintf(stderr, "  saved FP8 weight cache to %s (%.0f MB)\n", path, fp8_total / 1048576.0);
+        };
+
+        auto fp8_load = [&](const char* path) -> bool {
+            const uint8_t* mem_data = nullptr;
+            size_t mem_size = 0;
+#ifdef EMBEDDED_WEIGHTS
+            mem_data = _binary_weights_fp8_bin_start;
+            mem_size = (size_t)(_binary_weights_fp8_bin_end - _binary_weights_fp8_bin_start);
+#endif
+            std::vector<uint8_t> buf(fp8_total);
+            std::vector<float> scales(N_FP8_SCALES);
+
+            if (mem_data && mem_size > 24) {
+                // Load from embedded blob
+                const uint8_t* p = mem_data;
+                if (memcmp(p, "PRKTFP8", 8) != 0) return false;
+                uint64_t data_bytes; memcpy(&data_bytes, p + 8, 8);
+                uint32_t n_scales;   memcpy(&n_scales,   p + 16, 4);
+                if (data_bytes != fp8_total || n_scales != (uint32_t)N_FP8_SCALES) return false;
+                memcpy(buf.data(), p + 24, fp8_total);
+                memcpy(scales.data(), p + 24 + fp8_total, N_FP8_SCALES * sizeof(float));
+                fprintf(stderr, "  loaded embedded FP8 weight cache (%.0f MB)\n", fp8_total / 1048576.0);
+            } else {
+                FILE* f = fopen(path, "rb");
+                if (!f) return false;
+                char magic[8]; uint64_t data_bytes; uint32_t n_scales, pad;
+                if (fread(magic, 8, 1, f) != 1 || memcmp(magic, "PRKTFP8", 8) != 0) { fclose(f); return false; }
+                if (fread(&data_bytes, 8, 1, f) != 1 || data_bytes != fp8_total)      { fclose(f); return false; }
+                if (fread(&n_scales, 4, 1, f) != 1 || n_scales != N_FP8_SCALES)       { fclose(f); return false; }
+                fread(&pad, 4, 1, f);
+                if (fread(buf.data(), 1, fp8_total, f) != fp8_total) { fclose(f); return false; }
+                if (fread(scales.data(), 4, N_FP8_SCALES, f) != (size_t)N_FP8_SCALES) { fclose(f); return false; }
+                fclose(f);
+            }
+
+            size_t off = 0;
+            auto ul = [&](uint8_t* dst, size_t n) {
+                CUDA_CHECK(cudaMemcpyAsync(dst, buf.data() + off, n, cudaMemcpyHostToDevice, stream));
+                off += n;
+            };
+            for (int b = 0; b < N_BLOCKS; b++) {
+                ul(fp8_qkv_w[b],      D_MODEL * 3 * D_MODEL);
+                ul(fp8_ff1_w1[b],     D_MODEL * D_FF);
+                ul(fp8_ff1_w2[b],     D_FF * D_MODEL);
+                ul(fp8_ff2_w1[b],     D_MODEL * D_FF);
+                ul(fp8_ff2_w2[b],     D_FF * D_MODEL);
+                ul(fp8_pos_w[b],      D_MODEL * D_MODEL);
+                ul(fp8_out_w[b],      D_MODEL * D_MODEL);
+                ul(fp8_conv_pw1_w[b], D_CONV_PW * D_MODEL);
+                ul(fp8_conv_pw2_w[b], D_MODEL * D_MODEL);
+            }
+            ul(fp8_sub_out_w,           SUB_CHANNELS * 16 * D_MODEL);
+            ul(fp8_enc_proj_w,          D_MODEL * D_JOINT);
+            ul(fp8_lstm_combined_w[0],  4 * D_PRED * 2 * D_PRED);
+            ul(fp8_lstm_combined_w[1],  4 * D_PRED * 2 * D_PRED);
+            ul(fp8_dec_proj_w,          D_PRED * D_JOINT);
+            ul(fp8_out_proj_w,          D_JOINT * D_OUTPUT);
+            CUDA_CHECK(cudaMemcpyAsync(fp8_scales, scales.data(), N_FP8_SCALES * sizeof(float), cudaMemcpyHostToDevice, stream));
+            fprintf(stderr, "  loaded FP8 weight cache from %s (%.0f MB)\n", path, fp8_total / 1048576.0);
+            return true;
+        };
+
+        // Try to load cache; quantize and save if missing
+        const char* fp8_cache = "weights_fp8.bin";
+        if (!fp8_load(fp8_cache)) {
+            // Quantize all weight matrices
+            int si = 0;
+            for (int b = 0; b < N_BLOCKS; b++) {
+                auto& blk = weights.blocks[b];
+                quantize_absmax_fp16_to_fp8(qkv_w[b],        fp8_qkv_w[b],      &fp8_scales[si++], D_MODEL * 3 * D_MODEL, fp8_amax_buf, stream);
+                quantize_absmax_fp16_to_fp8(blk.ff1_w1,      fp8_ff1_w1[b],     &fp8_scales[si++], D_MODEL * D_FF,        fp8_amax_buf, stream);
+                quantize_absmax_fp16_to_fp8(blk.ff1_w2,      fp8_ff1_w2[b],     &fp8_scales[si++], D_FF * D_MODEL,        fp8_amax_buf, stream);
+                quantize_absmax_fp16_to_fp8(blk.ff2_w1,      fp8_ff2_w1[b],     &fp8_scales[si++], D_MODEL * D_FF,        fp8_amax_buf, stream);
+                quantize_absmax_fp16_to_fp8(blk.ff2_w2,      fp8_ff2_w2[b],     &fp8_scales[si++], D_FF * D_MODEL,        fp8_amax_buf, stream);
+                quantize_absmax_fp16_to_fp8(blk.pos_w,       fp8_pos_w[b],      &fp8_scales[si++], D_MODEL * D_MODEL,     fp8_amax_buf, stream);
+                quantize_absmax_fp16_to_fp8(blk.out_w,       fp8_out_w[b],      &fp8_scales[si++], D_MODEL * D_MODEL,     fp8_amax_buf, stream);
+                quantize_absmax_fp16_to_fp8(blk.conv_pw1_w,  fp8_conv_pw1_w[b], &fp8_scales[si++], D_CONV_PW * D_MODEL,   fp8_amax_buf, stream);
+                quantize_absmax_fp16_to_fp8(blk.conv_pw2_w,  fp8_conv_pw2_w[b], &fp8_scales[si++], D_MODEL * D_MODEL,     fp8_amax_buf, stream);
+            }
+            quantize_absmax_fp16_to_fp8(weights.sub_out_w,   fp8_sub_out_w,     &fp8_scales[si++], SUB_CHANNELS * 16 * D_MODEL, fp8_amax_buf, stream);
+            quantize_absmax_fp16_to_fp8(weights.enc_proj_w,  fp8_enc_proj_w,    &fp8_scales[si++], D_MODEL * D_JOINT,           fp8_amax_buf, stream);
+            quantize_absmax_fp16_to_fp8(lstm_combined_w[0],  fp8_lstm_combined_w[0], &fp8_scales[si++], 4 * D_PRED * 2 * D_PRED, fp8_amax_buf, stream);
+            quantize_absmax_fp16_to_fp8(lstm_combined_w[1],  fp8_lstm_combined_w[1], &fp8_scales[si++], 4 * D_PRED * 2 * D_PRED, fp8_amax_buf, stream);
+            quantize_absmax_fp16_to_fp8(weights.dec_proj_w,  fp8_dec_proj_w,    &fp8_scales[si++], D_PRED * D_JOINT,            fp8_amax_buf, stream);
+            quantize_absmax_fp16_to_fp8(weights.out_proj_w,  fp8_out_proj_w,    &fp8_scales[si++], D_JOINT * D_OUTPUT,          fp8_amax_buf, stream);
+            assert(si == N_FP8_SCALES);
+            fp8_save(fp8_cache);
+        }
     }
 
     // Allocate CUTLASS workspace (queried for max GEMM size)

@@ -11,7 +11,7 @@ CXXFLAGS = -std=c++17 -O3 -march=native -flto=auto -Wno-deprecated-declarations 
 NVFLAGS  = -std=c++17 -O3 -I$(CUDA_HOME)/include -Isrc --expt-relaxed-constexpr
 LDFLAGS  = -flto=auto -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lpthread $(TRT_LIBS)/libnvinfer.so.10 -Wl,-rpath,$(TRT_LIBS)
 
-.PHONY: bench-all bench-py bench-cpp bench-cuda bench-cublas engines inspect-onnx weights download-data download-weights clean
+.PHONY: bench-all bench-py bench-cpp bench-cuda bench-cublas engines inspect-onnx weights weights-fp8 download-data download-weights clean
 
 # Download benchmark data from GitHub release
 data/librispeech/manifest.json:
@@ -115,8 +115,22 @@ src/conformer_fp8.o: src/conformer_fp8.cpp src/conformer_fp8.h src/conformer.h s
 paraketto.fp8: src/paraketto_cuda.cpp src/conformer_fp8.h src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o $(SHARED_HEADERS)
 	$(CXX) $(CUDA_CXXFLAGS) -include src/conformer_fp8.h src/paraketto_cuda.cpp src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o $(CUDA_LDFLAGS) -lcublas -lcublasLt -o $@
 
+# Generate FP8 weight cache (quantized from weights.bin, auto-saved by paraketto.fp8 on first run)
+weights_fp8.bin: paraketto.fp8 weights.bin
+	@echo "Generating FP8 weight cache (quantizing weights.bin → weights_fp8.bin)..."
+	@rm -f weights_fp8.bin
+	@./paraketto.fp8 --weights weights.bin /dev/null 2>&1 | grep -E "saved|loaded|FP8" || true
+	@test -f weights_fp8.bin || (echo "ERROR: weights_fp8.bin not created" && exit 1)
+
+weights-fp8: weights_fp8.bin
+
 # Static build with embedded weights (single file, only needs NVIDIA driver)
 weights_embedded.o: weights.bin
+	objcopy -I binary -O elf64-x86-64 -B i386:x86-64 \
+		--rename-section .data=.rodata,alloc,load,readonly,data,contents \
+		$< $@
+
+weights_fp8_embedded.o: weights_fp8.bin
 	objcopy -I binary -O elf64-x86-64 -B i386:x86-64 \
 		--rename-section .data=.rodata,alloc,load,readonly,data,contents \
 		$< $@
@@ -126,6 +140,16 @@ paraketto.static: $(CONFORMER_DEPS) src/kernels.o src/cutlass_gemm.o src/cutlass
 		src/paraketto_cuda.cpp src/conformer.cpp src/kernels.o src/cutlass_gemm.o weights_embedded.o \
 		-static-libstdc++ -static-libgcc \
 		-L$(CUDA_HOME)/lib64 $(CUDA_HOME)/lib64/libcudart_static.a -ldl -lpthread -lrt \
+		-o $@
+
+# FP8 static: embeds weights.bin (FP16) + weights_fp8.bin (quantized cache) — no runtime files needed
+paraketto.fp8.static: src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o weights_embedded.o weights_fp8_embedded.o $(SHARED_HEADERS) src/conformer_fp8.h
+	$(CXX) $(CUDA_CXXFLAGS) -DEMBEDDED_WEIGHTS -include src/conformer_fp8.h \
+		src/paraketto_cuda.cpp src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o \
+		weights_embedded.o weights_fp8_embedded.o \
+		-static-libstdc++ -static-libgcc \
+		-L$(CUDA_HOME)/lib64 $(CUDA_HOME)/lib64/libcudart_static.a -ldl -lpthread -lrt \
+		-lcublas -lcublasLt \
 		-o $@
 
 bench_gemm: tests/bench_gemm.cu
@@ -141,4 +165,4 @@ bench_ff2: tests/bench_ff2.cu
 	$(NVCC) $(NVFLAGS) -arch=sm_120 $(CUTLASS_INC) tests/bench_ff2.cu -lcublas -lcublasLt -o $@
 
 clean:
-	rm -f paraketto paraketto.cuda paraketto.cublas paraketto.fp8 paraketto.static src/kernels.o src/kernels_fp8.o src/cutlass_gemm.o src/cublas_gemm.o src/weights.o src/conformer_fp8.o weights_embedded.o
+	rm -f paraketto paraketto.cuda paraketto.cublas paraketto.fp8 paraketto.static paraketto.fp8.static src/kernels.o src/kernels_fp8.o src/cutlass_gemm.o src/cublas_gemm.o src/weights.o src/conformer_fp8.o weights_embedded.o weights_fp8_embedded.o

@@ -254,7 +254,7 @@ struct CudaModel {
 
 
     // --- FP8 weight quantization (used by conformer_fp8.cpp) ---
-    static constexpr int N_FP8_SCALES    = N_BLOCKS * 9 + 4;  // 220
+    static constexpr int N_FP8_SCALES    = N_BLOCKS * 9 + 6;  // 222 (9 per block + sub_out,enc_proj,lstm0,lstm1,dec_proj,out_proj)
     static constexpr int N_FP8_ACT_SITES = N_BLOCKS * 9 + 2;  // 218
     void*    fp8_pool             = nullptr;   // single GPU alloc for all FP8 data
     uint8_t* fp8_qkv_w[N_BLOCKS]  = {};
