@@ -6,6 +6,7 @@
 
 #ifndef CONFORMER_H_
 #define CONFORMER_H_
+// FP8 variant — includes extra CudaModel members for FP8 quantization
 
 #include <cstddef>
 #include <cstdint>
@@ -16,6 +17,8 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cublas_v2.h>
+#include <cublasLt.h>
 
 // ---------------------------------------------------------------------------
 // Weight file format constants
@@ -248,6 +251,36 @@ struct CudaModel {
     half* joint_act     = nullptr;  // [D_JOINT]
     half* joint_out     = nullptr;  // [D_OUTPUT]
     int*  argmax_out    = nullptr;  // [2] — token, step (for GPU argmax)
+
+
+    // --- FP8 weight quantization (used by conformer_fp8.cpp) ---
+    static constexpr int N_FP8_SCALES    = N_BLOCKS * 9 + 4;  // 220
+    static constexpr int N_FP8_ACT_SITES = N_BLOCKS * 9 + 2;  // 218
+    void*    fp8_pool             = nullptr;   // single GPU alloc for all FP8 data
+    uint8_t* fp8_qkv_w[N_BLOCKS]  = {};
+    uint8_t* fp8_ff1_w1[N_BLOCKS] = {};
+    uint8_t* fp8_ff1_w2[N_BLOCKS] = {};
+    uint8_t* fp8_ff2_w1[N_BLOCKS] = {};
+    uint8_t* fp8_ff2_w2[N_BLOCKS] = {};
+    uint8_t* fp8_pos_w[N_BLOCKS]  = {};
+    uint8_t* fp8_out_w[N_BLOCKS]  = {};
+    uint8_t* fp8_conv_pw1_w[N_BLOCKS] = {};
+    uint8_t* fp8_conv_pw2_w[N_BLOCKS] = {};
+    uint8_t* fp8_sub_out_w        = nullptr;
+    uint8_t* fp8_enc_proj_w       = nullptr;
+    uint8_t* fp8_lstm_combined_w[2] = {};
+    uint8_t* fp8_dec_proj_w       = nullptr;
+    uint8_t* fp8_out_proj_w       = nullptr;
+    float*   fp8_scales           = nullptr;   // [N_FP8_SCALES] weight scales on GPU
+    float*   fp8_act_site_scales  = nullptr;   // [N_FP8_ACT_SITES] act scales on GPU
+    uint8_t* fp8_act_buf          = nullptr;   // activation quantization scratch
+    int*     fp8_amax_buf         = nullptr;   // absmax scratch (1 int)
+    bool     fp8_calibrated       = false;
+    // cublasLt handle and workspace for FP8 GEMMs
+    cublasHandle_t   cublas            = nullptr;
+    cublasLtHandle_t cublaslt          = nullptr;
+    void*            lt_workspace      = nullptr;
+    size_t           lt_workspace_size = 0;
 
     // --- Methods ---
     void init(const Weights& weights, cudaStream_t s, int max_mel_frames);
