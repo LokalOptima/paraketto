@@ -4,7 +4,14 @@
 
 # parakettő
 
-Batch-1 speech-to-text inference for NVIDIA's [Parakeet TDT 0.6B V2](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2), written in C++ with custom CUDA kernels. No frameworks, no Python at runtime.
+Speech-to-text inference for NVIDIA's [Parakeet TDT 0.6B V2](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2), written in C++ with custom CUDA kernels.
+
+- Batch 1, 1250x+ real-time — fast on a single WAV
+- Custom CUDA/CUTLASS kernels — only libcudart.so
+- Optimized 1.8GB VRAM usage
+- Optimized startup time ~300ms cold / ~90ms hot
+- Builtin HTTP server
+- Optional static build with zero runtime deps 
 
 ```
 WAV (16kHz/24kHz mono) → mel spectrogram → conformer encoder → TDT greedy decoder → text
@@ -18,12 +25,23 @@ RTX 5070 Ti, batch size 1. Two GEMM backends: **CUTLASS** (zero dependencies bey
                  CUTLASS (cudart only)          cuBLAS (+ libcublas)
               ────────────────────────────   ────────────────────────────
                RTFx    WER    Audio  Time     RTFx    WER    Audio  Time
-librispeech   1008x   1.68%   896s  888ms    1042x   1.68%   896s  860ms
-earnings22     938x  16.48%   253s  270ms     965x  16.48%   253s  262ms
-long          1263x   1.93%  5578s  4.42s    1277x   1.90%  5578s  4.37s
-difficult     1178x  23.49%   509s  432ms    1226x  23.32%   509s  415ms
+librispeech   1083x   1.68%   896s  827ms    1042x   1.68%   896s  860ms
+earnings22     982x  16.48%   253s  258ms     965x  16.48%   253s  262ms
+long          1313x   1.92%  5578s  4.25s    1277x   1.90%  5578s  4.37s
+difficult     1215x  23.41%   509s  419ms    1226x  23.32%   509s  415ms
               ────────────────────────────   ────────────────────────────
-Total         1204x          7236s  6.01s    1226x          7236s  5.90s
+Total         1258x          7236s  5.75s    1226x          7236s  5.90s
+```
+
+### Test machine
+
+```
+┌───────────┬────────────────────────────────────────────────────────────────┐
+│ CPU       │ Intel Core i7-12700 — 2.1 GHz base / 4.9 GHz boost, 25 MB L3   │
+│ RAM       │ Corsair Vengeance LPX 32 GB DDR4-3200 CL16, dual ch, 51.2 GB/s │
+│ GPU       │ NVIDIA GeForce RTX 5070 Ti — 16 GB GDDR7, 896 GB/s, 2452 MHz   │
+│ Storage   │ Samsung 970 EVO 1 TB NVMe — PCIe 3.0 x4, 3400/2500 MB/s r/w    │
+└───────────┴────────────────────────────────────────────────────────────────┘
 ```
 
 ## Quick start
