@@ -94,6 +94,13 @@ def bench_server(binary: Path, binary_name: str, port: int = 18080) -> None:
     def wait_for_server(timeout: float = 30) -> None:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            ret = server.poll()
+            if ret is not None:
+                err = server.stderr.read().decode() if server.stderr else ""
+                print(f"Server exited with code {ret}", file=sys.stderr)
+                if err:
+                    print(err, file=sys.stderr, end="")
+                sys.exit(1)
             try:
                 r = requests.get(f"{server_url}/health", timeout=1)
                 if r.ok:
@@ -101,7 +108,7 @@ def bench_server(binary: Path, binary_name: str, port: int = 18080) -> None:
             except requests.ConnectionError:
                 pass
             time.sleep(0.1)
-        print("Server failed to start", file=sys.stderr)
+        print("Server failed to start (timeout)", file=sys.stderr)
         sys.exit(1)
 
     server = subprocess.Popen(

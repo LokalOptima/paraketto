@@ -4,7 +4,15 @@ CXX      = g++
 NVCC     = $(CUDA_HOME)/bin/nvcc
 NVFLAGS  = -std=c++17 -O3 -I$(CUDA_HOME)/include -Isrc --expt-relaxed-constexpr
 
-.PHONY: bench-all bench-cuda bench-cublas bench-fp8 weights weights-fp8 download-data download-weights clean
+.PHONY: bench-all bench-cuda bench-cublas bench-fp8 weights weights-fp8 download-data download-weights check-weights clean
+
+# Verify weights.bin is the expected format (PRKT v2)
+check-weights: weights.bin
+	@v=$$(od -An -td4 -N4 -j4 weights.bin | tr -d ' '); \
+	if [ "$$v" != "2" ]; then \
+		echo "ERROR: weights.bin is version $$v, expected 2. Run: uv run python scripts/repack_weights.py"; \
+		exit 1; \
+	fi
 
 # Download benchmark data from GitHub release
 data/librispeech/manifest.json:
@@ -26,7 +34,7 @@ download-weights: weights.bin
 
 BENCH_SEP = @printf '\n%s\n%s\n%s\n' '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━' '  $(1)'
 
-bench-all: paraketto.cuda paraketto.cublas paraketto.fp8 data/librispeech/manifest.json weights.bin
+bench-all: paraketto.cuda paraketto.cublas paraketto.fp8 data/librispeech/manifest.json check-weights
 	$(call BENCH_SEP,C++ CUDA · paraketto_cuda.cpp + CUTLASS FP16)
 	@uv run python tests/bench_native.py paraketto.cuda
 	$(call BENCH_SEP,C++ cuBLAS · paraketto_cuda.cpp + cuBLAS FP16)
@@ -34,10 +42,10 @@ bench-all: paraketto.cuda paraketto.cublas paraketto.fp8 data/librispeech/manife
 	$(call BENCH_SEP,C++ FP8  · paraketto_cuda.cpp + cublasLt FP8)
 	@uv run python tests/bench_native.py paraketto.fp8
 
-bench-cuda: paraketto.cuda data/librispeech/manifest.json weights.bin
+bench-cuda: paraketto.cuda data/librispeech/manifest.json check-weights
 	uv run python tests/bench_native.py paraketto.cuda
 
-bench-cublas: paraketto.cublas data/librispeech/manifest.json weights.bin
+bench-cublas: paraketto.cublas data/librispeech/manifest.json check-weights
 	uv run python tests/bench_native.py paraketto.cublas
 
 bench-fp8: paraketto.fp8 data/librispeech/manifest.json weights_fp8.bin
