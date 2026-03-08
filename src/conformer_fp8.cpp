@@ -783,6 +783,8 @@ static Fp8GemmPlan& get_fp8_gemm_plan(cublasLtHandle_t lt, void* workspace, size
 // FP8 GEMM: quantizes activation B, uses pre-quantized weight A.
 // site_scale: per-activation-site cached scale (on GPU). On calibration pass,
 //   absmax is computed and written here. On subsequent passes, reused as-is.
+// prequantized: if true, act_buf already contains FP8 data (from fused kernel),
+//   skip the quantization step entirely.
 static void lt_gemm_fp8(cublasLtHandle_t lt, cublasHandle_t h,
                           void* workspace, size_t ws_size, cudaStream_t stream,
                           cublasOperation_t opA, cublasOperation_t opB,
@@ -791,14 +793,17 @@ static void lt_gemm_fp8(cublasLtHandle_t lt, cublasHandle_t h,
                           const half* B_fp16, int ldB,
                           half* C, int ldC,
                           uint8_t* act_buf, float* site_scale, int* amax_buf,
-                          bool accumulate, bool calibrated) {
-    int b_elems = (opB == CUBLAS_OP_N) ? col_k * col_n : col_n * col_k;
-    if (!calibrated) {
-        // Calibration: full absmax + quantize, stores scale in *site_scale
-        quantize_absmax_fp16_to_fp8(B_fp16, act_buf, site_scale, b_elems, amax_buf, stream);
-    } else {
-        // Runtime: single-pass quantize using cached scale
-        quantize_fp8_static(B_fp16, act_buf, site_scale, b_elems, stream);
+                          bool accumulate, bool calibrated,
+                          bool prequantized = false) {
+    if (!prequantized) {
+        int b_elems = (opB == CUBLAS_OP_N) ? col_k * col_n : col_n * col_k;
+        if (!calibrated) {
+            // Calibration: full absmax + quantize, stores scale in *site_scale
+            quantize_absmax_fp16_to_fp8(B_fp16, act_buf, site_scale, b_elems, amax_buf, stream);
+        } else {
+            // Runtime: single-pass quantize using cached scale
+            quantize_fp8_static(B_fp16, act_buf, site_scale, b_elems, stream);
+        }
     }
 
     float alpha = 1.0f;
@@ -823,16 +828,17 @@ static void lt_gemm_fp8(cublasLtHandle_t lt, cublasHandle_t h,
     }
 }
 
-// FP8 wrappers — take per-site cached scale + calibration flag
+// FP8 wrappers — take per-site cached scale + calibration flag + prequantized
 static void gemm_nn_fp8(cublasLtHandle_t lt, cublasHandle_t h,
                           void* ws, size_t ws_size, cudaStream_t stream,
                           const half* X, int m, int k,
                           const uint8_t* W_fp8, int n, const float* w_scale,
                           half* Y, uint8_t* act_buf, float* site_scale,
-                          int* amax_buf, bool calibrated) {
+                          int* amax_buf, bool calibrated,
+                          bool prequantized = false) {
     lt_gemm_fp8(lt, h, ws, ws_size, stream, CUBLAS_OP_N, CUBLAS_OP_N,
                 n, m, k, W_fp8, n, w_scale, X, k, Y, n,
-                act_buf, site_scale, amax_buf, false, calibrated);
+                act_buf, site_scale, amax_buf, false, calibrated, prequantized);
 }
 
 static void gemm_nn_bias_fp8(cublasLtHandle_t lt, cublasHandle_t h,
@@ -840,10 +846,11 @@ static void gemm_nn_bias_fp8(cublasLtHandle_t lt, cublasHandle_t h,
                                const half* X, int m, int k,
                                const uint8_t* W_fp8, int n, const float* w_scale,
                                const half* bias, half* Y, uint8_t* act_buf,
-                               float* site_scale, int* amax_buf, bool calibrated) {
+                               float* site_scale, int* amax_buf, bool calibrated,
+                               bool prequantized = false) {
     lt_gemm_fp8(lt, h, ws, ws_size, stream, CUBLAS_OP_N, CUBLAS_OP_N,
                 n, m, k, W_fp8, n, w_scale, X, k, Y, n,
-                act_buf, site_scale, amax_buf, false, calibrated);
+                act_buf, site_scale, amax_buf, false, calibrated, prequantized);
     bias_add_row_fp16(Y, bias, m, n, stream);
 }
 
@@ -852,10 +859,11 @@ static void gemm_nt_fp8(cublasLtHandle_t lt, cublasHandle_t h,
                           const half* X, int m, int k,
                           const uint8_t* W_fp8, int n, const float* w_scale,
                           half* Y, uint8_t* act_buf, float* site_scale,
-                          int* amax_buf, bool calibrated) {
+                          int* amax_buf, bool calibrated,
+                          bool prequantized = false) {
     lt_gemm_fp8(lt, h, ws, ws_size, stream, CUBLAS_OP_T, CUBLAS_OP_N,
                 n, m, k, W_fp8, k, w_scale, X, k, Y, n,
-                act_buf, site_scale, amax_buf, false, calibrated);
+                act_buf, site_scale, amax_buf, false, calibrated, prequantized);
 }
 
 static void gemm_nt_bias_fp8(cublasLtHandle_t lt, cublasHandle_t h,
@@ -863,10 +871,11 @@ static void gemm_nt_bias_fp8(cublasLtHandle_t lt, cublasHandle_t h,
                                const half* X, int m, int k,
                                const uint8_t* W_fp8, int n, const float* w_scale,
                                const half* bias, half* Y, uint8_t* act_buf,
-                               float* site_scale, int* amax_buf, bool calibrated) {
+                               float* site_scale, int* amax_buf, bool calibrated,
+                               bool prequantized = false) {
     lt_gemm_fp8(lt, h, ws, ws_size, stream, CUBLAS_OP_T, CUBLAS_OP_N,
                 n, m, k, W_fp8, k, w_scale, X, k, Y, n,
-                act_buf, site_scale, amax_buf, false, calibrated);
+                act_buf, site_scale, amax_buf, false, calibrated, prequantized);
     bias_add_row_fp16(Y, bias, m, n, stream);
 }
 
@@ -912,22 +921,23 @@ int CudaModel::encode_gpu(int T_mel) {
     bool cal = fp8_calibrated;
 
     auto gnn8 = [&](const half* X, int m, int k, const uint8_t* W, int n,
-                     const float* ws, int si, half* Y) {
+                     const float* ws, int si, half* Y, bool preq = false) {
         gemm_nn_fp8(cublaslt, cublas, lt_workspace, lt_workspace_size, stream,
                     X, m, k, W, n, ws, Y, fp8_act_buf,
-                    &fp8_act_site_scales[si], fp8_amax_buf, cal);
+                    &fp8_act_site_scales[si], fp8_amax_buf, cal, preq);
     };
     auto gnn8_bias = [&](const half* X, int m, int k, const uint8_t* W, int n,
-                          const float* ws, int si, const half* bias, half* Y) {
+                          const float* ws, int si, const half* bias, half* Y,
+                          bool preq = false) {
         gemm_nn_bias_fp8(cublaslt, cublas, lt_workspace, lt_workspace_size, stream,
                          X, m, k, W, n, ws, bias, Y, fp8_act_buf,
-                         &fp8_act_site_scales[si], fp8_amax_buf, cal);
+                         &fp8_act_site_scales[si], fp8_amax_buf, cal, preq);
     };
     auto gnt8 = [&](const half* X, int m, int k, const uint8_t* W, int n,
-                     const float* ws, int si, half* Y) {
+                     const float* ws, int si, half* Y, bool preq = false) {
         gemm_nt_fp8(cublaslt, cublas, lt_workspace, lt_workspace_size, stream,
                     X, m, k, W, n, ws, Y, fp8_act_buf,
-                    &fp8_act_site_scales[si], fp8_amax_buf, cal);
+                    &fp8_act_site_scales[si], fp8_amax_buf, cal, preq);
     };
     // Weight scale helper: fp8_scales[blk * 9 + offset]
     auto bscale = [&](int blk, int off) -> const float* { return &fp8_scales[blk * 9 + off]; };
@@ -964,14 +974,22 @@ int CudaModel::encode_gpu(int T_mel) {
     bias_relu_nchw_fp16(sub_buf[1], w->sub_conv[6].bias, SUB_CHANNELS, H * W, stream);
 
     int T = H;
-    reshape_chw_to_hcw_fp16(sub_buf[1], sub_buf[0], SUB_CHANNELS, T, W, stream);
+    bool fused = cal;  // true when calibrated (runtime path)
+
+    // reshape_chw_to_hcw: site 216 = N_BLOCKS*9 + 0 (sub_out activation)
+    int sub_out_si = N_BLOCKS * 9 + 0;
+    if (fused)
+        reshape_chw_to_hcw_fp8(sub_buf[1], sub_buf[0], fp8_act_buf,
+                                &fp8_act_site_scales[sub_out_si],
+                                SUB_CHANNELS, T, W, stream);
+    else
+        reshape_chw_to_hcw_fp16(sub_buf[1], sub_buf[0], SUB_CHANNELS, T, W, stream);
     // sub_out projection: FP8 (activation site: N_BLOCKS*9 + 0)
     const float* sub_out_scale = &fp8_scales[N_BLOCKS * 9 + 0];
-    int sub_out_si = N_BLOCKS * 9 + 0;
     if (w->sub_out_b)
-        gnn8_bias(sub_buf[0], T, SUB_CHANNELS * W, fp8_sub_out_w, D_MODEL, sub_out_scale, sub_out_si, w->sub_out_b, x);
+        gnn8_bias(sub_buf[0], T, SUB_CHANNELS * W, fp8_sub_out_w, D_MODEL, sub_out_scale, sub_out_si, w->sub_out_b, x, fused);
     else
-        gnn8(sub_buf[0], T, SUB_CHANNELS * W, fp8_sub_out_w, D_MODEL, sub_out_scale, sub_out_si, x);
+        gnn8(sub_buf[0], T, SUB_CHANNELS * W, fp8_sub_out_w, D_MODEL, sub_out_scale, sub_out_si, x, fused);
 
     // 3. Position encoding
     half* pos_enc_T = pos_enc + (T_max - T) * D_MODEL;
@@ -982,18 +1000,34 @@ int CudaModel::encode_gpu(int T_mel) {
         auto& b = w->blocks[blk];
 
         // --- FF1 (half-step residual) ---
-        layer_norm_fp16(x, b.ff1_ln_w, b.ff1_ln_b, ln_out, T, D_MODEL, 1e-5f, stream);
+        // layer_norm → asite(blk, 0) feeds ff1_w1
+        if (fused)
+            layer_norm_fp8(x, b.ff1_ln_w, b.ff1_ln_b, ln_out, fp8_act_buf,
+                           &fp8_act_site_scales[asite(blk, 0)], T, D_MODEL, 1e-5f, stream);
+        else
+            layer_norm_fp16(x, b.ff1_ln_w, b.ff1_ln_b, ln_out, T, D_MODEL, 1e-5f, stream);
 
-        gnn8(ln_out, T, D_MODEL, fp8_ff1_w1[blk], D_FF, bscale(blk, 1), asite(blk, 0), ff_mid);
-        silu_inplace_fp16(ff_mid, T * D_FF, stream);
+        gnn8(ln_out, T, D_MODEL, fp8_ff1_w1[blk], D_FF, bscale(blk, 1), asite(blk, 0), ff_mid, fused);
+        // silu → asite(blk, 1) feeds ff1_w2
+        if (fused)
+            silu_inplace_fp8(ff_mid, fp8_act_buf,
+                             &fp8_act_site_scales[asite(blk, 1)], T * D_FF, stream);
+        else
+            silu_inplace_fp16(ff_mid, T * D_FF, stream);
 
-        gnn8(ff_mid, T, D_FF, fp8_ff1_w2[blk], D_MODEL, bscale(blk, 2), asite(blk, 1), ff_out);
-        residual_add_layer_norm_fp16(x, ff_out, 0.5f,
-            b.mhsa_ln_w, b.mhsa_ln_b, ln_out, T, D_MODEL, 1e-5f, stream);
+        gnn8(ff_mid, T, D_FF, fp8_ff1_w2[blk], D_MODEL, bscale(blk, 2), asite(blk, 1), ff_out, fused);
+        // residual_add_layer_norm → asite(blk, 2) feeds qkv
+        if (fused)
+            residual_add_layer_norm_fp8(x, ff_out, 0.5f,
+                b.mhsa_ln_w, b.mhsa_ln_b, ln_out, fp8_act_buf,
+                &fp8_act_site_scales[asite(blk, 2)], T, D_MODEL, 1e-5f, stream);
+        else
+            residual_add_layer_norm_fp16(x, ff_out, 0.5f,
+                b.mhsa_ln_w, b.mhsa_ln_b, ln_out, T, D_MODEL, 1e-5f, stream);
 
         {
             // Fused QKV projection: FP8
-            gnn8(ln_out, T, D_MODEL, fp8_qkv_w[blk], 3 * D_MODEL, bscale(blk, 0), asite(blk, 2), qkv);
+            gnn8(ln_out, T, D_MODEL, fp8_qkv_w[blk], 3 * D_MODEL, bscale(blk, 0), asite(blk, 2), qkv, fused);
 
             half* K_h = k;
             half* V_h = v;
@@ -1001,9 +1035,9 @@ int CudaModel::encode_gpu(int T_mel) {
                                            q_u, q_v_buf, K_h, V_h,
                                            T, N_HEADS, HEAD_DIM, stream);
 
-            // Position encoding projection: FP8
+            // Position encoding projection: FP8 (NOT fused — precomputed data, per-block scales)
             half* pos_temp = pos_proj;
-            gnn8(pos_enc_T, pos_len, D_MODEL, fp8_pos_w[blk], D_MODEL, bscale(blk, 5), asite(blk, 3), pos_temp);
+            gnn8(pos_enc_T, pos_len, D_MODEL, fp8_pos_w[blk], D_MODEL, bscale(blk, 5), asite(blk, 3), pos_temp, false);
 
             // Batched GEMMs stay FP16 (dynamic activations, not weight matrices)
             {
@@ -1029,41 +1063,81 @@ int CudaModel::encode_gpu(int T_mel) {
             batched_gemm_nn(cublas, scores, V_h, attn_out,
                             N_HEADS, T, HEAD_DIM, T,
                             (long long)T * T, (long long)T * HEAD_DIM, (long long)T * HEAD_DIM);
-            transpose_0213_fp16(attn_out, ff_out, N_HEADS, T, HEAD_DIM, stream);
+            // transpose_0213 → asite(blk, 4) feeds out_w
+            if (fused)
+                transpose_0213_fp8(attn_out, ff_out, fp8_act_buf,
+                                    &fp8_act_site_scales[asite(blk, 4)],
+                                    N_HEADS, T, HEAD_DIM, stream);
+            else
+                transpose_0213_fp16(attn_out, ff_out, N_HEADS, T, HEAD_DIM, stream);
 
             // Output projection: FP8
-            gnn8(ff_out, T, D_MODEL, fp8_out_w[blk], D_MODEL, bscale(blk, 6), asite(blk, 4), mhsa_out);
+            gnn8(ff_out, T, D_MODEL, fp8_out_w[blk], D_MODEL, bscale(blk, 6), asite(blk, 4), mhsa_out, fused);
         }
 
-        residual_add_layer_norm_fp16(x, mhsa_out, 1.0f,
-            b.conv_ln_w, b.conv_ln_b, ln_out, T, D_MODEL, 1e-5f, stream);
+        // residual_add_layer_norm → asite(blk, 5) feeds conv_pw1
+        if (fused)
+            residual_add_layer_norm_fp8(x, mhsa_out, 1.0f,
+                b.conv_ln_w, b.conv_ln_b, ln_out, fp8_act_buf,
+                &fp8_act_site_scales[asite(blk, 5)], T, D_MODEL, 1e-5f, stream);
+        else
+            residual_add_layer_norm_fp16(x, mhsa_out, 1.0f,
+                b.conv_ln_w, b.conv_ln_b, ln_out, T, D_MODEL, 1e-5f, stream);
 
         // Pointwise conv1 + GLU: FP8
-        gnt8(ln_out, T, D_MODEL, fp8_conv_pw1_w[blk], D_CONV_PW, bscale(blk, 7), asite(blk, 5), conv_mid);
+        gnt8(ln_out, T, D_MODEL, fp8_conv_pw1_w[blk], D_CONV_PW, bscale(blk, 7), asite(blk, 5), conv_mid, fused);
         glu_fp16(conv_mid, conv_glu, T, D_MODEL, stream);
 
-        depthwise_conv1d_k9_silu_fp16(conv_glu, b.conv_dw_w, b.conv_dw_b,
-                                       conv_dw, T, D_MODEL, stream);
+        // depthwise_conv1d + SiLU → asite(blk, 6) feeds conv_pw2
+        if (fused)
+            depthwise_conv1d_k9_silu_fp8(conv_glu, b.conv_dw_w, b.conv_dw_b,
+                                          conv_dw, fp8_act_buf,
+                                          &fp8_act_site_scales[asite(blk, 6)],
+                                          T, D_MODEL, stream);
+        else
+            depthwise_conv1d_k9_silu_fp16(conv_glu, b.conv_dw_w, b.conv_dw_b,
+                                           conv_dw, T, D_MODEL, stream);
 
         // Pointwise conv2: FP8
-        gnt8(conv_dw, T, D_MODEL, fp8_conv_pw2_w[blk], D_MODEL, bscale(blk, 8), asite(blk, 6), mhsa_out);
+        gnt8(conv_dw, T, D_MODEL, fp8_conv_pw2_w[blk], D_MODEL, bscale(blk, 8), asite(blk, 6), mhsa_out, fused);
 
-        residual_add_layer_norm_fp16(x, mhsa_out, 1.0f,
-            b.ff2_ln_w, b.ff2_ln_b, ln_out, T, D_MODEL, 1e-5f, stream);
+        // residual_add_layer_norm → asite(blk, 7) feeds ff2_w1
+        if (fused)
+            residual_add_layer_norm_fp8(x, mhsa_out, 1.0f,
+                b.ff2_ln_w, b.ff2_ln_b, ln_out, fp8_act_buf,
+                &fp8_act_site_scales[asite(blk, 7)], T, D_MODEL, 1e-5f, stream);
+        else
+            residual_add_layer_norm_fp16(x, mhsa_out, 1.0f,
+                b.ff2_ln_w, b.ff2_ln_b, ln_out, T, D_MODEL, 1e-5f, stream);
 
         // FF2: FP8
-        gnn8(ln_out, T, D_MODEL, fp8_ff2_w1[blk], D_FF, bscale(blk, 3), asite(blk, 7), ff_mid);
-        silu_inplace_fp16(ff_mid, T * D_FF, stream);
+        gnn8(ln_out, T, D_MODEL, fp8_ff2_w1[blk], D_FF, bscale(blk, 3), asite(blk, 7), ff_mid, fused);
+        // silu → asite(blk, 8) feeds ff2_w2
+        if (fused)
+            silu_inplace_fp8(ff_mid, fp8_act_buf,
+                             &fp8_act_site_scales[asite(blk, 8)], T * D_FF, stream);
+        else
+            silu_inplace_fp16(ff_mid, T * D_FF, stream);
 
-        gnn8(ff_mid, T, D_FF, fp8_ff2_w2[blk], D_MODEL, bscale(blk, 4), asite(blk, 8), ff_out);
-        residual_add_layer_norm_fp16(x, ff_out, 0.5f,
-            b.final_ln_w, b.final_ln_b, x, T, D_MODEL, 1e-5f, stream);
+        gnn8(ff_mid, T, D_FF, fp8_ff2_w2[blk], D_MODEL, bscale(blk, 4), asite(blk, 8), ff_out, fused);
+        // Final LN: last block fuses FP8 for enc_proj (site 217 = N_BLOCKS*9 + 1)
+        bool fuse_final = fused && (blk == N_BLOCKS - 1);
+        int enc_proj_si = N_BLOCKS * 9 + 1;
+        if (fuse_final)
+            residual_add_layer_norm_fp8(x, ff_out, 0.5f,
+                b.final_ln_w, b.final_ln_b, x, fp8_act_buf,
+                &fp8_act_site_scales[enc_proj_si], T, D_MODEL, 1e-5f, stream);
+        else
+            residual_add_layer_norm_fp16(x, ff_out, 0.5f,
+                b.final_ln_w, b.final_ln_b, x, T, D_MODEL, 1e-5f, stream);
     }
 
     // Encoder projection: FP8 (activation site: N_BLOCKS*9 + 1)
-    const float* enc_proj_scale = &fp8_scales[N_BLOCKS * 9 + 1];
-    int enc_proj_si = N_BLOCKS * 9 + 1;
-    gnn8_bias(x, T, D_MODEL, fp8_enc_proj_w, D_JOINT, enc_proj_scale, enc_proj_si, w->enc_proj_b, enc_proj_all);
+    {
+        const float* enc_proj_scale = &fp8_scales[N_BLOCKS * 9 + 1];
+        int epi = N_BLOCKS * 9 + 1;
+        gnn8_bias(x, T, D_MODEL, fp8_enc_proj_w, D_JOINT, enc_proj_scale, epi, w->enc_proj_b, enc_proj_all, fused);
+    }
 
     fp8_calibrated = true;
     return T;

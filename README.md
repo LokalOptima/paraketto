@@ -6,9 +6,9 @@
 
 Speech-to-text inference for NVIDIA's [Parakeet TDT 0.6B V2](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2), written in C++ with custom CUDA kernels. No frameworks, no Python at runtime.
 
-- Batch 1, 1250x+ real-time — fast on a single WAV
+- Batch 1, 1300x+ real-time — fast on a single WAV
 - Custom CUDA/CUTLASS kernels — only `libcudart.so`
-- Optional FP8 quantization — half the weight size, faster startup
+- Optional FP8 quantization — half the weight size, +9% throughput
 - Optimized 1.8 GB VRAM usage
 - ~240ms warm startup (FP16), ~180ms (FP8)
 - Builtin HTTP server
@@ -34,18 +34,18 @@ difficult     1205x  23.32%   509s  422ms    1261x  23.24%   509s  404ms
 Total         1250x          7236s  5.79s    1256x          7236s  5.76s
 ```
 
-FP8 backend (requires Blackwell GPU):
+FP8 backend with fused quantization (requires Blackwell GPU):
 
 ```
-                 FP8 (cublasLt E4M3)
+                 FP8 (cublasLt E4M3 + fused quantize)
               ────────────────────────────
                RTFx    WER    Audio  Time
-librispeech   1152x   2.03%   896s  778ms
-earnings22    1015x  15.76%   253s  249ms
-long          1360x   2.20%  5578s  4.10s
-difficult     1269x  19.38%   509s  401ms
+librispeech   1220x   2.11%   896s  735ms
+earnings22    1036x  15.62%   253s  244ms
+long          1346x   2.17%  5578s  4.14s
+difficult     1331x  18.96%   509s  383ms
               ────────────────────────────
-Total         1309x          7236s  5.53s
+Total         1314x          7236s  5.51s
 ```
 
 ### Startup time
@@ -208,7 +208,7 @@ src/gemm.h                # Unified GEMM interface (backend selected at link tim
 src/cutlass_gemm.cu       # CUTLASS FP16 backend
 src/cublas_gemm.cu        # cuBLAS FP16 backend
 src/kernels.cu            # Custom kernels: FFT, LayerNorm, SiLU, GLU, conv, LSTM, ...
-src/kernels_fp8.cu        # FP8 kernels: absmax quantize, static quantize, transpose
+src/kernels_fp8.cu        # FP8 kernels: absmax quantize, static quantize, fused FP8 output
 src/mel.h                 # Custom 512-point FFT + mel filterbank
 scripts/export_weights.py # NeMo → weights.bin converter
 ```

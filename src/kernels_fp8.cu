@@ -5,6 +5,7 @@
 
 #include "kernels_fp8.h"
 #include <cuda_fp8.h>
+#include <cuda_fp16.h>
 #include <cfloat>
 #include <cstdio>
 #include <cstdlib>
@@ -156,4 +157,305 @@ void transpose_u8_inplace(uint8_t* data, int rows, int cols,
     int blocks = (total + threads - 1) / threads;
     transpose_u8_kernel<<<blocks, threads, 0, stream>>>(
         (const uint8_t*)temp, data, rows, cols);
+}
+
+// =========================================================================
+// Fused FP8 output kernels
+// =========================================================================
+
+// ---------------------------------------------------------------------------
+// LayerNorm + FP8
+// ---------------------------------------------------------------------------
+
+__global__ void layer_norm_fp8_kernel(const half* __restrict__ x,
+                                       const half* __restrict__ gamma,
+                                       const half* __restrict__ beta,
+                                       half* __restrict__ y,
+                                       uint8_t* __restrict__ fp8_out,
+                                       const float* __restrict__ fp8_scale,
+                                       int N, int D, float eps) {
+    int row = blockIdx.x;
+    if (row >= N) return;
+
+    const half* xr = x + row * D;
+    half* yr = y + row * D;
+    uint8_t* fp8r = fp8_out + row * D;
+
+    float sum = 0.0f, sum2 = 0.0f;
+    for (int i = threadIdx.x; i < D; i += blockDim.x) {
+        float v = __half2float(xr[i]);
+        sum += v;
+        sum2 += v * v;
+    }
+
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        sum  += __shfl_xor_sync(0xffffffff, sum, mask);
+        sum2 += __shfl_xor_sync(0xffffffff, sum2, mask);
+    }
+
+    __shared__ float s_sum[32], s_sum2[32];
+    int warp_id = threadIdx.x / 32;
+    int lane = threadIdx.x % 32;
+    if (lane == 0) { s_sum[warp_id] = sum; s_sum2[warp_id] = sum2; }
+    __syncthreads();
+
+    if (warp_id == 0) {
+        int nwarps = blockDim.x / 32;
+        sum  = (lane < nwarps) ? s_sum[lane] : 0.0f;
+        sum2 = (lane < nwarps) ? s_sum2[lane] : 0.0f;
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            sum  += __shfl_xor_sync(0xffffffff, sum, mask);
+            sum2 += __shfl_xor_sync(0xffffffff, sum2, mask);
+        }
+    }
+
+    __shared__ float s_mean, s_inv_std;
+    if (threadIdx.x == 0) {
+        s_mean = sum / D;
+        float var = sum2 / D - s_mean * s_mean;
+        s_inv_std = rsqrtf(var + eps);
+    }
+    __syncthreads();
+
+    float mean = s_mean;
+    float inv_std = s_inv_std;
+    float inv_scale = 1.0f / (*fp8_scale);
+
+    for (int i = threadIdx.x; i < D; i += blockDim.x) {
+        float v = __half2float(xr[i]);
+        float g = __half2float(gamma[i]);
+        float b = __half2float(beta[i]);
+        float val = (v - mean) * inv_std * g + b;
+        yr[i] = __float2half(val);
+        fp8r[i] = __nv_cvt_float_to_fp8(val * inv_scale, __NV_SATFINITE, __NV_E4M3);
+    }
+}
+
+void layer_norm_fp8(const half* x, const half* gamma, const half* beta,
+                    half* y, uint8_t* fp8_out, const float* fp8_scale,
+                    int N, int D, float eps, cudaStream_t stream) {
+    int threads = (D <= 1024) ? ((D + 31) / 32 * 32) : 1024;
+    if (threads < 32) threads = 32;
+    layer_norm_fp8_kernel<<<N, threads, 0, stream>>>(x, gamma, beta, y, fp8_out, fp8_scale, N, D, eps);
+}
+
+// ---------------------------------------------------------------------------
+// Residual add + LayerNorm + FP8
+// ---------------------------------------------------------------------------
+
+__global__ void residual_add_layer_norm_fp8_kernel(half* __restrict__ x,
+                                                    const half* __restrict__ delta,
+                                                    float alpha,
+                                                    const half* __restrict__ gamma,
+                                                    const half* __restrict__ beta,
+                                                    half* __restrict__ ln_out,
+                                                    uint8_t* __restrict__ fp8_out,
+                                                    const float* __restrict__ fp8_scale,
+                                                    int N, int D, float eps) {
+    int row = blockIdx.x;
+    if (row >= N) return;
+
+    half* xr = x + row * D;
+    const half* dr = delta + row * D;
+    half* yr = ln_out + row * D;
+    uint8_t* fp8r = fp8_out + row * D;
+
+    float sum = 0.0f, sum2 = 0.0f;
+    for (int i = threadIdx.x; i < D; i += blockDim.x) {
+        float v = __half2float(xr[i]) + alpha * __half2float(dr[i]);
+        xr[i] = __float2half(v);
+        sum += v;
+        sum2 += v * v;
+    }
+
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        sum  += __shfl_xor_sync(0xffffffff, sum, mask);
+        sum2 += __shfl_xor_sync(0xffffffff, sum2, mask);
+    }
+
+    __shared__ float s_sum[32], s_sum2[32];
+    int warp_id = threadIdx.x / 32;
+    int lane = threadIdx.x % 32;
+    if (lane == 0) { s_sum[warp_id] = sum; s_sum2[warp_id] = sum2; }
+    __syncthreads();
+
+    if (warp_id == 0) {
+        int nwarps = blockDim.x / 32;
+        sum  = (lane < nwarps) ? s_sum[lane] : 0.0f;
+        sum2 = (lane < nwarps) ? s_sum2[lane] : 0.0f;
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            sum  += __shfl_xor_sync(0xffffffff, sum, mask);
+            sum2 += __shfl_xor_sync(0xffffffff, sum2, mask);
+        }
+    }
+
+    __shared__ float s_mean, s_inv_std;
+    if (threadIdx.x == 0) {
+        s_mean = sum / D;
+        float var = sum2 / D - s_mean * s_mean;
+        s_inv_std = rsqrtf(var + eps);
+    }
+    __syncthreads();
+
+    float mean = s_mean;
+    float inv_std = s_inv_std;
+    float inv_scale = 1.0f / (*fp8_scale);
+
+    for (int i = threadIdx.x; i < D; i += blockDim.x) {
+        float v = __half2float(xr[i]);
+        float g = __half2float(gamma[i]);
+        float b = __half2float(beta[i]);
+        float val = (v - mean) * inv_std * g + b;
+        yr[i] = __float2half(val);
+        fp8r[i] = __nv_cvt_float_to_fp8(val * inv_scale, __NV_SATFINITE, __NV_E4M3);
+    }
+}
+
+void residual_add_layer_norm_fp8(half* x, const half* delta, float alpha,
+                                  const half* gamma, const half* beta,
+                                  half* ln_out, uint8_t* fp8_out,
+                                  const float* fp8_scale,
+                                  int N, int D, float eps,
+                                  cudaStream_t stream) {
+    int threads = (D <= 1024) ? ((D + 31) / 32 * 32) : 1024;
+    if (threads < 32) threads = 32;
+    residual_add_layer_norm_fp8_kernel<<<N, threads, 0, stream>>>(
+        x, delta, alpha, gamma, beta, ln_out, fp8_out, fp8_scale, N, D, eps);
+}
+
+// ---------------------------------------------------------------------------
+// SiLU in-place + FP8
+// ---------------------------------------------------------------------------
+
+__global__ void silu_inplace_fp8_kernel(half* __restrict__ x,
+                                         uint8_t* __restrict__ fp8_out,
+                                         const float* __restrict__ fp8_scale,
+                                         int n) {
+    float inv_scale = 1.0f / (*fp8_scale);
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = __half2float(x[i]);
+        float val = v / (1.0f + expf(-v));
+        x[i] = __float2half(val);
+        fp8_out[i] = __nv_cvt_float_to_fp8(val * inv_scale, __NV_SATFINITE, __NV_E4M3);
+    }
+}
+
+void silu_inplace_fp8(half* x, uint8_t* fp8_out, const float* fp8_scale,
+                      int n, cudaStream_t stream) {
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    silu_inplace_fp8_kernel<<<blocks, threads, 0, stream>>>(x, fp8_out, fp8_scale, n);
+}
+
+// ---------------------------------------------------------------------------
+// Depthwise conv1d k=9 + SiLU + FP8
+// ---------------------------------------------------------------------------
+
+__global__ void depthwise_conv1d_k9_silu_fp8_kernel(const half* __restrict__ x,
+                                                      const half* __restrict__ w,
+                                                      const half* __restrict__ b,
+                                                      half* __restrict__ y,
+                                                      uint8_t* __restrict__ fp8_out,
+                                                      const float* __restrict__ fp8_scale,
+                                                      int T, int C) {
+    float inv_scale = 1.0f / (*fp8_scale);
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = T * C;
+    if (idx < total) {
+        int t = idx / C;
+        int c = idx % C;
+
+        float sum = 0.0f;
+        const half* wc = w + c * 9;
+
+        #pragma unroll
+        for (int k = 0; k < 9; k++) {
+            int ti = t + k - 4;
+            if (ti >= 0 && ti < T)
+                sum += __half2float(x[ti * C + c]) * __half2float(wc[k]);
+        }
+
+        if (b) sum += __half2float(b[c]);
+        float val = sum / (1.0f + expf(-sum));
+        y[idx] = __float2half(val);
+        fp8_out[idx] = __nv_cvt_float_to_fp8(val * inv_scale, __NV_SATFINITE, __NV_E4M3);
+    }
+}
+
+void depthwise_conv1d_k9_silu_fp8(const half* x, const half* w, const half* b,
+                                   half* y, uint8_t* fp8_out,
+                                   const float* fp8_scale,
+                                   int T, int C, cudaStream_t stream) {
+    int total = T * C;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    depthwise_conv1d_k9_silu_fp8_kernel<<<blocks, threads, 0, stream>>>(
+        x, w, b, y, fp8_out, fp8_scale, T, C);
+}
+
+// ---------------------------------------------------------------------------
+// Transpose [A,B,C] -> [B,A,C] + FP8
+// ---------------------------------------------------------------------------
+
+__global__ void transpose_0213_fp8_kernel(const half* __restrict__ in,
+                                           half* __restrict__ out,
+                                           uint8_t* __restrict__ fp8_out,
+                                           const float* __restrict__ fp8_scale,
+                                           int A, int B, int C) {
+    float inv_scale = 1.0f / (*fp8_scale);
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = A * B * C;
+    if (idx < total) {
+        int a = idx / (B * C);
+        int rem = idx % (B * C);
+        int b = rem / C;
+        int c = rem % C;
+        int out_idx = b * A * C + a * C + c;
+        float val = __half2float(in[idx]);
+        out[out_idx] = __float2half(val);
+        fp8_out[out_idx] = __nv_cvt_float_to_fp8(val * inv_scale, __NV_SATFINITE, __NV_E4M3);
+    }
+}
+
+void transpose_0213_fp8(const half* in, half* out, uint8_t* fp8_out,
+                         const float* fp8_scale,
+                         int A, int B, int C, cudaStream_t stream) {
+    int total = A * B * C;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    transpose_0213_fp8_kernel<<<blocks, threads, 0, stream>>>(
+        in, out, fp8_out, fp8_scale, A, B, C);
+}
+
+// ---------------------------------------------------------------------------
+// Reshape [C,H,W] -> [H,C*W] + FP8
+// ---------------------------------------------------------------------------
+
+__global__ void reshape_chw_to_hcw_fp8_kernel(const half* __restrict__ in,
+                                               half* __restrict__ out,
+                                               uint8_t* __restrict__ fp8_out,
+                                               const float* __restrict__ fp8_scale,
+                                               int C, int H, int W) {
+    float inv_scale = 1.0f / (*fp8_scale);
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = C * H * W;
+    if (idx >= total) return;
+    int h = idx / (C * W);
+    int cw = idx % (C * W);
+    int c = cw / W;
+    int w = cw % W;
+    float val = __half2float(in[c * H * W + h * W + w]);
+    out[idx] = __float2half(val);
+    fp8_out[idx] = __nv_cvt_float_to_fp8(val * inv_scale, __NV_SATFINITE, __NV_E4M3);
+}
+
+void reshape_chw_to_hcw_fp8(const half* in, half* out, uint8_t* fp8_out,
+                             const float* fp8_scale,
+                             int C, int H, int W, cudaStream_t stream) {
+    int total = C * H * W;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    reshape_chw_to_hcw_fp8_kernel<<<blocks, threads, 0, stream>>>(
+        in, out, fp8_out, fp8_scale, C, H, W);
 }

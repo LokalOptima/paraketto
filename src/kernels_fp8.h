@@ -43,3 +43,45 @@ void bias_add_row_fp16(half* x, const half* bias, int rows, int cols,
 // ---------------------------------------------------------------------------
 void transpose_u8_inplace(uint8_t* data, int rows, int cols,
                            void* temp, cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
+// Fused FP8 output kernels — produce FP16 + FP8 simultaneously
+//
+// Each kernel is a copy of the FP16 variant that also writes FP8 E4M3 output
+// using a pre-computed scale (from prior calibration pass). Used on runtime
+// path (fp8_calibrated=true) to eliminate separate quantize_fp8_static calls.
+// ---------------------------------------------------------------------------
+
+// LayerNorm + FP8: y = LN(x) in FP16, fp8_out = quantize(LN(x)) in FP8
+void layer_norm_fp8(const half* x, const half* gamma, const half* beta,
+                    half* y, uint8_t* fp8_out, const float* fp8_scale,
+                    int N, int D, float eps, cudaStream_t stream);
+
+// Residual add + LayerNorm + FP8:
+//   x += alpha * delta, ln_out = LN(x) in FP16, fp8_out = quantize(LN(x))
+void residual_add_layer_norm_fp8(half* x, const half* delta, float alpha,
+                                  const half* gamma, const half* beta,
+                                  half* ln_out, uint8_t* fp8_out,
+                                  const float* fp8_scale,
+                                  int N, int D, float eps,
+                                  cudaStream_t stream);
+
+// SiLU in-place + FP8: x = silu(x) in FP16, fp8_out = quantize(silu(x))
+void silu_inplace_fp8(half* x, uint8_t* fp8_out, const float* fp8_scale,
+                      int n, cudaStream_t stream);
+
+// Depthwise conv1d k=9 + SiLU + FP8: y = silu(conv(x)) in FP16, fp8_out = quantize
+void depthwise_conv1d_k9_silu_fp8(const half* x, const half* w, const half* b,
+                                   half* y, uint8_t* fp8_out,
+                                   const float* fp8_scale,
+                                   int T, int C, cudaStream_t stream);
+
+// Transpose [A,B,C] -> [B,A,C] + FP8: out in FP16, fp8_out = quantize
+void transpose_0213_fp8(const half* in, half* out, uint8_t* fp8_out,
+                         const float* fp8_scale,
+                         int A, int B, int C, cudaStream_t stream);
+
+// Reshape [C,H,W] -> [H,C*W] + FP8: out in FP16, fp8_out = quantize
+void reshape_chw_to_hcw_fp8(const half* in, half* out, uint8_t* fp8_out,
+                             const float* fp8_scale,
+                             int C, int H, int W, cudaStream_t stream);

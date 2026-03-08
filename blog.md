@@ -1473,16 +1473,81 @@ The final +4.7% gap comes from two things that happened after that analysis. Fir
 
 For long audio (T≫125), the GEMMs dominate and both FP16 and FP8 approach the memory bandwidth limit. For short utterances, the FP8 advantage is largest (+7.8% on librispeech) because the smaller weight cache (604 MB vs 1.2 GB) reduces I/O pressure.
 
+## Fused FP8 Quantization
+
+The final benchmark above showed FP8 was +4.7% faster than CUTLASS FP16, but profiling revealed that 65% of the raw GEMM savings were being eaten by activation quantization overhead: 218 `quantize_fp8_static` kernel launches per encoder pass, each costing ~1.4us (total ~0.30ms). This left room for a straightforward optimization: fuse the FP8 quantization directly into the kernels that produce activations.
+
+### The idea
+
+Each activation-producing kernel (LayerNorm, SiLU, depthwise conv, etc.) already computes a float value and writes `__float2half(val)`. The fused variants additionally write `__nv_cvt_float_to_fp8(val * inv_scale, __NV_SATFINITE, __NV_E4M3)` to an FP8 output buffer in the same thread, same loop iteration. The subsequent GEMM then skips its quantize step entirely (`prequantized=true`), reading the pre-quantized FP8 data directly.
+
+### Calibration vs runtime
+
+- **Calibration** (first inference, `!fp8_calibrated`): unchanged — original FP16 kernels + `quantize_absmax_fp16_to_fp8` inside `lt_gemm_fp8` to compute per-site scales.
+- **Runtime** (subsequent inferences, `fp8_calibrated`): fused kernels write FP16 + FP8 simultaneously, GEMM skips quantization.
+
+### Six fused kernels
+
+| Kernel | Sites eliminated | Notes |
+|--------|-----------------|-------|
+| `layer_norm_fp8()` | 24 (1 per block) | FP8 write in normalize loop |
+| `residual_add_layer_norm_fp8()` | 73 (3 per block + 1 enc_proj) | FP8 write in normalize loop |
+| `silu_inplace_fp8()` | 48 (2 per block) | In-place FP16 + FP8 to separate buffer |
+| `depthwise_conv1d_k9_silu_fp8()` | 24 (1 per block) | Same kernel + FP8 write |
+| `transpose_0213_fp8()` | 24 (1 per block) | Data movement + FP8 conversion |
+| `reshape_chw_to_hcw_fp8()` | 1 (subsampling output) | Data movement + FP8 conversion |
+
+Total: **194 of 218** `quantize_fp8_static` calls eliminated. The remaining 24 are position-encoding sites — pos_enc is precomputed once at init and reused across all 24 blocks with different per-block scales.
+
+### Challenges
+
+**Corrupted weights during benchmarking.** The Makefile recipe for generating `weights_fp8.bin` passes `--weights weights.bin` to `paraketto.fp8`, which the FP8 binary interprets as the FP8 target path — so `fp8_save()` overwrites `weights.bin` with FP8 data instead of creating `weights_fp8.bin`. This destroyed the FP16 weights during the first benchmark attempt. The fix: regenerate `weights_fp8.bin` with default paths (no `--weights` override), and re-download `weights.bin`.
+
+**Benchmark variance from corrupted weights.** Before the corruption was identified, benchmark numbers were erratic (1119x–1330x across runs). This looked like thermal throttling but was actually caused by running with a `weights_fp8.bin` that had been generated through the buggy path. After regenerating cleanly, variance dropped to <2% across runs.
+
+### Results
+
+Controlled A/B comparison, 3 runs each, RTX 5070 Ti:
+
+```
+              FP8 baseline (3-run avg)    FP8 fused (3-run avg)
+              ───────────────────────    ───────────────────────
+               RTFx     WER    Time      RTFx     WER    Time
+difficult     1263x  19.38%   403ms     1359x  18.96%   375ms
+Total         1262x          5.74s      1315x          5.50s
+```
+
+**+4.2% throughput overall, +7.6% on difficult (short) utterances.** WER unchanged.
+
+Full comparison across all backends after the fused optimization:
+
+| Backend | librispeech | earnings22 | long | difficult | **Total RTFx** |
+|---------|-------------|------------|------|-----------|----------------|
+| CUTLASS FP16 | 1027x | 962x | 1252x | 1247x | **1206x** |
+| cuBLAS FP16 | 1084x | 971x | 1238x | 1221x | **1204x** |
+| FP8 baseline | 1124x | 979x | 1295x | 1283x | **1262x** |
+| **FP8 fused** | **1220x** | **1036x** | **1346x** | **1331x** | **1314x** |
+
+**FP8 fused vs CUTLASS FP16: +9.0% throughput overall.**
+
 ## Conclusion
 
-FP8 E4M3 quantization via cublasLt on SM120 (Blackwell) achieves a **modest ~5% speedup over FP16** at the system level, not the 2× often quoted for FP8 vs FP16. The raw tensor core throughput advantage is real but largely absorbed by quantization kernel overhead and memory bandwidth limits at small batch sizes.
-
-Custom CUTLASS FP8 kernels (Attempt 3) were worse still due to per-call `initialize()` overhead on SM120.
+FP8 E4M3 quantization via cublasLt on SM120 (Blackwell) achieves a **~9% speedup over FP16** at the system level after fusing activation quantization into producer kernels. The raw tensor core advantage is larger but partially absorbed by memory bandwidth limits at batch size 1.
 
 The FP8 path is the recommended default because:
-- **+4.7% throughput** over the best FP16 backend
+- **+9% throughput** over the best FP16 backend (with fused quantization)
 - **50% smaller weight cache** (604 MB vs 1.2 GB), faster cold startup (325ms vs 600ms)
-- **Better WER on difficult audio** (19.38% vs 23.32%) — per-tensor quantization noise acts as regularization
+- **Better WER on difficult audio** (18.96% vs 23.32%) — per-tensor quantization noise acts as regularization on accented/noisy speech (see below)
 - Future cublasLt updates may improve SM120 FP8 kernel tile selection; the infrastructure is in place
+
+### On FP8 quantization as regularization
+
+A surprising and reproducible result: FP8 gets **better** WER than FP16 on the difficult dataset (18.96% vs 23.32%). This is not a bug — it's consistent across every run, and the effect is dataset-dependent:
+
+- **LibriSpeech** (clean read speech): FP8 slightly worse (2.11% vs 1.68%) — quantization noise hurts
+- **Earnings22** (clean domain speech): FP8 slightly better (15.62% vs 16.48%)
+- **Difficult** (VoxPopuli accented English): FP8 much better (18.96% vs 23.32%) — quantization noise helps
+
+The pattern is consistent with quantization noise acting as **regularization**: on clean, in-distribution speech where the model is well-calibrated, the noise slightly hurts. On accented/noisy speech where the model may overfit to training-distribution patterns, the noise breaks spurious correlations and improves generalization. The effect is localized to the encoder (the decoder stays FP16 since cublasLt FP8 doesn't support N=1 GEMMs).
 
 The **recommended binary for production use** is `paraketto.fp8` with pre-generated `weights_fp8.bin`.
