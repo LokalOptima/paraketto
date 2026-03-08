@@ -26,11 +26,14 @@
 
 #ifdef EMBEDDED_WEIGHTS
 extern "C" {
+#  ifdef PARAKETTO_FP8
+    extern const uint8_t _binary_weights_fp8_bin_start[];
+    extern const uint8_t _binary_weights_fp8_bin_end[];
+#  else
     extern const uint8_t _binary_weights_bin_start[];
     extern const uint8_t _binary_weights_bin_end[];
+#  endif
 }
-static const uint8_t* paraketto_weights_start = _binary_weights_bin_start;
-static const uint8_t* paraketto_weights_end   = _binary_weights_bin_end;
 #endif
 
 // ---------------------------------------------------------------------------
@@ -43,15 +46,35 @@ struct Pipeline {
     MelSpec mel;
     cudaStream_t stream = nullptr;
 
-    // Initialize with already-prefetched weights (upload to GPU + build model).
-    void init(Weights&& prefetched) {
+    // fp8_ready: non-empty = weights_fp8.bin exists and is valid (use allocate_only).
+    // fp8_target: path to load/save weights_fp8.bin (may differ on first run).
+    // fp8_prefetch: pre-populated mmap of weights_fp8.bin from background thread.
+    void init(Weights&& prefetched,
+              const std::string& fp8_ready  = "",
+              const std::string& fp8_target = "",
+              const void* fp8_prefetch = nullptr,
+              size_t fp8_prefetch_size = 0) {
         CUDA_CHECK(cudaStreamCreate(&stream));
         weights = std::move(prefetched);
+
+#ifdef PARAKETTO_FP8
+        if (!fp8_ready.empty())
+            weights.allocate_only();  // FP8 file ready: malloc + assign pointers only
+        else
+            weights.upload(stream);   // first run: upload FP16 to quantize from
+#else
         weights.upload(stream);
+#endif
 
         mel.init();
 
-        cuda_model.init(weights, stream, 16000 * 120 / 160);  // 120s max audio
+#ifdef PARAKETTO_FP8
+        const char* fp8_path = fp8_target.empty() ? nullptr : fp8_target.c_str();
+        cuda_model.init(weights, stream, 16000 * 120 / 160, fp8_path,
+                        fp8_prefetch, fp8_prefetch_size);
+#else
+        cuda_model.init(weights, stream, 16000 * 120 / 160);
+#endif
     }
 
     ~Pipeline() {
@@ -147,7 +170,12 @@ int main(int argc, char** argv) {
 
     if (argc < 2) { usage(); return 1; }
 
+#ifdef PARAKETTO_FP8
+    std::string weights_path = "weights_fp8.bin";  // FP8 binary uses fp8 weights by default
+    std::string fp16_path    = "weights.bin";       // FP16 source for first-run quantization
+#else
     std::string weights_path = "weights.bin";
+#endif
     std::vector<std::string> wav_files;
     bool server_mode = false;
     std::string server_host = "0.0.0.0";
@@ -184,15 +212,63 @@ int main(int argc, char** argv) {
     Weights prefetched;
     std::thread prefetch_thread;
 
+    // For FP8: check whether the fp8 weights file is ready before starting prefetch.
+    // Check if weights_fp8.bin is present and valid.
+    // If yes: allocate_only() + fp8_load (skip weights.bin upload).
+    // If no:  upload weights.bin FP16, quantize, save weights_fp8.bin.
+    std::string fp8_path_for_init;
+    void* fp8_prefetch_ptr = nullptr;
+    size_t fp8_prefetch_size = 0;
+#if defined(PARAKETTO_FP8) && !defined(EMBEDDED_WEIGHTS)
+    {
+        int fd = open(weights_path.c_str(), O_RDONLY);
+        if (fd >= 0) {
+            char hdr[12];
+            if (read(fd, hdr, 12) == 12
+                    && memcmp(hdr, "PRKTFP8", 7) == 0) {
+                uint32_t version; memcpy(&version, hdr + 8, 4);
+                if (version == FP8_WEIGHTS_VERSION)
+                    fp8_path_for_init = weights_path;
+            }
+            close(fd);
+        }
+    }
+#endif
+
 #ifdef EMBEDDED_WEIGHTS
-    // Embedded weights: parse header (fast, no I/O)
-    prefetched = Weights::from_embedded(
-        paraketto_weights_start,
-        paraketto_weights_end - paraketto_weights_start);
+#  ifdef PARAKETTO_FP8
+    fp8_path_for_init = "embedded";  // FP8 static: weights_fp8.bin is embedded
+    prefetched = Weights{};          // allocate_only() computes layout from constants
+#  else
+    prefetched = Weights::from_embedded(_binary_weights_bin_start,
+        _binary_weights_bin_end - _binary_weights_bin_start);
+#  endif
 #else
-    // Prefetch weights (mmap + populate pages) in background while CUDA inits
+    // Prefetch in background while CUDA context inits.
     prefetch_thread = std::thread([&]() {
+#  ifdef PARAKETTO_FP8
+        if (fp8_path_for_init.empty()) {
+            prefetched = Weights::prefetch(fp16_path);  // need FP16 data for quantization
+        } else {
+            // Pre-populate FP8 file pages while CUDA init runs
+            int fd = open(fp8_path_for_init.c_str(), O_RDONLY);
+            if (fd >= 0) {
+                struct stat st; fstat(fd, &st);
+                fp8_prefetch_size = (size_t)st.st_size;
+                fp8_prefetch_ptr = mmap(nullptr, st.st_size, PROT_READ,
+                                        MAP_PRIVATE | MAP_POPULATE, fd, 0);
+                close(fd);
+                if (fp8_prefetch_ptr == MAP_FAILED) {
+                    fp8_prefetch_ptr = nullptr;
+                    fp8_prefetch_size = 0;
+                } else {
+                    madvise(fp8_prefetch_ptr, st.st_size, MADV_SEQUENTIAL);
+                }
+            }
+        }
+#  else
         prefetched = Weights::prefetch(weights_path);
+#  endif
     });
 #endif
 
@@ -209,8 +285,19 @@ int main(int argc, char** argv) {
     auto t_prefetch = clk::now();
 
     Pipeline pipeline;
+#ifdef PARAKETTO_FP8
+    pipeline.init(std::move(prefetched), fp8_path_for_init, weights_path,
+                  fp8_prefetch_ptr, fp8_prefetch_size);
+#else
     pipeline.init(std::move(prefetched));
+#endif
     auto t_init_done = clk::now();
+
+    // Clean up FP8 prefetch mapping (data is on GPU now)
+    if (fp8_prefetch_ptr) {
+        munmap(fp8_prefetch_ptr, fp8_prefetch_size);
+        fp8_prefetch_ptr = nullptr;
+    }
 
     if (server_mode) {
         // Warmup with 1s of silence

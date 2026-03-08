@@ -4,14 +4,15 @@
 
 # parakettő
 
-Speech-to-text inference for NVIDIA's [Parakeet TDT 0.6B V2](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2), written in C++ with custom CUDA kernels.
+Speech-to-text inference for NVIDIA's [Parakeet TDT 0.6B V2](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2), written in C++ with custom CUDA kernels. No frameworks, no Python at runtime.
 
 - Batch 1, 1250x+ real-time — fast on a single WAV
-- Custom CUDA/CUTLASS kernels — only libcudart.so
-- Optimized 1.8GB VRAM usage
-- Optimized startup time ~300ms cold / ~90ms hot
+- Custom CUDA/CUTLASS kernels — only `libcudart.so`
+- Optional FP8 quantization — half the weight size, faster startup
+- Optimized 1.8 GB VRAM usage
+- ~240ms warm startup (FP16), ~180ms (FP8)
 - Builtin HTTP server
-- Optional static build with zero runtime deps 
+- Optional static build with zero runtime files
 
 ```
 WAV (16kHz/24kHz mono) → mel spectrogram → conformer encoder → TDT greedy decoder → text
@@ -19,19 +20,46 @@ WAV (16kHz/24kHz mono) → mel spectrogram → conformer encoder → TDT greedy 
 
 ## Performance
 
-RTX 5070 Ti, batch size 1. Two GEMM backends: **CUTLASS** (zero dependencies beyond `libcudart.so`) and **cuBLAS** (~2% faster, requires `libcublas.so`). Everything else — FFT, mel filterbank, LayerNorm, convolutions, SiLU, GLU, LSTM, greedy decoding — runs on custom CUDA kernels in both.
+RTX 5070 Ti, batch size 1. Two FP16 GEMM backends: **CUTLASS** (zero dependencies beyond `libcudart.so`) and **cuBLAS** (requires `libcublas.so`). Plus an **FP8** backend using cublasLt E4M3 quantized weights. Everything else — FFT, mel filterbank, LayerNorm, convolutions, SiLU, GLU, LSTM, greedy decoding — runs on custom CUDA kernels in all backends.
 
 ```
                  CUTLASS (cudart only)          cuBLAS (+ libcublas)
               ────────────────────────────   ────────────────────────────
                RTFx    WER    Audio  Time     RTFx    WER    Audio  Time
-librispeech   1083x   1.68%   896s  827ms    1042x   1.68%   896s  860ms
-earnings22     982x  16.48%   253s  258ms     965x  16.48%   253s  262ms
-long          1313x   1.92%  5578s  4.25s    1277x   1.90%  5578s  4.37s
-difficult     1215x  23.41%   509s  419ms    1226x  23.32%   509s  415ms
+librispeech   1069x   1.68%   896s  838ms    1077x   1.68%   896s  832ms
+earnings22     979x  16.48%   253s  259ms    1000x  16.48%   253s  253ms
+long          1307x   1.90%  5578s  4.27s    1306x   1.90%  5578s  4.27s
+difficult     1205x  23.32%   509s  422ms    1261x  23.24%   509s  404ms
               ────────────────────────────   ────────────────────────────
-Total         1258x          7236s  5.75s    1226x          7236s  5.90s
+Total         1250x          7236s  5.79s    1256x          7236s  5.76s
 ```
+
+FP8 backend (requires Blackwell GPU):
+
+```
+                 FP8 (cublasLt E4M3)
+              ────────────────────────────
+               RTFx    WER    Audio  Time
+librispeech   1152x   2.03%   896s  778ms
+earnings22    1015x  15.76%   253s  249ms
+long          1360x   2.20%  5578s  4.10s
+difficult     1269x  19.38%   509s  401ms
+              ────────────────────────────
+Total         1309x          7236s  5.53s
+```
+
+### Startup time
+
+Time from process start to first inference, measured with `tests/bench_startup.py`:
+
+```
+                startup (cold / warm)
+CUTLASS:       600ms / 240ms      weights.bin (1.2 GB)
+cuBLAS:        620ms / 240ms      weights.bin (1.2 GB)
+FP8:           325ms / 180ms      weights_fp8.bin (604 MB)
+```
+
+Cold = weight files not in OS page cache. Warm = cached.
 
 ### Test machine
 
@@ -44,20 +72,41 @@ Total         1258x          7236s  5.75s    1226x          7236s  5.90s
 └───────────┴────────────────────────────────────────────────────────────────┘
 ```
 
-## Quick start
+## Backends
 
-```bash
-uv sync                          # install Python deps (weight export only)
-make weights                     # export model weights to weights.bin (~1.2GB)
-make paraketto.cuda              # CUTLASS backend (cudart only)
-make paraketto.cublas            # cuBLAS backend (slightly faster)
-./paraketto.cuda audio.wav       # transcribe
-```
+Three CUDA backends, same driver and weight loader:
+
+| Binary | GEMM backend | Weights | Notes |
+|--------|-------------|---------|-------|
+| `paraketto.cuda` | CUTLASS FP16 (custom-tuned) | `weights.bin` (1.2 GB) | default, no cuBLAS dep |
+| `paraketto.cublas` | cuBLAS/cublasLt FP16 | `weights.bin` (1.2 GB) | |
+| `paraketto.fp8` | cublasLt FP8 E4M3 | `weights_fp8.bin` (604 MB) | Blackwell only |
+
+## Quick start
 
 ### Prerequisites
 
 - Linux, NVIDIA GPU (Ampere or newer), CUDA toolkit 12+
-- Python 3.10+, [uv](https://docs.astral.sh/uv/) (for weight export + benchmarks only — not needed at runtime)
+- Python 3.10+ with [uv](https://docs.astral.sh/uv/) (for weight export and benchmarks only — not needed at runtime)
+
+### Build & run
+
+```bash
+uv sync                          # install Python deps (weight export only)
+make weights                     # download or export weights.bin (~1.2GB)
+make paraketto.cuda              # CUTLASS backend (cudart only)
+make paraketto.cublas            # cuBLAS backend
+./paraketto.cuda audio.wav       # transcribe
+```
+
+### FP8 backend (Blackwell)
+
+```bash
+make paraketto.fp8               # build FP8 binary
+./paraketto.fp8 audio.wav        # first run quantizes weights.bin → weights_fp8.bin
+```
+
+On first run without `weights_fp8.bin`, `paraketto.fp8` generates it from `weights.bin` and saves for future runs. Subsequent runs only load `weights_fp8.bin` (604 MB) — no `weights.bin` needed.
 
 ## Usage
 
@@ -75,7 +124,9 @@ make paraketto.cublas            # cuBLAS backend (slightly faster)
 ./paraketto.cuda --server 127.0.0.1:5001     # bind to localhost
 ```
 
-### HTTP API
+All backends support the same server mode.
+
+## HTTP API
 
 - `GET /health` — returns `{"status":"ok"}`
 - `POST /transcribe` — multipart `file` upload, returns `{"text":"...","audio_duration_s":...,"inference_time_s":...}`
@@ -85,11 +136,86 @@ curl localhost:8080/health
 curl -F file=@audio.wav localhost:8080/transcribe
 ```
 
-### Benchmarks
+## Benchmarks
 
 ```bash
 make bench-cuda    # WER + RTFx (CUTLASS backend)
 make bench-cublas  # WER + RTFx (cuBLAS backend)
+make bench-fp8     # WER + RTFx (FP8 backend)
+make bench-all     # all backends
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Python  ·  ONNX Runtime + TRT EP
+
+Loading model...
+Model loaded in 2.3s
+
+┌─────────────┬──────────┬─────────┬────────┬─────────┬──────────┐
+│ Dataset     │      WER │    RTFx │   Utts │   Audio │     Time │
+├─────────────┼──────────┼─────────┼────────┼─────────┼──────────┤
+│ librispeech │    1.68% │    694x │    100 │    896s │    1.29s │
+│ earnings22  │   16.48% │    583x │     40 │    253s │    434ms │
+│ long        │    2.00% │    879x │     50 │   5578s │    6.35s │
+│ difficult   │   23.32% │    801x │     50 │    509s │    635ms │
+├─────────────┼──────────┼─────────┼────────┼─────────┼──────────┤
+│ Total       │          │    831x │    240 │   7236s │    8.71s │
+└─────────────┴──────────┴─────────┴────────┴─────────┴──────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  C++ TRT ·  paraketto.cpp + TensorRT
+
+┌─────────────┬──────────┬─────────┬────────┬─────────┬──────────┐
+│ Dataset     │      WER │    RTFx │   Utts │   Audio │     Time │
+├─────────────┼──────────┼─────────┼────────┼─────────┼──────────┤
+│ librispeech │    1.68% │    946x │    100 │    896s │    947ms │
+│ earnings22  │   16.48% │    836x │     40 │    253s │    303ms │
+│ long        │    1.94% │   1192x │     50 │   5578s │    4.68s │
+│ difficult   │   23.41% │   1079x │     50 │    509s │    472ms │
+├─────────────┼──────────┼─────────┼────────┼─────────┼──────────┤
+│ Total       │          │   1131x │    240 │   7236s │    6.40s │
+└─────────────┴──────────┴─────────┴────────┴─────────┴──────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  C++ CUDA · paraketto_cuda.cpp + CUTLASS FP16
+
+┌─────────────┬──────────┬─────────┬────────┬─────────┬──────────┐
+│ Dataset     │      WER │    RTFx │   Utts │   Audio │     Time │
+├─────────────┼──────────┼─────────┼────────┼─────────┼──────────┤
+│ librispeech │    1.68% │   1069x │    100 │    896s │    838ms │
+│ earnings22  │   16.48% │    979x │     40 │    253s │    259ms │
+│ long        │    1.90% │   1307x │     50 │   5578s │    4.27s │
+│ difficult   │   23.32% │   1205x │     50 │    509s │    422ms │
+├─────────────┼──────────┼─────────┼────────┼─────────┼──────────┤
+│ Total       │          │   1250x │    240 │   7236s │    5.79s │
+└─────────────┴──────────┴─────────┴────────┴─────────┴──────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  C++ cuBLAS · paraketto_cuda.cpp + cuBLAS FP16
+
+┌─────────────┬──────────┬─────────┬────────┬─────────┬──────────┐
+│ Dataset     │      WER │    RTFx │   Utts │   Audio │     Time │
+├─────────────┼──────────┼─────────┼────────┼─────────┼──────────┤
+│ librispeech │    1.68% │   1077x │    100 │    896s │    832ms │
+│ earnings22  │   16.48% │   1000x │     40 │    253s │    253ms │
+│ long        │    1.90% │   1306x │     50 │   5578s │    4.27s │
+│ difficult   │   23.24% │   1261x │     50 │    509s │    404ms │
+├─────────────┼──────────┼─────────┼────────┼─────────┼──────────┤
+│ Total       │          │   1256x │    240 │   7236s │    5.76s │
+└─────────────┴──────────┴─────────┴────────┴─────────┴──────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  C++ FP8  · paraketto_cuda.cpp + cublasLt FP8
+
+┌─────────────┬──────────┬─────────┬────────┬─────────┬──────────┐
+│ Dataset     │      WER │    RTFx │   Utts │   Audio │     Time │
+├─────────────┼──────────┼─────────┼────────┼─────────┼──────────┤
+│ librispeech │    2.03% │   1152x │    100 │    896s │    778ms │
+│ earnings22  │   15.76% │   1015x │     40 │    253s │    249ms │
+│ long        │    2.20% │   1360x │     50 │   5578s │    4.10s │
+│ difficult   │   19.38% │   1269x │     50 │    509s │    401ms │
+├─────────────┼──────────┼─────────┼────────┼─────────┼──────────┤
+│ Total       │          │   1309x │    240 │   7236s │    5.53s │
+└─────────────┴──────────┴─────────┴────────┴─────────┴──────────┘
 ```
 
 ## TensorRT backend (reference)
@@ -103,18 +229,32 @@ make paraketto                   # compile the TRT binary
 make bench-cpp                   # benchmark
 ```
 
+## Static binary (no runtime files)
+
+```bash
+make paraketto.static      # embeds weights.bin, CUTLASS FP16
+make paraketto.fp8.static  # embeds weights_fp8.bin, FP8
+```
+
+Requires only the NVIDIA driver + shared CUDA/cuBLAS libraries. No weights files at runtime.
+
 ## Project structure
 
 ```
-src/paraketto_cuda.cpp   # main: WAV loading, mel, server, greedy decode loop
-src/conformer.cpp        # conformer encoder + joint network
-src/gemm.h               # unified GEMM interface (backend-agnostic)
-src/cutlass_gemm.cu      # CUTLASS FP16 GEMM backend (no cuBLAS dep)
-src/cublas_gemm.cu       # cuBLAS/cublasLt GEMM backend
-src/kernels.cu           # custom CUDA kernels (FFT, LayerNorm, SiLU, GLU, conv, LSTM, ...)
-src/mel.h                # custom 512-point FFT + mel filterbank
-src/paraketto.cpp        # TensorRT backend (reference)
-scripts/export_weights.py  # NeMo → weights.bin converter
+src/paraketto_cuda.cpp    # CUDA backend main (mel, server, greedy decode)
+src/conformer.cpp         # FP16 CudaModel (CUTLASS or cuBLAS via gemm.h)
+src/conformer_fp8.cpp     # FP8 CudaModel (cublasLt E4M3, per-tensor scaling)
+src/conformer_fp8.h       # FP8 CudaModel header (adds fp8_pool, scales, handles)
+src/weights.cpp           # Weight loading (shared by all backends)
+src/gemm.h                # Unified GEMM interface (backend selected at link time)
+src/cutlass_gemm.cu       # CUTLASS FP16 backend
+src/cublas_gemm.cu        # cuBLAS FP16 backend
+src/kernels.cu            # Custom kernels: FFT, LayerNorm, SiLU, GLU, conv, LSTM, ...
+src/kernels_fp8.cu        # FP8 kernels: absmax quantize, static quantize, transpose
+src/mel.h                 # Custom 512-point FFT + mel filterbank
+src/paraketto.cpp         # TensorRT backend (reference)
+scripts/export_weights.py # NeMo → weights.bin converter
+scripts/build_engines.py  # ONNX → TRT engine builder
 ```
 
 ## References
