@@ -87,26 +87,24 @@ Three CUDA backends, same driver and weight loader:
 ### Prerequisites
 
 - Linux, NVIDIA GPU (Ampere or newer), CUDA toolkit 12+
-- Python 3.10+ with [uv](https://docs.astral.sh/uv/) (for weight export and benchmarks only — not needed at runtime)
+- `wget` (for auto-downloading weights)
+- Python 3.10+ with [uv](https://docs.astral.sh/uv/) (for benchmarks only — not needed at runtime)
 
 ### Build & run
 
 ```bash
-uv sync                          # install Python deps (weight export only)
-make weights                     # download or export weights.bin (~1.2GB)
 make paraketto.cuda              # CUTLASS backend (cudart only)
-make paraketto.cublas            # cuBLAS backend
-./paraketto.cuda audio.wav       # transcribe
+./paraketto.cuda audio.wav       # auto-downloads weights on first run (~1.2 GB)
 ```
+
+Weights are downloaded from [HuggingFace](https://huggingface.co/localoptima/paraketto) to `~/.cache/paraketto/` on first run. Use `--weights FILE` to override with a local file.
 
 ### FP8 backend (Blackwell)
 
 ```bash
 make paraketto.fp8               # build FP8 binary
-./paraketto.fp8 audio.wav        # first run quantizes weights.bin → weights_fp8.bin
+./paraketto.fp8 audio.wav        # auto-downloads weights_fp8.bin (~604 MB)
 ```
-
-On first run without `weights_fp8.bin`, `paraketto.fp8` generates it from `weights.bin` and saves for future runs. Subsequent runs only load `weights_fp8.bin` (604 MB) — no `weights.bin` needed.
 
 ## Usage
 

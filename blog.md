@@ -1551,3 +1551,9 @@ A surprising and reproducible result: FP8 gets **better** WER than FP16 on the d
 The pattern is consistent with quantization noise acting as **regularization**: on clean, in-distribution speech where the model is well-calibrated, the noise slightly hurts. On accented/noisy speech where the model may overfit to training-distribution patterns, the noise breaks spurious correlations and improves generalization. The effect is localized to the encoder (the decoder stays FP16 since cublasLt FP8 doesn't support N=1 GEMMs).
 
 The **recommended binary for production use** is `paraketto.fp8` with pre-generated `weights_fp8.bin`.
+
+## Distribution: Auto-download from HuggingFace
+
+Weights were previously fetched via `gh release download`, which required GitHub CLI authentication and only worked from the project root. Replaced with auto-download from [HuggingFace](https://huggingface.co/localoptima/paraketto) using `wget` — no auth needed for public repos.
+
+Weights now default to `~/.cache/paraketto/` (XDG standard), so the binary works from any directory. On first run, missing weights are downloaded automatically; `--weights` skips the download for local development. The Makefile and Python benchmark harness also pull from HF instead of `gh`.

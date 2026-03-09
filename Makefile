@@ -4,37 +4,51 @@ CXX      = g++
 NVCC     = $(CUDA_HOME)/bin/nvcc
 NVFLAGS  = -std=c++17 -O3 -I$(CUDA_HOME)/include -Isrc --expt-relaxed-constexpr
 
+HF_BASE     = https://huggingface.co/localoptima/paraketto/resolve/main
+WEIGHTS_DIR = $(or $(XDG_CACHE_HOME),$(HOME)/.cache)/paraketto
+WEIGHTS     = $(WEIGHTS_DIR)/weights.bin
+WEIGHTS_FP8 = $(WEIGHTS_DIR)/weights_fp8.bin
+
 .PHONY: bench-all bench-cuda bench-cublas bench-fp8 weights weights-fp8 download-data download-weights check-weights clean
 
 # Verify weights.bin is the expected format (PRKT v2)
-check-weights: weights.bin
-	@v=$$(od -An -td4 -N4 -j4 weights.bin | tr -d ' '); \
+check-weights: $(WEIGHTS)
+	@v=$$(od -An -td4 -N4 -j4 $(WEIGHTS) | tr -d ' '); \
 	if [ "$$v" != "2" ]; then \
 		echo "ERROR: weights.bin is version $$v, expected 2. Run: uv run python scripts/repack_weights.py"; \
 		exit 1; \
 	fi
 
-# Download benchmark data from GitHub release
+# Download benchmark data from HuggingFace
 data/librispeech/manifest.json:
 	@echo "Downloading benchmark data..."
-	@gh release download bench-data --pattern 'bench-data.tar.gz' && \
+	@wget -q --show-progress -O bench-data.tar.gz $(HF_BASE)/bench-data.tar.gz && \
 		tar xzf bench-data.tar.gz && \
 		rm bench-data.tar.gz && \
 		echo "Downloaded $$(find data/ -name '*.wav' | wc -l) wav files"
 
 download-data: data/librispeech/manifest.json
 
-# Download pre-exported weights from GitHub release
-weights.bin:
-	@echo "Downloading weights..."
-	@gh release download bench-data --pattern 'weights.bin'
-	@echo "Downloaded weights.bin ($$(du -h weights.bin | cut -f1))"
+# Download weights from HuggingFace
+$(WEIGHTS):
+	@mkdir -p $(WEIGHTS_DIR)
+	@echo "Downloading weights.bin..."
+	@wget -q --show-progress -O $@ $(HF_BASE)/weights.bin
+	@echo "Downloaded $@ ($$(du -h $@ | cut -f1))"
 
-download-weights: weights.bin
+$(WEIGHTS_FP8):
+	@mkdir -p $(WEIGHTS_DIR)
+	@echo "Downloading weights_fp8.bin..."
+	@wget -q --show-progress -O $@ $(HF_BASE)/weights_fp8.bin
+	@echo "Downloaded $@ ($$(du -h $@ | cut -f1))"
+
+download-weights: $(WEIGHTS)
+weights: $(WEIGHTS)
+weights-fp8: $(WEIGHTS_FP8)
 
 BENCH_SEP = @printf '\n%s\n%s\n%s\n' '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━' '  $(1)'
 
-bench-all: paraketto.cuda paraketto.cublas paraketto.fp8 data/librispeech/manifest.json check-weights
+bench-all: paraketto.cuda paraketto.cublas paraketto.fp8 data/librispeech/manifest.json $(WEIGHTS) check-weights
 	$(call BENCH_SEP,C++ CUDA · paraketto_cuda.cpp + CUTLASS FP16)
 	@uv run python tests/bench_native.py paraketto.cuda
 	$(call BENCH_SEP,C++ cuBLAS · paraketto_cuda.cpp + cuBLAS FP16)
@@ -42,16 +56,14 @@ bench-all: paraketto.cuda paraketto.cublas paraketto.fp8 data/librispeech/manife
 	$(call BENCH_SEP,C++ FP8  · paraketto_cuda.cpp + cublasLt FP8)
 	@uv run python tests/bench_native.py paraketto.fp8
 
-bench-cuda: paraketto.cuda data/librispeech/manifest.json check-weights
+bench-cuda: paraketto.cuda data/librispeech/manifest.json $(WEIGHTS) check-weights
 	uv run python tests/bench_native.py paraketto.cuda
 
-bench-cublas: paraketto.cublas data/librispeech/manifest.json check-weights
+bench-cublas: paraketto.cublas data/librispeech/manifest.json $(WEIGHTS) check-weights
 	uv run python tests/bench_native.py paraketto.cublas
 
-bench-fp8: paraketto.fp8 data/librispeech/manifest.json weights_fp8.bin
+bench-fp8: paraketto.fp8 data/librispeech/manifest.json $(WEIGHTS_FP8)
 	uv run python tests/bench_native.py paraketto.fp8
-
-weights: weights.bin
 
 # Re-generate weights from ONNX (only needed if export script changes)
 weights-export: scripts/export_weights.py
@@ -96,26 +108,19 @@ src/conformer_fp8.o: src/conformer_fp8.cpp src/conformer_fp8.h src/conformer.h s
 paraketto.fp8: src/paraketto_cuda.cpp src/conformer_fp8.h src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o $(SHARED_HEADERS)
 	$(CXX) $(CUDA_CXXFLAGS) -include src/conformer_fp8.h src/paraketto_cuda.cpp src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o $(CUDA_LDFLAGS) -lcublas -lcublasLt -o $@
 
-# Generate FP8 weight cache (quantized from weights.bin, auto-saved by paraketto.fp8 on first run)
-weights_fp8.bin: paraketto.fp8 weights.bin
-	@echo "Generating FP8 weight cache (quantizing weights.bin → weights_fp8.bin)..."
-	@rm -f weights_fp8.bin
-	@./paraketto.fp8 --weights weights.bin /dev/null 2>&1 | grep -E "saved|loaded|FP8" || true
-	@test -f weights_fp8.bin || (echo "ERROR: weights_fp8.bin not created" && exit 1)
-
-weights-fp8: weights_fp8.bin
+# (weights_fp8.bin generation removed — paraketto.fp8 auto-downloads from HF)
 
 # Convert existing weight files to current format (run once after updating)
-repack: weights.bin
+repack: $(WEIGHTS)
 	uv run python scripts/repack_weights.py
 
 # Static build with embedded weights (single file, only needs NVIDIA driver)
-weights_embedded.o: weights.bin
+weights_embedded.o: $(WEIGHTS)
 	objcopy -I binary -O elf64-x86-64 -B i386:x86-64 \
 		--rename-section .data=.rodata,alloc,load,readonly,data,contents \
 		$< $@
 
-weights_fp8_embedded.o: weights_fp8.bin
+weights_fp8_embedded.o: $(WEIGHTS_FP8)
 	objcopy -I binary -O elf64-x86-64 -B i386:x86-64 \
 		--rename-section .data=.rodata,alloc,load,readonly,data,contents \
 		$< $@

@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <thread>
 #include <vector>
@@ -17,6 +18,35 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include "conformer.h"
+
+// ---------------------------------------------------------------------------
+// Auto-download helpers
+// ---------------------------------------------------------------------------
+
+static std::string cache_dir() {
+    const char* xdg = getenv("XDG_CACHE_HOME");
+    if (xdg && xdg[0]) return std::string(xdg) + "/paraketto";
+    const char* home = getenv("HOME");
+    if (home && home[0]) return std::string(home) + "/.cache/paraketto";
+    return ".";
+}
+
+static void ensure_file(const std::string& path, const char* url) {
+    if (access(path.c_str(), F_OK) == 0) return;
+    std::string dir = path.substr(0, path.rfind('/'));
+    if (!dir.empty()) {
+        std::string cmd = "mkdir -p '" + dir + "'";
+        if (system(cmd.c_str()) != 0) {}  // best-effort
+    }
+    fprintf(stderr, "Downloading %s...\n", path.c_str());
+    std::string cmd = "wget -q --show-progress -O '" + path + "' '" + std::string(url) + "'";
+    int ret = system(cmd.c_str());
+    if (ret != 0) {
+        unlink(path.c_str());
+        fprintf(stderr, "Download failed. Get weights from https://huggingface.co/localoptima/paraketto\n");
+        exit(1);
+    }
+}
 
 #include "common.h"
 #include "wav.h"
@@ -160,9 +190,10 @@ int main(int argc, char** argv) {
             "\n"
             "Speech-to-text using Paraketto (CUDA/cuBLAS backend).\n"
             "Accepts one or more 16kHz or 24kHz mono WAV files (int16 or float32).\n"
+            "Weights are auto-downloaded from HuggingFace on first run.\n"
             "\n"
             "Options:\n"
-            "  --weights FILE             Model weights [default: weights.bin]\n"
+            "  --weights FILE             Model weights [default: ~/.cache/paraketto/]\n"
             "  --server [[host]:port]     Start HTTP server [default: 0.0.0.0:8080]\n"
             "  -h, --help                 Show this help\n",
             argv[0]);
@@ -170,11 +201,13 @@ int main(int argc, char** argv) {
 
     if (argc < 2) { usage(); return 1; }
 
+    std::string dir = cache_dir();
+    bool custom_weights = false;
 #ifdef PARAKETTO_FP8
-    std::string weights_path = "weights_fp8.bin";  // FP8 binary uses fp8 weights by default
-    std::string fp16_path    = "weights.bin";       // FP16 source for first-run quantization
+    std::string weights_path = dir + "/weights_fp8.bin";
+    std::string fp16_path    = dir + "/weights.bin";
 #else
-    std::string weights_path = "weights.bin";
+    std::string weights_path = dir + "/weights.bin";
 #endif
     std::vector<std::string> wav_files;
     bool server_mode = false;
@@ -186,6 +219,7 @@ int main(int argc, char** argv) {
         if (arg == "--help" || arg == "-h") { usage(); return 0; }
         if (arg == "--weights" && i + 1 < argc) {
             weights_path = argv[++i];
+            custom_weights = true;
         } else if (arg == "--server") {
             server_mode = true;
             if (i + 1 < argc && argv[i + 1][0] != '-') {
@@ -209,6 +243,17 @@ int main(int argc, char** argv) {
     using clk = std::chrono::high_resolution_clock;
     auto t_main_start = clk::now();
 
+#ifndef EMBEDDED_WEIGHTS
+    if (!custom_weights) {
+#  ifdef PARAKETTO_FP8
+        ensure_file(weights_path, "https://huggingface.co/localoptima/paraketto/resolve/main/weights_fp8.bin");
+        // FP16 weights needed only for first-run quantization (if fp8 file is missing/invalid)
+#  else
+        ensure_file(weights_path, "https://huggingface.co/localoptima/paraketto/resolve/main/weights.bin");
+#  endif
+    }
+#endif
+
     Weights prefetched;
     std::thread prefetch_thread;
 
@@ -231,6 +276,10 @@ int main(int argc, char** argv) {
                     fp8_path_for_init = weights_path;
             }
             close(fd);
+        }
+        // FP8 file missing or invalid — need FP16 weights for quantization
+        if (fp8_path_for_init.empty() && !custom_weights) {
+            ensure_file(fp16_path, "https://huggingface.co/localoptima/paraketto/resolve/main/weights.bin");
         }
     }
 #endif

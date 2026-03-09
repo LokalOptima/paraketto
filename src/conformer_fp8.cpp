@@ -323,6 +323,17 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames,
             save16(weights.dec_proj_b,    D_JOINT);
             save16(weights.out_proj_b,    D_OUTPUT);
 
+            // Create parent directory (path may be in ~/.cache/paraketto/)
+            {
+                std::string dir(path);
+                auto slash = dir.rfind('/');
+                if (slash != std::string::npos) {
+                    dir.resize(slash);
+                    std::string cmd = "mkdir -p '" + dir + "'";
+                    system(cmd.c_str());
+                }
+            }
+
             FILE* f = fopen(path, "wb");
             if (!f) { fprintf(stderr, "  warning: cannot write %s\n", path); return; }
 

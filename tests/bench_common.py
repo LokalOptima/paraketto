@@ -14,6 +14,8 @@ from jiwer import wer
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
 
+HF_BASE = "https://huggingface.co/localoptima/paraketto/resolve/main"
+
 DATASETS = ["librispeech", "earnings22", "long", "difficult"]
 
 normalize = Compose([ToLowerCase(), RemovePunctuation(), ReduceToListOfListOfWords()])
@@ -76,12 +78,36 @@ def print_results(rows: list[dict]) -> None:
     print(sep("└", "┴", "┘"))
 
 
+def ensure_bench_data() -> None:
+    """Download benchmark data from HuggingFace if not present."""
+    manifest = DATA_DIR / "librispeech" / "manifest.json"
+    if manifest.exists():
+        return
+    print("Downloading benchmark data...", file=sys.stderr)
+    tarball = ROOT / "bench-data.tar.gz"
+    ret = subprocess.run(
+        ["wget", "-q", "--show-progress", "-O", str(tarball),
+         f"{HF_BASE}/bench-data.tar.gz"],
+        cwd=str(ROOT),
+    )
+    if ret.returncode != 0:
+        print(f"Download failed. Get bench data from {HF_BASE}/bench-data.tar.gz",
+              file=sys.stderr)
+        sys.exit(1)
+    subprocess.run(["tar", "xzf", str(tarball)], cwd=str(ROOT), check=True)
+    tarball.unlink()
+    n_wavs = len(list(DATA_DIR.rglob("*.wav")))
+    print(f"Downloaded {n_wavs} wav files", file=sys.stderr)
+
+
 def bench_server(binary: Path, binary_name: str, port: int = 18080) -> None:
     """Start a server binary, run benchmarks, and print results."""
     if not binary.exists():
         print(f"Binary not found: {binary}", file=sys.stderr)
         print(f"Run 'make {binary_name}' first.", file=sys.stderr)
         sys.exit(1)
+
+    ensure_bench_data()
 
     server_url = f"http://localhost:{port}"
 
