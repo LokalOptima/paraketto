@@ -9,7 +9,48 @@ WEIGHTS_DIR = $(or $(XDG_CACHE_HOME),$(HOME)/.cache)/paraketto
 WEIGHTS     = $(WEIGHTS_DIR)/paraketto-fp16.bin
 WEIGHTS_FP8 = $(WEIGHTS_DIR)/paraketto-fp8.bin
 
-.PHONY: bench-all bench-cuda bench-cublas bench-fp8 weights weights-fp8 download-data download-weights check-weights clean
+.PHONY: bench-all bench-cuda bench-cublas bench-fp8 bench-corrector weights weights-fp8 download-data download-weights check-weights clean llama-libs
+
+# ---------------------------------------------------------------------------
+# LLM corrector (opt-in via WITH_CORRECTOR=1)
+# ---------------------------------------------------------------------------
+# Builds llama.cpp from the vendored submodule as static libraries, then links
+# them into paraketto. Only the CUDA backend is built; everything else is off.
+
+LLAMA_SRC    = vendor/llama.cpp
+LLAMA_BUILD  = $(LLAMA_SRC)/build
+LLAMA_LIBDIR = $(LLAMA_BUILD)/src $(LLAMA_BUILD)/ggml/src $(LLAMA_BUILD)/ggml/src/ggml-cuda $(LLAMA_BUILD)/ggml/src/ggml-cpu
+LLAMA_INC    = -I$(LLAMA_SRC)/include -I$(LLAMA_SRC)/ggml/include
+LLAMA_STAMP  = $(LLAMA_BUILD)/.stamp
+
+# Static lib build (one-time, cached)
+$(LLAMA_STAMP):
+	cmake -B $(LLAMA_BUILD) $(LLAMA_SRC) \
+		-DBUILD_SHARED_LIBS=OFF \
+		-DGGML_CUDA=ON -DCUDA_ARCHITECTURES=120 \
+		-DGGML_VULKAN=OFF -DGGML_METAL=OFF -DGGML_RPC=OFF \
+		-DGGML_BLAS=OFF -DGGML_LLAMAFILE=OFF -DGGML_OPENMP=ON \
+		-DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=OFF \
+		-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF \
+		-DLLAMA_BUILD_COMMON=OFF \
+		-DCMAKE_C_FLAGS="-ffunction-sections -fdata-sections" \
+		-DCMAKE_CXX_FLAGS="-ffunction-sections -fdata-sections" \
+		-DCMAKE_CUDA_FLAGS="-Xcompiler -ffunction-sections -Xcompiler -fdata-sections"
+	cmake --build $(LLAMA_BUILD) --target llama --parallel
+	touch $@
+
+llama-libs: $(LLAMA_STAMP)
+
+ifdef WITH_CORRECTOR
+  CORRECTOR_OBJ     = src/corrector.o
+  CORRECTOR_CFLAGS  = -DWITH_CORRECTOR $(LLAMA_INC)
+  CORRECTOR_LDFLAGS = $(foreach d,$(LLAMA_LIBDIR),-L$(d)) \
+                      -Wl,--whole-archive -lggml-cuda -Wl,--no-whole-archive \
+                      -lllama -lggml -lggml-base -lggml-cpu \
+                      -lcudart -lcublas -lcublasLt -lcuda -lgomp \
+                      -Wl,--gc-sections
+  CORRECTOR_DEP     = $(LLAMA_STAMP)
+endif
 
 # Verify paraketto-fp16.bin is the expected format (PRKT v2)
 check-weights: $(WEIGHTS)
@@ -65,6 +106,9 @@ bench-cublas: paraketto.cublas data/librispeech/manifest.json $(WEIGHTS) check-w
 bench-fp8: paraketto.fp8 data/librispeech/manifest.json $(WEIGHTS_FP8)
 	uv run python tests/bench_native.py paraketto.fp8
 
+bench-corrector: paraketto.fp8 data/librispeech/manifest.json $(WEIGHTS_FP8)
+	uv run python tests/bench_corrector.py paraketto.fp8
+
 # Re-generate weights from ONNX (only needed if export script changes)
 weights-export: scripts/export_weights.py
 	uv run python scripts/export_weights.py
@@ -82,21 +126,26 @@ CUTLASS_INC   = -Ithird_party/cutlass/include -Ithird_party/cutlass/tools/util/i
 src/weights.o: src/weights.cpp src/conformer.h src/common.h
 	$(CXX) $(CUDA_CXXFLAGS) -I$(CUDA_HOME)/include -c $< -o $@
 
+ifdef WITH_CORRECTOR
+src/corrector.o: src/corrector.cpp src/corrector.h $(CORRECTOR_DEP)
+	$(CXX) $(CUDA_CXXFLAGS) $(CORRECTOR_CFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+endif
+
 CONFORMER_DEPS = src/paraketto_cuda.cpp src/conformer.cpp src/conformer.h src/kernels.h src/gemm.h $(SHARED_HEADERS)
 
 # CUTLASS GEMM backend (default — no cuBLAS dependency, cudart only)
 src/cutlass_gemm.o: src/cutlass_gemm.cu src/cutlass_gemm.h src/gemm.h src/kernels.h
 	$(NVCC) $(NVFLAGS) -arch=sm_120 $(CUTLASS_INC) -c $< -o $@
 
-paraketto.cuda: $(CONFORMER_DEPS) src/weights.o src/kernels.o src/cutlass_gemm.o src/cutlass_gemm.h
-	$(CXX) $(CUDA_CXXFLAGS) src/paraketto_cuda.cpp src/conformer.cpp src/weights.o src/kernels.o src/cutlass_gemm.o $(CUDA_LDFLAGS) -o $@
+paraketto.cuda: $(CONFORMER_DEPS) src/weights.o src/kernels.o src/cutlass_gemm.o src/cutlass_gemm.h $(CORRECTOR_OBJ)
+	$(CXX) $(CUDA_CXXFLAGS) $(CORRECTOR_CFLAGS) src/paraketto_cuda.cpp src/conformer.cpp src/weights.o src/kernels.o src/cutlass_gemm.o $(CORRECTOR_OBJ) $(CUDA_LDFLAGS) $(CORRECTOR_LDFLAGS) -o $@
 
 # cuBLAS GEMM backend (faster on some shapes, requires libcublas)
 src/cublas_gemm.o: src/cublas_gemm.cu src/gemm.h src/kernels.h
 	$(NVCC) $(NVFLAGS) -arch=sm_120 -c $< -o $@
 
-paraketto.cublas: $(CONFORMER_DEPS) src/weights.o src/kernels.o src/cublas_gemm.o
-	$(CXX) $(CUDA_CXXFLAGS) src/paraketto_cuda.cpp src/conformer.cpp src/weights.o src/kernels.o src/cublas_gemm.o $(CUDA_LDFLAGS) -lcublas -lcublasLt -o $@
+paraketto.cublas: $(CONFORMER_DEPS) src/weights.o src/kernels.o src/cublas_gemm.o $(CORRECTOR_OBJ)
+	$(CXX) $(CUDA_CXXFLAGS) $(CORRECTOR_CFLAGS) src/paraketto_cuda.cpp src/conformer.cpp src/weights.o src/kernels.o src/cublas_gemm.o $(CORRECTOR_OBJ) $(CUDA_LDFLAGS) -lcublas -lcublasLt $(CORRECTOR_LDFLAGS) -o $@
 
 # FP8 cublasLt backend
 src/kernels_fp8.o: src/kernels_fp8.cu src/kernels_fp8.h
@@ -105,8 +154,8 @@ src/kernels_fp8.o: src/kernels_fp8.cu src/kernels_fp8.h
 src/conformer_fp8.o: src/conformer_fp8.cpp src/conformer_fp8.h src/conformer.h src/kernels.h src/kernels_fp8.h
 	$(CXX) $(CUDA_CXXFLAGS) -I$(CUDA_HOME)/include -c $< -o $@
 
-paraketto.fp8: src/paraketto_cuda.cpp src/conformer_fp8.h src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o $(SHARED_HEADERS)
-	$(CXX) $(CUDA_CXXFLAGS) -include src/conformer_fp8.h src/paraketto_cuda.cpp src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o $(CUDA_LDFLAGS) -lcublas -lcublasLt -o $@
+paraketto.fp8: src/paraketto_cuda.cpp src/conformer_fp8.h src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o $(SHARED_HEADERS) $(CORRECTOR_OBJ)
+	$(CXX) $(CUDA_CXXFLAGS) $(CORRECTOR_CFLAGS) -include src/conformer_fp8.h src/paraketto_cuda.cpp src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o $(CORRECTOR_OBJ) $(CUDA_LDFLAGS) -lcublas -lcublasLt $(CORRECTOR_LDFLAGS) -o $@
 
 # (paraketto-fp8.bin generation removed — paraketto.fp8 auto-downloads from HF)
 
@@ -155,4 +204,4 @@ bench_ff2: tests/bench_ff2.cu
 	$(NVCC) $(NVFLAGS) -arch=sm_120 $(CUTLASS_INC) tests/bench_ff2.cu -lcublas -lcublasLt -o $@
 
 clean:
-	rm -f paraketto.cuda paraketto.cublas paraketto.fp8 paraketto.static paraketto.fp8.static src/kernels.o src/kernels_fp8.o src/cutlass_gemm.o src/cublas_gemm.o src/weights.o src/conformer_fp8.o weights_embedded.o weights_fp8_embedded.o
+	rm -f paraketto.cuda paraketto.cublas paraketto.fp8 paraketto.static paraketto.fp8.static src/kernels.o src/kernels_fp8.o src/cutlass_gemm.o src/cublas_gemm.o src/weights.o src/conformer_fp8.o src/corrector.o weights_embedded.o weights_fp8_embedded.o

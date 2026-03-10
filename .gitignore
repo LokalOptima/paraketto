@@ -43,6 +43,9 @@ paraketto.fp8
 # CUTLASS headers (clone from https://github.com/NVIDIA/cutlass)
 third_party/cutlass/
 
+# llama.cpp build artifacts (submodule source is tracked, build is not)
+vendor/llama.cpp/build/
+
 # Model weights (generated or quantized)
 paraketto-fp16.bin
 paraketto-fp8.bin

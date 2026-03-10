@@ -1557,3 +1557,89 @@ The **recommended binary for production use** is `paraketto.fp8` with pre-genera
 Weights were previously fetched via `gh release download`, which required GitHub CLI authentication and only worked from the project root. Replaced with auto-download from [HuggingFace](https://huggingface.co/localoptima/paraketto) using `wget` — no auth needed for public repos.
 
 Weights now default to `~/.cache/paraketto/` (XDG standard), so the binary works from any directory. On first run, missing weights are downloaded automatically; `--weights` skips the download for local development. The Makefile and Python benchmark harness also pull from HF instead of `gh`.
+
+## WER Normalization: We Were Measuring Wrong
+
+Our WER computation used a naive `ToLowerCase() + RemovePunctuation()` pipeline from jiwer. This penalized perfectly correct transcriptions that simply used a different number format — "2012" vs "two thousand and twelve" counts as 4 word errors (one substitution + three insertions). Similarly, "98%" vs "ninety eight percent" is 3 errors, and "I am" vs "I'm" is an error after contraction expansion.
+
+Switched to `whisper-normalizer`'s `EnglishTextNormalizer` — the same normalizer OpenAI uses for Whisper evaluation. It canonicalizes numbers, contractions, and British/American spelling before comparison.
+
+Impact on reported WER:
+
+| Dataset | Old (naive) | New (Whisper norm) | Delta |
+|---|---|---|---|
+| librispeech (FP16) | 1.68% | **1.38%** | -0.30 |
+| earnings22 (FP16) | 16.48% | **11.37%** | -5.11 |
+| long (FP16) | 1.90% | **1.62%** | -0.28 |
+| difficult (FP16) | 23.32% | **20.99%** | -2.33 |
+| librispeech (FP8) | 2.11% | **1.64%** | -0.47 |
+| earnings22 (FP8) | 15.62% | **11.37%** | -4.25 |
+| long (FP8) | 2.20% | **1.82%** | -0.38 |
+| difficult (FP8) | 18.96% | **16.46%** | -2.50 |
+
+earnings22 had the biggest improvement — 5 points lower — because earnings calls are full of numbers ("Q4", "ninety eight percent", "2022") that the ASR was transcribing correctly but in a different format.
+
+The FP8 regularization effect on difficult audio is even more pronounced with proper normalization: **16.46%** vs **20.99%** (4.5 points better than FP16, vs the old 4.4 points).
+
+## LLM Corrector: An Experiment That Didn't Pan Out (for WER)
+
+### The idea
+
+Integrate an LLM directly into the paraketto binary for post-processing ASR output — removing fillers ("uh", "um"), fixing capitalization/punctuation, and cleaning up stutters. Inspired by our separate `llm-server` FastAPI gateway that chains STT + OLMoE correction, but in-process with no HTTP round-trips.
+
+### Implementation
+
+Vendored llama.cpp as a git submodule (`vendor/llama.cpp`), built as static libraries with cmake, and linked into paraketto with dead-code elimination (`-ffunction-sections -fdata-sections` + `-Wl,--gc-sections`). Only the CUDA backend is built; `--whole-archive` is needed for `libggml-cuda.a` (self-registering backend pattern) but not for the others.
+
+The corrector uses OLMoE-1B-7B (base model, not instruct) with few-shot prompting — just IN:/OUT: pattern completion, no chat template. Auto-downloads the Q4_K_M GGUF (~4.5 GB) on first use. VRAM budget: FP8 paraketto (~0.6 GB) + OLMoE Q4_K_M (~4.5 GB) = ~5.1 GB, fits comfortably in 16 GB.
+
+Build: `make paraketto.fp8 WITH_CORRECTOR=1`. The corrector is always loaded in server mode, opt-in with `--correct` for CLI one-offs. The server returns both raw `text` and `corrected_text` in the JSON response.
+
+### Challenges
+
+**llama.cpp API churn.** Function names don't match what you'd guess — `llama_context_init` doesn't exist (it's `llama_init_from_model`), `llama_context_free` is actually `llama_free`. Had to read `llama.h` directly instead of guessing.
+
+**CUDA driver API dependency.** ggml-cuda uses VMM functions (`cuMemCreate`, `cuMemAddressReserve`) from the CUDA driver API. Linking failed until we added `-lcuda` to the link flags.
+
+**Verbose logging.** llama.cpp prints model metadata, graph reservations, and dots during loading. Suppressed with custom log callbacks via `ggml_log_set()` and `llama_log_set()` that filter below `GGML_LOG_LEVEL_WARN`.
+
+**Position tracking.** When `llama_batch_get_one()` returns a batch with `pos == nullptr`, llama.cpp auto-assigns positions from the KV cache state. Manually setting positions caused crashes.
+
+### The result: corrector makes WER worse
+
+Benchmarked on all 240 test utterances across 4 datasets:
+
+```
+                 Without corrector    With corrector
+librispeech:         1.64%               2.85%        (+1.21)
+earnings22:         11.37%              18.05%        (+6.68)
+long:                1.82%               2.20%        (+0.38)
+difficult:          16.46%              19.88%        (+3.42)
+```
+
+Detailed error analysis: **55 regressions, 7 improvements, 117 no change.** The corrector was net harmful on every dataset.
+
+### Why it fails
+
+The raw ASR errors are overwhelmingly things an LLM *cannot* fix from text alone:
+
+1. **Misheard proper nouns** — "Harald"→"Harold", "Oliver"→"Oliva", "APAC"→"APEC". The LLM doesn't have the audio, so it can't know which is correct.
+2. **Genuinely misheard content** — "earthquake" vs "earth week", "revoking" vs "remote walking". Same problem.
+3. **Number format differences** — now handled by the Whisper normalizer, not an LLM's job.
+4. **Reference quality** — some references include fillers, so removing them *increases* WER.
+
+Meanwhile, the LLM introduces new errors:
+- **Repetition/hallucination** — "I start with the competition point" repeated 3x (+90% WER on one utterance)
+- **Long text truncation** — model drops the beginning of long passages, generating from the middle
+- **Word substitution** — "peppered"→"peppery", "Firstly"→"First", "mister"→"Mr." (all technically valid edits, all WER regressions)
+- **Content deletion** — drops clauses that weren't fillers
+
+### Safety checks helped but weren't enough
+
+We implemented safety validation (ported from the Python server): max new words, max word drop percentage, length bounds, trailing-sentence overlap. Tightened to zero new words allowed, 60-105% word count ratio, 4-gram repetition detection. This caught the worst hallucinations but couldn't prevent subtle word substitutions that stay within bounds.
+
+Added a **length gate** — skip correction entirely for inputs over 100 words. This fixed the long-text truncation problem (the "long" dataset went from +2.37% to +0.00% regression).
+
+### Conclusion
+
+The LLM corrector is valuable for **user-facing output quality** — cleaner punctuation, proper capitalization, filler removal — but it **hurts WER benchmarks**. The ASR model's errors are not the kind that text-only post-processing can fix, and the risk of introducing new errors outweighs the benefit. The corrector remains available as an opt-in feature (`WITH_CORRECTOR=1`) but is not recommended for WER-critical applications.

@@ -38,8 +38,8 @@ static void ensure_file(const std::string& path, const char* url) {
         std::string cmd = "mkdir -p '" + dir + "'";
         if (system(cmd.c_str()) != 0) {}  // best-effort
     }
-    fprintf(stderr, "Downloading %s...\n", path.c_str());
-    std::string cmd = "wget -q --show-progress -O '" + path + "' '" + std::string(url) + "'";
+    fprintf(stderr, "Downloading %s\n", path.c_str());
+    std::string cmd = "curl -# -fL -o '" + path + "' '" + std::string(url) + "'";
     int ret = system(cmd.c_str());
     if (ret != 0) {
         unlink(path.c_str());
@@ -53,6 +53,10 @@ static void ensure_file(const std::string& path, const char* url) {
 #include "mel.h"
 #include "vocab.h"
 #include "server.h"
+
+#ifdef WITH_CORRECTOR
+#include "corrector.h"
+#endif
 
 #ifdef EMBEDDED_WEIGHTS
 extern "C" {
@@ -195,6 +199,10 @@ int main(int argc, char** argv) {
             "Options:\n"
             "  --weights FILE             Model weights [default: ~/.cache/paraketto/]\n"
             "  --server [[host]:port]     Start HTTP server [default: 0.0.0.0:8080]\n"
+#ifdef WITH_CORRECTOR
+            "  --correct                  Enable LLM text correction\n"
+            "  --llm-model FILE           LLM weights [default: ~/.cache/paraketto/olmoe-1b-7b-0924-q4_k_m.gguf]\n"
+#endif
             "  -h, --help                 Show this help\n",
             argv[0]);
     };
@@ -213,6 +221,10 @@ int main(int argc, char** argv) {
     bool server_mode = false;
     std::string server_host = "0.0.0.0";
     int server_port = 8080;
+#ifdef WITH_CORRECTOR
+    bool enable_correct = false;
+    std::string llm_model_path = dir + "/olmoe-1b-7b-0924-q4_k_m.gguf";
+#endif
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -220,6 +232,13 @@ int main(int argc, char** argv) {
         if (arg == "--weights" && i + 1 < argc) {
             weights_path = argv[++i];
             custom_weights = true;
+#ifdef WITH_CORRECTOR
+        } else if (arg == "--correct") {
+            enable_correct = true;
+        } else if (arg == "--llm-model" && i + 1 < argc) {
+            llm_model_path = argv[++i];
+            enable_correct = true;
+#endif
         } else if (arg == "--server") {
             server_mode = true;
             if (i + 1 < argc && argv[i + 1][0] != '-') {
@@ -239,6 +258,10 @@ int main(int argc, char** argv) {
         fprintf(stderr, "No WAV files specified.\n");
         return 1;
     }
+
+#ifdef WITH_CORRECTOR
+    if (server_mode) enable_correct = true;
+#endif
 
     using clk = std::chrono::high_resolution_clock;
     auto t_main_start = clk::now();
@@ -348,6 +371,19 @@ int main(int argc, char** argv) {
         fp8_prefetch_ptr = nullptr;
     }
 
+#ifdef WITH_CORRECTOR
+    Corrector corrector;
+    if (enable_correct) {
+        ensure_file(llm_model_path,
+            "https://huggingface.co/allenai/OLMoE-1B-7B-0924-GGUF/resolve/main/"
+            "olmoe-1b-7b-0924-q4_k_m.gguf");
+        if (!corrector.init(llm_model_path)) {
+            fprintf(stderr, "error: LLM correction model failed to load\n");
+            return 1;
+        }
+    }
+#endif
+
     if (server_mode) {
         // Warmup with 1s of silence
         std::vector<float> silence(16000, 0.0f);
@@ -378,9 +414,17 @@ int main(int argc, char** argv) {
                 ms(t_main_start, t_prefetch),
                 ms(t_prefetch, t_init_done), ms(t_init_done, t_warmup_done));
         fprintf(stderr, "endpoints: GET /health | POST /transcribe\n");
+#ifdef WITH_CORRECTOR
+        if (enable_correct)
+            fprintf(stderr, "corrector: enabled (%.0fms warmup)\n", corrector.last_correct_ms);
+#endif
         fprintf(stderr, "\n");
 
+#ifdef WITH_CORRECTOR
+        run_server(pipeline, enable_correct ? &corrector : nullptr, server_host, server_port);
+#else
         run_server(pipeline, server_host, server_port);
+#endif
         return 0;
     }
 
@@ -400,13 +444,25 @@ int main(int argc, char** argv) {
         auto t0 = clk::now();
         std::string text = pipeline.transcribe(wav.samples.data(), wav.samples.size());
         auto t1 = clk::now();
-
         double elapsed = std::chrono::duration<double>(t1 - t0).count();
-        printf("%s\n", text.c_str());
-        fprintf(stderr, "%.1fs audio, %.1fms (mel=%.1f enc=%.1f dec=%.1f), %.0fx RTFx\n",
-                audio_dur, elapsed * 1000,
-                pipeline.last_mel_ms, pipeline.last_enc_ms, pipeline.last_dec_ms,
-                audio_dur / elapsed);
+
+#ifdef WITH_CORRECTOR
+        if (enable_correct) {
+            std::string corrected = corrector.correct(text);
+            printf("%s\n", corrected.c_str());
+            fprintf(stderr, "%.1fs audio, %.1fms (mel=%.1f enc=%.1f dec=%.1f correct=%.1f), %.0fx RTFx\n",
+                    audio_dur, elapsed * 1000 + corrector.last_correct_ms,
+                    pipeline.last_mel_ms, pipeline.last_enc_ms, pipeline.last_dec_ms,
+                    corrector.last_correct_ms, audio_dur / elapsed);
+        } else
+#endif
+        {
+            printf("%s\n", text.c_str());
+            fprintf(stderr, "%.1fs audio, %.1fms (mel=%.1f enc=%.1f dec=%.1f), %.0fx RTFx\n",
+                    audio_dur, elapsed * 1000,
+                    pipeline.last_mel_ms, pipeline.last_enc_ms, pipeline.last_dec_ms,
+                    audio_dur / elapsed);
+        }
     }
 
     return 0;
