@@ -8,8 +8,8 @@ import time
 from pathlib import Path
 
 import requests
-from jiwer import Compose, ReduceToListOfListOfWords, RemovePunctuation, ToLowerCase
 from jiwer import wer
+from whisper_normalizer.english import EnglishTextNormalizer
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
@@ -18,7 +18,7 @@ HF_BASE = "https://huggingface.co/localoptima/paraketto/resolve/main"
 
 DATASETS = ["librispeech", "earnings22", "long", "difficult"]
 
-normalize = Compose([ToLowerCase(), RemovePunctuation(), ReduceToListOfListOfWords()])
+whisper_normalize = EnglishTextNormalizer()
 
 
 def load_manifest(name: str) -> list[dict]:
@@ -100,7 +100,7 @@ def ensure_bench_data() -> None:
     print(f"Downloaded {n_wavs} wav files", file=sys.stderr)
 
 
-def bench_server(binary: Path, binary_name: str, port: int = 18080) -> None:
+def bench_server(binary: Path, binary_name: str, port: int = 18080, use_corrected: bool = False) -> None:
     """Start a server binary, run benchmarks, and print results."""
     if not binary.exists():
         print(f"Binary not found: {binary}", file=sys.stderr)
@@ -159,14 +159,14 @@ def bench_server(binary: Path, binary_name: str, port: int = 18080) -> None:
 
             for entry in manifest:
                 result = transcribe(entry["audio_path"])
-                hypotheses.append(result["text"])
+                text_key = "corrected_text" if use_corrected and "corrected_text" in result else "text"
+                hypotheses.append(result[text_key])
                 references.append(entry["reference"])
                 ds_inference += result["inference_time_s"]
 
             wer_pct = wer(
-                references, hypotheses,
-                reference_transform=normalize,
-                hypothesis_transform=normalize,
+                [whisper_normalize(r) for r in references],
+                [whisper_normalize(h) for h in hypotheses],
             ) * 100
             rtfx = ds_audio / ds_inference if ds_inference > 0 else 0
             rows.append(dict(

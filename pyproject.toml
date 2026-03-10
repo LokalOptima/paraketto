@@ -11,5 +11,6 @@ dependencies = [
     "onnx",
     "datasets>=4.6.1",
     "torchcodec>=0.10.0",
+    "whisper-normalizer>=0.1.12",
 ]
 
