@@ -9,17 +9,13 @@
 //        --expt-relaxed-constexpr -c cutlass_gemm.cu -o cutlass_gemm.o
 
 #include "cutlass_gemm.h"
-#include "kernels.h"  // for residual_add_fp16 (bias add)
+#include "common.h"
+#include "kernels.h"  // for bias_add_fp16
 
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/device/gemm.h"
 #include "cutlass/gemm/device/gemm_batched.h"
 #include "cutlass/gemm/device/gemm_splitk_parallel.h"
-
-#include <cstdio>
-#include <cstdlib>
-
-#define CUDA_CHECK(x) do { cudaError_t e = (x); if (e) { fprintf(stderr, "CUDA %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(e)); exit(1); } } while(0)
 
 // =========================================================================
 // CUTLASS kernel type aliases — SM80 FP16 TensorOp
@@ -500,25 +496,11 @@ void cutlass_gemm_nt(cudaStream_t stream,
     tn_dispatch(stream, X, m, k, W, n, Y, HALF_ONE, HALF_ZERO);
 }
 
-void cutlass_gemm_nt_accum(cudaStream_t stream,
-                           const half* X, int m, int k,
-                           const half* W, int n, half* Y) {
-    tn_dispatch(stream, X, m, k, W, n, Y, HALF_ONE, HALF_ONE);
-}
-
 void cutlass_gemm_nt_bias(cudaStream_t stream,
                           const half* X, int m, int k,
                           const half* W, int n,
                           const half* bias, half* Y) {
     tn_dispatch(stream, X, m, k, W, n, Y, HALF_ONE, HALF_ZERO);
-    bias_add_fp16(Y, bias, m, n, stream);
-}
-
-void cutlass_gemm_nt_accum_bias(cudaStream_t stream,
-                                const half* X, int m, int k,
-                                const half* W, int n,
-                                const half* bias, half* Y) {
-    tn_dispatch(stream, X, m, k, W, n, Y, HALF_ONE, HALF_ONE);
     bias_add_fp16(Y, bias, m, n, stream);
 }
 
@@ -566,25 +548,6 @@ void cutlass_batched_gemm_nt(cudaStream_t stream,
         // → full pipeline stages=6 with scalar epilogue
         run_batched_gemm<BatchedTN_64x64_64_s6_e1>(col_m, col_n, col_k,
             B, ldA_c, strideB, A, ldB_c, strideA, C, ldC_c, strideC,
-            batch, HALF_ONE, HALF_ZERO, stream);
-}
-
-void cutlass_batched_gemm_nn_ex(cudaStream_t stream,
-                                const half* A, int ldA, long long strideA,
-                                const half* B, int ldB, long long strideB,
-                                half* C, int ldC, long long strideC,
-                                int batch, int m, int n, int k) {
-    // Row-major NN with explicit ld/stride:
-    // → CUTLASS col-major NN: col_m=n, col_n=m, A_c=B(ldB), B_c=A(ldA)
-    int col_m = n, col_n = m, col_k = k;
-    int align = pick_batched_align(ldB, ldA, ldC, strideB, strideA, strideC);
-    if (align == 8)
-        run_batched_gemm<BatchedNN_64x64_64_s6>(col_m, col_n, col_k,
-            B, ldB, strideB, A, ldA, strideA, C, ldC, strideC,
-            batch, HALF_ONE, HALF_ZERO, stream);
-    else
-        run_batched_gemm<BatchedNN_64x64_32_s2_a8b1>(col_m, col_n, col_k,
-            B, ldB, strideB, A, ldA, strideA, C, ldC, strideC,
             batch, HALF_ONE, HALF_ZERO, stream);
 }
 

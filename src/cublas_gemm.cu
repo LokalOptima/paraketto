@@ -4,16 +4,12 @@
 // Links against -lcublas.
 
 #include "gemm.h"
+#include "common.h"
 #include "kernels.h"
 
 #include <cublas_v2.h>
 #include <cublasLt.h>
-#include <cstdio>
-#include <cstdlib>
 #include <unordered_map>
-
-#define CUDA_CHECK(x) do { cudaError_t e = (x); if (e) { fprintf(stderr, "CUDA %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(e)); exit(1); } } while(0)
-#define CUBLAS_CHECK(call) do { cublasStatus_t stat = (call); if (stat != CUBLAS_STATUS_SUCCESS) { fprintf(stderr, "cuBLAS error at %s:%d: %d\n", __FILE__, __LINE__, (int)stat); exit(1); } } while(0)
 
 // =========================================================================
 // Static state

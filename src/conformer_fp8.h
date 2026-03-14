@@ -2,6 +2,11 @@
 //
 // Included via -include flag for the FP8 build, overriding conformer.h.
 // Defines PARAKETTO_FP8 and extends CudaModel with FP8 quantization fields.
+//
+// IMPORTANT: This file intentionally reuses the CONFORMER_H_ include guard so
+// that when the compiler processes it first (via -include), the subsequent
+// #include "conformer.h" in paraketto_cuda.cpp becomes a no-op. This lets the
+// FP8 CudaModel definition cleanly replace the FP16 one at compile time.
 
 #ifndef CONFORMER_H_
 #define CONFORMER_H_

@@ -38,22 +38,11 @@ void cutlass_gemm_nt(cudaStream_t stream,
                      const half* X, int m, int k,
                      const half* W, int n, half* Y);
 
-// NT + accumulate: Y[m,n] += X[m,k] @ W[n,k]^T
-void cutlass_gemm_nt_accum(cudaStream_t stream,
-                           const half* X, int m, int k,
-                           const half* W, int n, half* Y);
-
 // NT + bias: Y[m,n] = X[m,k] @ W[n,k]^T + bias[n]
 void cutlass_gemm_nt_bias(cudaStream_t stream,
                           const half* X, int m, int k,
                           const half* W, int n,
                           const half* bias, half* Y);
-
-// NT + accumulate + bias: Y[m,n] += X[m,k] @ W[n,k]^T + bias[n]
-void cutlass_gemm_nt_accum_bias(cudaStream_t stream,
-                                const half* X, int m, int k,
-                                const half* W, int n,
-                                const half* bias, half* Y);
 
 // ---------------------------------------------------------------------------
 // Batched strided GEMM (for multi-head attention)
@@ -70,14 +59,6 @@ void cutlass_batched_gemm_nt(cudaStream_t stream,
                              const half* A, const half* B, half* C,
                              int batch, int m, int n, int k,
                              long long strideA, long long strideB, long long strideC);
-
-// NN with explicit leading dimensions and strides.
-// Row-major: C[b,m,n] = A[b,m,k] @ B[b,k,n]
-void cutlass_batched_gemm_nn_ex(cudaStream_t stream,
-                                const half* A, int ldA, long long strideA,
-                                const half* B, int ldB, long long strideB,
-                                half* C, int ldC, long long strideC,
-                                int batch, int m, int n, int k);
 
 // NT with explicit leading dimensions and strides.
 // Row-major: C[b,m,n] = A[b,m,k] @ B[b,n,k]^T

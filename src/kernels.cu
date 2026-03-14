@@ -4,21 +4,8 @@
 // Block/grid sizes tuned for typical conformer dimensions (D=1024, H=640).
 
 #include "kernels.h"
+#include "common.h"
 #include <cfloat>
-#include <cstdio>
-#include <cstdlib>
-
-#ifndef CUDA_CHECK
-#define CUDA_CHECK(call)                                                       \
-    do {                                                                        \
-        cudaError_t err = (call);                                              \
-        if (err != cudaSuccess) {                                              \
-            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__,   \
-                    cudaGetErrorString(err));                                   \
-            std::exit(1);                                                      \
-        }                                                                      \
-    } while (0)
-#endif
 
 // ---------------------------------------------------------------------------
 // LayerNorm
@@ -956,7 +943,7 @@ __global__ void fft512_mel_log_kernel(const float* __restrict__ frames,
 
     // 4. Mel filterbank: scatter with atomicAdd in shared memory
     // Reuse si[0..127] as mel accumulators
-    if (tid < 128) si[tid] = 0.0f;
+    if (tid < N_MELS) si[tid] = 0.0f;
     __syncthreads();
 
     // Each thread handles ~2 filterbank entries (504 / 256 ≈ 2)
@@ -969,8 +956,8 @@ __global__ void fft512_mel_log_kernel(const float* __restrict__ frames,
     __syncthreads();
 
     // 5. Log + write output
-    if (tid < 128) {
-        mel_out[frame * 128 + tid] = logf(si[tid] + 5.9604645e-08f);
+    if (tid < N_MELS) {
+        mel_out[frame * N_MELS + tid] = logf(si[tid] + LOG_EPS);
     }
 }
 

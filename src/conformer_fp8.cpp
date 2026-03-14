@@ -37,16 +37,7 @@ extern "C" {
 // CudaModel — encoder + decoder forward pass
 // =========================================================================
 
-// cuBLAS error checking
-#define CUBLAS_CHECK(call)                                                     \
-    do {                                                                       \
-        cublasStatus_t stat = (call);                                         \
-        if (stat != CUBLAS_STATUS_SUCCESS) {                                  \
-            fprintf(stderr, "cuBLAS error at %s:%d: %d\n",                    \
-                    __FILE__, __LINE__, (int)stat);                            \
-            std::exit(1);                                                     \
-        }                                                                     \
-    } while (0)
+// CUBLAS_CHECK is provided by common.h
 
 // ---------------------------------------------------------------------------
 // CudaModel::init
@@ -1014,9 +1005,9 @@ int CudaModel::encode_gpu(int T_mel) {
         // layer_norm → asite(blk, 0) feeds ff1_w1
         if (fused)
             layer_norm_fp8(x, b.ff1_ln_w, b.ff1_ln_b, ln_out, fp8_act_buf,
-                           &fp8_act_site_scales[asite(blk, 0)], T, D_MODEL, 1e-5f, stream);
+                           &fp8_act_site_scales[asite(blk, 0)], T, D_MODEL, NORM_EPS, stream);
         else
-            layer_norm_fp16(x, b.ff1_ln_w, b.ff1_ln_b, ln_out, T, D_MODEL, 1e-5f, stream);
+            layer_norm_fp16(x, b.ff1_ln_w, b.ff1_ln_b, ln_out, T, D_MODEL, NORM_EPS, stream);
 
         gnn8(ln_out, T, D_MODEL, fp8_ff1_w1[blk], D_FF, bscale(blk, 1), asite(blk, 0), ff_mid, fused);
         // silu → asite(blk, 1) feeds ff1_w2
@@ -1031,10 +1022,10 @@ int CudaModel::encode_gpu(int T_mel) {
         if (fused)
             residual_add_layer_norm_fp8(x, ff_out, 0.5f,
                 b.mhsa_ln_w, b.mhsa_ln_b, ln_out, fp8_act_buf,
-                &fp8_act_site_scales[asite(blk, 2)], T, D_MODEL, 1e-5f, stream);
+                &fp8_act_site_scales[asite(blk, 2)], T, D_MODEL, NORM_EPS, stream);
         else
             residual_add_layer_norm_fp16(x, ff_out, 0.5f,
-                b.mhsa_ln_w, b.mhsa_ln_b, ln_out, T, D_MODEL, 1e-5f, stream);
+                b.mhsa_ln_w, b.mhsa_ln_b, ln_out, T, D_MODEL, NORM_EPS, stream);
 
         {
             // Fused QKV projection: FP8
@@ -1090,10 +1081,10 @@ int CudaModel::encode_gpu(int T_mel) {
         if (fused)
             residual_add_layer_norm_fp8(x, mhsa_out, 1.0f,
                 b.conv_ln_w, b.conv_ln_b, ln_out, fp8_act_buf,
-                &fp8_act_site_scales[asite(blk, 5)], T, D_MODEL, 1e-5f, stream);
+                &fp8_act_site_scales[asite(blk, 5)], T, D_MODEL, NORM_EPS, stream);
         else
             residual_add_layer_norm_fp16(x, mhsa_out, 1.0f,
-                b.conv_ln_w, b.conv_ln_b, ln_out, T, D_MODEL, 1e-5f, stream);
+                b.conv_ln_w, b.conv_ln_b, ln_out, T, D_MODEL, NORM_EPS, stream);
 
         // Pointwise conv1 + GLU: FP8
         gnt8(ln_out, T, D_MODEL, fp8_conv_pw1_w[blk], D_CONV_PW, bscale(blk, 7), asite(blk, 5), conv_mid, fused);
@@ -1116,10 +1107,10 @@ int CudaModel::encode_gpu(int T_mel) {
         if (fused)
             residual_add_layer_norm_fp8(x, mhsa_out, 1.0f,
                 b.ff2_ln_w, b.ff2_ln_b, ln_out, fp8_act_buf,
-                &fp8_act_site_scales[asite(blk, 7)], T, D_MODEL, 1e-5f, stream);
+                &fp8_act_site_scales[asite(blk, 7)], T, D_MODEL, NORM_EPS, stream);
         else
             residual_add_layer_norm_fp16(x, mhsa_out, 1.0f,
-                b.ff2_ln_w, b.ff2_ln_b, ln_out, T, D_MODEL, 1e-5f, stream);
+                b.ff2_ln_w, b.ff2_ln_b, ln_out, T, D_MODEL, NORM_EPS, stream);
 
         // FF2: FP8
         gnn8(ln_out, T, D_MODEL, fp8_ff2_w1[blk], D_FF, bscale(blk, 3), asite(blk, 7), ff_mid, fused);
@@ -1137,10 +1128,10 @@ int CudaModel::encode_gpu(int T_mel) {
         if (fuse_final)
             residual_add_layer_norm_fp8(x, ff_out, 0.5f,
                 b.final_ln_w, b.final_ln_b, x, fp8_act_buf,
-                &fp8_act_site_scales[enc_proj_si], T, D_MODEL, 1e-5f, stream);
+                &fp8_act_site_scales[enc_proj_si], T, D_MODEL, NORM_EPS, stream);
         else
             residual_add_layer_norm_fp16(x, ff_out, 0.5f,
-                b.final_ln_w, b.final_ln_b, x, T, D_MODEL, 1e-5f, stream);
+                b.final_ln_w, b.final_ln_b, x, T, D_MODEL, NORM_EPS, stream);
     }
 
     // Encoder projection: FP8 (activation site: N_BLOCKS*9 + 1)

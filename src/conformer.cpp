@@ -126,14 +126,19 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames)
         return r;
     };
 
-    // --- Aliased region: subsampling pointers ---
+    // --- Phase-based buffer aliasing ---
+    // Subsampling buffers and conformer scratch buffers share the same GPU
+    // memory region. This is safe because subsampling runs first (converting
+    // mel frames into encoder input x), and once x is written to the persistent
+    // region the subsampling buffers are never touched again. The conformer
+    // blocks then reuse that same memory for intermediates (ln_out, ff_mid,
+    // qkv, scores, etc.), saving ~10MB VRAM.
     char* sub_cur = pool;
     sub_buf[0] = take(sub_cur, sub_sizes[0]);
     sub_buf[1] = take(sub_cur, sub_sizes[1]);
     mel_fp16   = take(sub_cur, sub_sizes[2]);
 
-    // --- Aliased region: conformer pointers (same base — shares GPU memory) ---
-    char* conf_cur = pool;
+    char* conf_cur = pool;  // same base address — intentionally aliased
     ln_out     = take(conf_cur, conf_sizes[0]);
     ff_mid     = take(conf_cur, conf_sizes[1]);
     ff_out     = take(conf_cur, conf_sizes[2]);
@@ -326,7 +331,7 @@ int CudaModel::encode_gpu(int T_mel) {
         auto& b = w->blocks[blk];
 
         // --- FF1 (half-step residual) ---
-        layer_norm_fp16(x, b.ff1_ln_w, b.ff1_ln_b, ln_out, T, D_MODEL, 1e-5f, stream);
+        layer_norm_fp16(x, b.ff1_ln_w, b.ff1_ln_b, ln_out, T, D_MODEL, NORM_EPS, stream);
 
         // FF1 linear1 + SiLU: [T,1024] × [1024,4096] → [T,4096]
         gnn(ln_out, T, D_MODEL, b.ff1_w1, D_FF, ff_mid);
@@ -334,7 +339,7 @@ int CudaModel::encode_gpu(int T_mel) {
 
         gnn(ff_mid, T, D_FF, b.ff1_w2, D_MODEL, ff_out);
         residual_add_layer_norm_fp16(x, ff_out, 0.5f,
-            b.mhsa_ln_w, b.mhsa_ln_b, ln_out, T, D_MODEL, 1e-5f, stream);
+            b.mhsa_ln_w, b.mhsa_ln_b, ln_out, T, D_MODEL, NORM_EPS, stream);
 
         {
             // Fused QKV projection: [T, D] × [D, 3D] → [T, 3D]
@@ -382,7 +387,7 @@ int CudaModel::encode_gpu(int T_mel) {
 
         // Fused: x += mhsa_out, then ln_out = LN(x)
         residual_add_layer_norm_fp16(x, mhsa_out, 1.0f,
-            b.conv_ln_w, b.conv_ln_b, ln_out, T, D_MODEL, 1e-5f, stream);
+            b.conv_ln_w, b.conv_ln_b, ln_out, T, D_MODEL, NORM_EPS, stream);
 
         // Pointwise conv1 + GLU
         gnt(ln_out, T, D_MODEL, b.conv_pw1_w, D_CONV_PW, conv_mid);
@@ -397,7 +402,7 @@ int CudaModel::encode_gpu(int T_mel) {
 
         // Fused: x += conv_out, then ln_out = LN(x)
         residual_add_layer_norm_fp16(x, mhsa_out, 1.0f,
-            b.ff2_ln_w, b.ff2_ln_b, ln_out, T, D_MODEL, 1e-5f, stream);
+            b.ff2_ln_w, b.ff2_ln_b, ln_out, T, D_MODEL, NORM_EPS, stream);
 
         // FF2 linear1 + SiLU
         gnn(ln_out, T, D_MODEL, b.ff2_w1, D_FF, ff_mid);
@@ -405,7 +410,7 @@ int CudaModel::encode_gpu(int T_mel) {
 
         gnn(ff_mid, T, D_FF, b.ff2_w2, D_MODEL, ff_out);
         residual_add_layer_norm_fp16(x, ff_out, 0.5f,
-            b.final_ln_w, b.final_ln_b, x, T, D_MODEL, 1e-5f, stream);
+            b.final_ln_w, b.final_ln_b, x, T, D_MODEL, NORM_EPS, stream);
     }
 
     // x now holds encoder output [T, D_MODEL] in FP16

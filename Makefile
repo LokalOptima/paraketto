@@ -9,7 +9,7 @@ WEIGHTS_DIR = $(or $(XDG_CACHE_HOME),$(HOME)/.cache)/paraketto
 WEIGHTS     = $(WEIGHTS_DIR)/paraketto-fp16.bin
 WEIGHTS_FP8 = $(WEIGHTS_DIR)/paraketto-fp8.bin
 
-.PHONY: bench-all bench-cuda bench-cublas bench-fp8 bench-corrector weights weights-fp8 download-data download-weights check-weights clean llama-libs
+.PHONY: bench-all bench-cuda bench-cublas bench-fp8 bench-corrector weights weights-fp8 download-data download-weights check-weights check-weights-fp8 clean llama-libs
 
 # ---------------------------------------------------------------------------
 # LLM corrector (opt-in via WITH_CORRECTOR=1)
@@ -60,6 +60,15 @@ check-weights: $(WEIGHTS)
 		exit 1; \
 	fi
 
+# Verify paraketto-fp8.bin is the expected format (PRKTFP8 v1)
+check-weights-fp8: $(WEIGHTS_FP8)
+	@m=$$(od -An -tx1 -N7 $(WEIGHTS_FP8) | tr -d ' '); \
+	v=$$(od -An -td4 -N4 -j8 $(WEIGHTS_FP8) | tr -d ' '); \
+	if [ "$$m" != "50524b54465038" ] || [ "$$v" != "1" ]; then \
+		echo "ERROR: paraketto-fp8.bin has invalid header (magic=$$m, version=$$v). Re-run to regenerate."; \
+		exit 1; \
+	fi
+
 # Download benchmark data from HuggingFace
 data/librispeech/manifest.json:
 	@echo "Downloading benchmark data..."
@@ -103,7 +112,7 @@ bench-cuda: paraketto.cuda data/librispeech/manifest.json $(WEIGHTS) check-weigh
 bench-cublas: paraketto.cublas data/librispeech/manifest.json $(WEIGHTS) check-weights
 	uv run python tests/bench_native.py paraketto.cublas
 
-bench-fp8: paraketto.fp8 data/librispeech/manifest.json $(WEIGHTS_FP8)
+bench-fp8: paraketto.fp8 data/librispeech/manifest.json $(WEIGHTS_FP8) check-weights-fp8
 	uv run python tests/bench_native.py paraketto.fp8
 
 bench-corrector: paraketto.fp8 data/librispeech/manifest.json $(WEIGHTS_FP8)
@@ -192,13 +201,13 @@ paraketto.fp8.static: src/conformer_fp8.o src/weights.o src/kernels.o src/kernel
 		-o $@
 
 bench_gemm: tests/bench_gemm.cu
-	$(NVCC) $(NVFLAGS) -arch=sm_80 $(CUTLASS_INC) tests/bench_gemm.cu -lcublas -lcublasLt -o $@
+	$(NVCC) $(NVFLAGS) -arch=sm_120 $(CUTLASS_INC) tests/bench_gemm.cu -lcublas -lcublasLt -o $@
 
 bench_splitk: tests/bench_splitk.cu
-	$(NVCC) $(NVFLAGS) -arch=sm_80 $(CUTLASS_INC) tests/bench_splitk.cu -lcublas -lcublasLt -o $@
+	$(NVCC) $(NVFLAGS) -arch=sm_120 $(CUTLASS_INC) tests/bench_splitk.cu -lcublas -lcublasLt -o $@
 
 bench_tiles: tests/bench_tiles.cu
-	$(NVCC) $(NVFLAGS) -arch=sm_80 $(CUTLASS_INC) tests/bench_tiles.cu -lcublas -lcublasLt -o $@
+	$(NVCC) $(NVFLAGS) -arch=sm_120 $(CUTLASS_INC) tests/bench_tiles.cu -lcublas -lcublasLt -o $@
 
 bench_ff2: tests/bench_ff2.cu
 	$(NVCC) $(NVFLAGS) -arch=sm_120 $(CUTLASS_INC) tests/bench_ff2.cu -lcublas -lcublasLt -o $@

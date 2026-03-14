@@ -32,6 +32,7 @@ void quantize_fp8_static(const half* in, uint8_t* out, const float* scale,
 // Broadcast bias add: x[i,j] += bias[j]  for i in [0,rows), j in [0,cols)
 //   x: [rows, cols] row-major FP16 (modified in-place)
 //   bias: [cols] FP16
+//   Uses float32 intermediate to preserve FP8 calibration stability.
 // ---------------------------------------------------------------------------
 void bias_add_row_fp16(half* x, const half* bias, int rows, int cols,
                         cudaStream_t stream);

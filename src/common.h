@@ -6,7 +6,7 @@
 #include <cuda_runtime.h>
 
 // ---------------------------------------------------------------------------
-// CUDA error checking
+// Error checking
 // ---------------------------------------------------------------------------
 
 #define CUDA_CHECK(call)                                                       \
@@ -19,10 +19,22 @@
         }                                                                      \
     } while (0)
 
+// cuBLAS error checking (usable after including <cublas_v2.h>)
+#define CUBLAS_CHECK(call)                                                     \
+    do {                                                                       \
+        auto _cublas_stat = (call);                                            \
+        if ((int)_cublas_stat != 0) {                                          \
+            fprintf(stderr, "cuBLAS error at %s:%d: %d\n",                     \
+                    __FILE__, __LINE__, (int)_cublas_stat);                     \
+            std::exit(1);                                                      \
+        }                                                                      \
+    } while (0)
+
 // ---------------------------------------------------------------------------
 // Constants — match NeMo Parakeet TDT 0.6B V2 preprocessor
 // ---------------------------------------------------------------------------
 
+static constexpr int MAX_MEL_FRAMES = 16000 * 120 / 160;  // 120s max audio at 16kHz
 static constexpr int N_FFT = 512;
 static constexpr int HOP = 160;
 static constexpr int N_MELS = 128;

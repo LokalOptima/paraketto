@@ -13,6 +13,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <cuda_runtime.h>
@@ -31,17 +32,30 @@ static std::string cache_dir() {
     return ".";
 }
 
+static void mkdirs(const std::string& path) {
+    std::string cur;
+    for (size_t i = 0; i < path.size(); i++) {
+        cur += path[i];
+        if (path[i] == '/')
+            mkdir(cur.c_str(), 0755);  // ignores EEXIST
+    }
+    if (!cur.empty() && cur.back() != '/')
+        mkdir(cur.c_str(), 0755);
+}
+
 static void ensure_file(const std::string& path, const char* url) {
     if (access(path.c_str(), F_OK) == 0) return;
     std::string dir = path.substr(0, path.rfind('/'));
-    if (!dir.empty()) {
-        std::string cmd = "mkdir -p '" + dir + "'";
-        if (system(cmd.c_str()) != 0) {}  // best-effort
-    }
+    if (!dir.empty()) mkdirs(dir);
     fprintf(stderr, "Downloading %s\n", path.c_str());
-    std::string cmd = "curl -# -fL -o '" + path + "' '" + std::string(url) + "'";
-    int ret = system(cmd.c_str());
-    if (ret != 0) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        execlp("curl", "curl", "-#", "-fL", "-o", path.c_str(), url, nullptr);
+        _exit(127);
+    }
+    int status;
+    waitpid(pid, &status, 0);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         unlink(path.c_str());
         fprintf(stderr, "Download failed. Get weights from https://huggingface.co/localoptima/paraketto\n");
         exit(1);
@@ -104,10 +118,10 @@ struct Pipeline {
 
 #ifdef PARAKETTO_FP8
         const char* fp8_path = fp8_target.empty() ? nullptr : fp8_target.c_str();
-        cuda_model.init(weights, stream, 16000 * 120 / 160, fp8_path,
+        cuda_model.init(weights, stream, MAX_MEL_FRAMES, fp8_path,
                         fp8_prefetch, fp8_prefetch_size);
 #else
-        cuda_model.init(weights, stream, 16000 * 120 / 160);
+        cuda_model.init(weights, stream, MAX_MEL_FRAMES);
 #endif
     }
 
@@ -344,7 +358,7 @@ int main(int argc, char** argv) {
     });
 #endif
 
-    // Force CUDA driver/context initialization (overlaps with prefetch)
+    // Force eager CUDA context initialization (overlaps with weight prefetch)
     cudaFree(0);
     auto t_cuda_init = clk::now();
 

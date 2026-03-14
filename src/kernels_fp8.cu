@@ -4,23 +4,9 @@
 // Two-kernel approach: (1) multi-block absmax via atomicMax, (2) multi-block quantize.
 
 #include "kernels_fp8.h"
+#include "common.h"
 #include <cuda_fp8.h>
-#include <cuda_fp16.h>
 #include <cfloat>
-#include <cstdio>
-#include <cstdlib>
-
-#ifndef CUDA_CHECK
-#define CUDA_CHECK(call)                                                       \
-    do {                                                                        \
-        cudaError_t err = (call);                                              \
-        if (err != cudaSuccess) {                                              \
-            fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__,   \
-                    cudaGetErrorString(err));                                   \
-            std::exit(1);                                                      \
-        }                                                                      \
-    } while (0)
-#endif
 
 static constexpr float FP8_E4M3_MAX = 448.0f;
 
@@ -111,7 +97,7 @@ void quantize_fp8_static(const half* in, uint8_t* out, const float* scale,
 }
 
 // ---------------------------------------------------------------------------
-// Broadcast bias add: x[i,j] += bias[j]
+// Broadcast bias add: x[i,j] += bias[j]  (float32 intermediate for FP8 path)
 // ---------------------------------------------------------------------------
 
 __global__ void bias_add_row_kernel(half* __restrict__ x,
