@@ -205,7 +205,7 @@ void Weights::upload(cudaStream_t stream) {
 }
 
 // ---------------------------------------------------------------------------
-// Weights::allocate_only — FP8 path: malloc without data upload
+// Weights::allocate_only — FP8 first-run path: full layout for quantization
 // ---------------------------------------------------------------------------
 
 void Weights::allocate_only() {
@@ -220,6 +220,78 @@ void Weights::allocate_only() {
     embedded_ptr = nullptr;
 
     assign_weight_pointers(*this);  // assign pointers into gpu_data
+}
+
+// ---------------------------------------------------------------------------
+// Non-GEMM weight layout — only weights used at runtime in the FP8 path.
+//
+// The FP8 path replaces all large GEMM matrices with FP8 quantized versions
+// (stored in fp8_pool). Only LayerNorm, biases, depthwise conv, embeddings,
+// and the small decoder GEMM weights (dec_proj, out_proj) are needed in FP16.
+// This is ~5 MB vs ~1.2 GB for the full layout.
+// ---------------------------------------------------------------------------
+
+static size_t assign_nongemm_weight_pointers(Weights& w) {
+    uint8_t* base = (uint8_t*)w.gpu_data;
+    size_t off = 0;
+
+    auto take = [&](half*& ptr, size_t n) {
+        off = (off + 255) & ~(size_t)255;
+        if (base) ptr = (half*)(base + off);
+        off += n * sizeof(half);
+    };
+
+    // Sub-conv weights (FP16 subsampling GEMMs — too small for FP8)
+    for (int i : {0, 2, 3, 5, 6}) {
+        size_t wn = (i == 3 || i == 6) ? (size_t)SUB_CHANNELS * SUB_CHANNELS
+                                        : SUB_CHANNELS * 9;
+        take(w.sub_conv[i].weight, wn);
+        take(w.sub_conv[i].bias,   SUB_CHANNELS);
+    }
+    take(w.sub_out_b, D_MODEL);  // bias only; sub_out_w uses FP8
+
+    // Per-block non-GEMM weights: LN, biases, depthwise conv, pos_bias
+    for (int i = 0; i < N_BLOCKS; i++) {
+        auto& blk = w.blocks[i];
+        take(blk.ff1_ln_w,   D_MODEL);  take(blk.ff1_ln_b,   D_MODEL);
+        take(blk.mhsa_ln_w,  D_MODEL);  take(blk.mhsa_ln_b,  D_MODEL);
+        take(blk.pos_bias_u, (size_t)N_HEADS * HEAD_DIM);
+        take(blk.pos_bias_v, (size_t)N_HEADS * HEAD_DIM);
+        take(blk.conv_ln_w,  D_MODEL);  take(blk.conv_ln_b,  D_MODEL);
+        take(blk.conv_dw_w,  (size_t)D_MODEL * CONV_K);
+        take(blk.conv_dw_b,  D_MODEL);
+        take(blk.ff2_ln_w,   D_MODEL);  take(blk.ff2_ln_b,   D_MODEL);
+        take(blk.final_ln_w, D_MODEL);  take(blk.final_ln_b, D_MODEL);
+    }
+
+    // Decoder weights (FP16 GEMMs — cublasLt FP8 doesn't support N=1)
+    take(w.embed_w,    (size_t)N_VOCAB * D_PRED);
+    take(w.dec_proj_w, (size_t)D_PRED  * D_JOINT);
+    take(w.dec_proj_b, D_JOINT);
+    take(w.out_proj_w, (size_t)D_JOINT * D_OUTPUT);
+    take(w.out_proj_b, D_OUTPUT);
+    take(w.enc_proj_b, D_JOINT);
+
+    off = (off + 255) & ~(size_t)255;
+    return off;
+}
+
+// ---------------------------------------------------------------------------
+// Weights::allocate_nongemm_only — FP8 steady-state: only non-GEMM weights
+// ---------------------------------------------------------------------------
+
+void Weights::allocate_nongemm_only() {
+    gpu_data_size = assign_nongemm_weight_pointers(*this);
+    CUDA_CHECK(cudaMalloc(&gpu_data, gpu_data_size));
+
+    if (mmap_ptr) {
+        munmap(mmap_ptr, mmap_size);
+        mmap_ptr  = nullptr;
+        mmap_size = 0;
+    }
+    embedded_ptr = nullptr;
+
+    assign_nongemm_weight_pointers(*this);
 }
 
 // ---------------------------------------------------------------------------

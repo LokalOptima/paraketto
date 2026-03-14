@@ -6,10 +6,10 @@
 
 Speech-to-text inference for NVIDIA's [Parakeet TDT 0.6B V2](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2), written in C++ with custom CUDA kernels. No frameworks, no Python at runtime.
 
-- Batch 1, 1300x+ real-time — fast on a single WAV
+- Batch 1, 1200x–1400x real-time — fast on a single WAV
 - Custom CUDA/CUTLASS kernels — only `libcudart.so`
-- Optional FP8 quantization — half the weight size, +9% throughput
-- Optimized 1.8 GB VRAM usage
+- Optional FP8 quantization — half the weight size, ~35% less VRAM
+- Low VRAM: 1.8 GB (FP16), 1.2 GB (FP8)
 - ~240ms warm startup (FP16), ~180ms (FP8)
 - Builtin HTTP server
 - Optional static build with zero runtime files
@@ -40,12 +40,12 @@ FP8 backend with fused quantization (requires Blackwell GPU):
                  FP8 (cublasLt E4M3 + fused quantize)
               ────────────────────────────
                RTFx    WER    Audio  Time
-librispeech   1228x   1.64%   896s  729ms
-earnings22    1086x  11.37%   253s  233ms
-long          1352x   1.82%  5578s  4.12s
-difficult     1354x  16.46%   509s  376ms
+librispeech   1147x   1.42%   896s  781ms
+earnings22    1013x  10.93%   253s  250ms
+long          1325x   1.79%  5578s  4.21s
+difficult     1350x  16.62%   509s  377ms
               ────────────────────────────
-Total         1325x          7236s  5.46s
+Total         1288x          7236s  5.62s
 ```
 
 ### Startup time
@@ -176,12 +176,12 @@ make bench-all     # all backends
 ┌─────────────┬──────────┬─────────┬────────┬─────────┬──────────┐
 │ Dataset     │      WER │    RTFx │   Utts │   Audio │     Time │
 ├─────────────┼──────────┼─────────┼────────┼─────────┼──────────┤
-│ librispeech │    1.64% │   1228x │    100 │    896s │    729ms │
-│ earnings22  │   11.37% │   1086x │     40 │    253s │    233ms │
-│ long        │    1.82% │   1352x │     50 │   5578s │    4.12s │
-│ difficult   │   16.46% │   1354x │     50 │    509s │    376ms │
+│ librispeech │    1.42% │   1147x │    100 │    896s │    781ms │
+│ earnings22  │   10.93% │   1013x │     40 │    253s │    250ms │
+│ long        │    1.79% │   1325x │     50 │   5578s │    4.21s │
+│ difficult   │   16.62% │   1350x │     50 │    509s │    377ms │
 ├─────────────┼──────────┼─────────┼────────┼─────────┼──────────┤
-│ Total       │          │   1325x │    240 │   7236s │    5.46s │
+│ Total       │          │   1288x │    240 │   7236s │    5.62s │
 └─────────────┴──────────┴─────────┴────────┴─────────┴──────────┘
 ```
 

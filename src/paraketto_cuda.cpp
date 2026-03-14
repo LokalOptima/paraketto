@@ -107,9 +107,9 @@ struct Pipeline {
 
 #ifdef PARAKETTO_FP8
         if (!fp8_ready.empty())
-            weights.allocate_only();  // FP8 file ready: malloc + assign pointers only
+            weights.allocate_nongemm_only();  // FP8 ready: only non-GEMM weights (~5 MB)
         else
-            weights.upload(stream);   // first run: upload FP16 to quantize from
+            weights.upload(stream);           // first run: upload FP16 to quantize from
 #else
         weights.upload(stream);
 #endif

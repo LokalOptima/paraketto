@@ -31,6 +31,7 @@ import numpy as np
 import requests
 from jiwer import wer as compute_wer
 from scipy.stats import t as t_dist, ttest_ind
+from tqdm import tqdm
 from whisper_normalizer.english import EnglishTextNormalizer
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -86,7 +87,7 @@ def transcribe(path: str, port: int = 18080) -> dict:
     return r.json()
 
 
-def run_once(port: int = 18080, label: str = "") -> dict:
+def run_once(port: int = 18080, pbar_ds: tqdm | None = None) -> dict:
     """Run full benchmark suite once. Returns {dataset: {wer, rtfx, ...}}."""
     results = {}
     for name in DATASETS:
@@ -96,14 +97,17 @@ def run_once(port: int = 18080, label: str = "") -> dict:
         references = []
         hypotheses = []
 
-        for i, entry in enumerate(manifest):
+        if pbar_ds is not None:
+            pbar_ds.set_description(name)
+            pbar_ds.reset(total=len(manifest))
+
+        for entry in manifest:
             result = transcribe(entry["audio_path"], port)
             hypotheses.append(result["text"])
             references.append(entry["reference"])
             ds_inference += result["inference_time_s"]
-            print(f"\r    {label}{name}: {i+1}/{len(manifest)}",
-                  end="", file=sys.stderr, flush=True)
-        print(file=sys.stderr)
+            if pbar_ds is not None:
+                pbar_ds.update(1)
 
         wer_pct = compute_wer(
             [whisper_normalize(r) for r in references],
@@ -117,32 +121,41 @@ def run_once(port: int = 18080, label: str = "") -> dict:
 
 
 def run_session(binary: Path, port: int, runs: int,
-                session_idx: int, total_sessions: int) -> dict:
+                session_idx: int, total_sessions: int,
+                pbar_run: tqdm | None = None,
+                pbar_ds: tqdm | None = None) -> dict:
     """One session: start server, warmup, R runs, stop server. Returns session means."""
-    tag = f"[session {session_idx+1}/{total_sessions}]"
-    print(f"\n{tag} Starting server...", file=sys.stderr)
+    tag = f"session {session_idx+1}/{total_sessions}"
+    if pbar_run is not None:
+        pbar_run.set_description(f"{tag}: starting")
+        pbar_run.reset(total=runs + 1)  # +1 for warmup
+
     server = start_server(binary, port)
 
     try:
-        print(f"{tag} Warmup (discarded)...", file=sys.stderr)
-        run_once(port, label=f"{tag} [warmup] ")
+        if pbar_run is not None:
+            pbar_run.set_description(f"{tag}: warmup")
+        run_once(port, pbar_ds=pbar_ds)
+        if pbar_run is not None:
+            pbar_run.update(1)
 
         accum = {ds: {"wer": [], "rtfx": []} for ds in DATASETS}
 
         for r in range(runs):
-            t0 = time.monotonic()
-            results = run_once(port, label=f"{tag} [run {r+1}/{runs}] ")
-            elapsed = time.monotonic() - t0
+            if pbar_run is not None:
+                pbar_run.set_description(f"{tag}: run {r+1}/{runs}")
+            results = run_once(port, pbar_ds=pbar_ds)
 
             for ds in DATASETS:
                 accum[ds]["wer"].append(results[ds]["wer"])
                 accum[ds]["rtfx"].append(results[ds]["rtfx"])
 
-            rtfx_summary = " | ".join(
-                f"{ds[:4]}={results[ds]['rtfx']:.0f}x" for ds in DATASETS
-            )
-            print(f"  {tag} Run {r+1}/{runs} ({elapsed:.1f}s): {rtfx_summary}",
-                  file=sys.stderr)
+            if pbar_run is not None:
+                pbar_run.update(1)
+                rtfx_summary = " | ".join(
+                    f"{ds[:4]}={results[ds]['rtfx']:.0f}x" for ds in DATASETS
+                )
+                pbar_run.set_postfix_str(rtfx_summary)
 
     finally:
         stop_server(server)
@@ -293,12 +306,22 @@ def main():
     # Collect S sessions, each with R runs
     all_sessions = {ds: {"wer_sessions": [], "rtfx_sessions": []} for ds in DATASETS}
 
-    for s in range(args.sessions):
-        session = run_session(binary, args.port, args.runs, s, args.sessions)
+    pbar_session = tqdm(range(args.sessions), desc="sessions", position=0)
+    pbar_run = tqdm(total=args.runs + 1, desc="runs", position=1, leave=False)
+    pbar_ds = tqdm(total=100, desc="files", position=2, leave=False)
+
+    for s in pbar_session:
+        pbar_session.set_description(f"session {s+1}/{args.sessions}")
+        session = run_session(binary, args.port, args.runs, s, args.sessions,
+                              pbar_run=pbar_run, pbar_ds=pbar_ds)
 
         for ds in DATASETS:
             all_sessions[ds]["wer_sessions"].append(session[ds]["wer"])
             all_sessions[ds]["rtfx_sessions"].append(session[ds]["rtfx"])
+
+    pbar_ds.close()
+    pbar_run.close()
+    pbar_session.close()
 
     # Print summary
     print(file=sys.stderr)

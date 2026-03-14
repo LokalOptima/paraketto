@@ -156,9 +156,11 @@ struct Weights {
     /// Upload prefetched/embedded data to GPU, assign weight pointers.
     void upload(cudaStream_t stream = nullptr);
 
-    /// FP8 path: cudaMalloc + assign pointers only (no data upload).
-    /// fp8_load() will populate GPU memory from paraketto-fp8.bin.
+    /// FP8 first-run: full layout cudaMalloc + assign pointers (no data upload).
     void allocate_only();
+
+    /// FP8 steady-state: only non-GEMM weights (~5 MB vs ~1.2 GB full layout).
+    void allocate_nongemm_only();
 
     /// Free the GPU allocation.
     void free();

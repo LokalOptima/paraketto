@@ -1643,3 +1643,41 @@ Added a **length gate** — skip correction entirely for inputs over 100 words. 
 ### Conclusion
 
 The LLM corrector is valuable for **user-facing output quality** — cleaner punctuation, proper capitalization, filler removal — but it **hurts WER benchmarks**. The ASR model's errors are not the kind that text-only post-processing can fix, and the risk of introducing new errors outweighs the benefit. The corrector remains available as an opt-in feature (`WITH_CORRECTOR=1`) but is not recommended for WER-critical applications.
+
+## VRAM Optimization: 2847 MB → 1213 MB (-57%)
+
+The FP8 binary was using 2847 MB of VRAM — more than the FP16 binary's 1873 MB, despite having half the weight data. Three sources of waste, each addressed with a different technique.
+
+### Problem 1: Full FP16 weight allocation (~1.2 GB wasted)
+
+The FP8 path called `Weights::allocate_only()` which allocated the full FP16 weight layout (~1.2 GB) even though most of it was never used. The large GEMM weights (ff1, ff2, qkv, pos, out, conv_pw1, conv_pw2, sub_out, enc_proj) all live in the separate `fp8_pool` as quantized FP8 data. Only the non-GEMM weights need FP16 storage: LayerNorm parameters, biases, depthwise convolution weights, embeddings, and small decoder weights.
+
+**Fix:** Added `assign_nongemm_weight_pointers()` and `Weights::allocate_nongemm_only()` in `weights.cpp`. These allocate only the ~5 MB of FP16 data the FP8 runtime actually reads.
+
+### Problem 2: No buffer aliasing (~700 MB wasted)
+
+The FP16 path (`conformer.cpp`) already used phase-based buffer aliasing — subsampling buffers and conformer scratch buffers share the same GPU memory since their lifetimes don't overlap. The FP8 path (`conformer_fp8.cpp`) allocated everything independently, plus sized both subsampling buffers at the maximum dimensions instead of their actual sizes.
+
+**Fix:** Restructured the FP8 pool allocation to match the FP16 pattern:
+- **Sub-phase**: `sub_buf[0]` at H3×W3, `sub_buf[1]` at H2×W2, `mel_fp16` — right-sized
+- **Conf-phase**: 16 scratch buffers (ln_out, ff_mid, ff_out, qkv, k, v, pos_proj, q_u, q_v_buf, scores, pos_scores, attn_out, mhsa_out, conv_mid, conv_glu, conv_dw)
+- `aliased_bytes = max(sub_bytes, conf_bytes)`, pool = aliased + persistent
+
+One complication: the FP8 path used `im2col_2d_fp16()` for conv.0, which wrote to `ff_mid` — a conformer-phase buffer — during the subsampling phase. This would corrupt data under aliasing. Switched to `conv2d_fp16()` (matching the FP16 path) which handles im2col internally.
+
+### Problem 3: QKV weights in permanent pool (~144 MB wasted)
+
+Pre-concatenated QKV weights (`qkv_w[24]`, each `[D_MODEL, 3*D_MODEL]`) were allocated as part of the permanent GPU pool. They're only needed during the first-run FP8 quantization — after that, the FP8 quantized `fp8_qkv_w` arrays are used instead.
+
+**Fix:** Moved `qkv_w` to a temporary `cudaMalloc` inside the `!loaded` branch, freed immediately after `fp8_save()`.
+
+### Results
+
+| Build | VRAM Before | VRAM After | Reduction |
+|-------|-------------|------------|-----------|
+| FP8 (ready path) | 2847 MB | **1213 MB** | **-57%** |
+| FP16 (reference) | 1873 MB | 1873 MB | unchanged |
+
+FP8 now uses **660 MB less** than FP16 (1213 vs 1873 MB).
+
+Regression test (5 sessions × 3 runs): WER improved on 3/4 datasets (conv2d_fp16 is slightly more numerically accurate than im2col+gnn), +0.08pp on difficult. RTFx within noise.

@@ -124,6 +124,7 @@ struct Weights {
     static Weights from_embedded(const uint8_t* data, size_t size);
     void upload(cudaStream_t stream = nullptr);
     void allocate_only();
+    void allocate_nongemm_only();
     void free();
 };
 
@@ -152,7 +153,6 @@ struct CudaModel {
     half*  ff_mid      = nullptr;
     half*  ff_out      = nullptr;
     half*  qkv         = nullptr;
-    half*  q           = nullptr;
     half*  k           = nullptr;
     half*  v           = nullptr;
     half*  pos_enc     = nullptr;
