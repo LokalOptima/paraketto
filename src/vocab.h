@@ -104,9 +104,11 @@ static const char* const VOCAB_V2[] = {
     "\xce\xbf","<blk>"
 };
 // ---------------------------------------------------------------------------
-// V3 Vocabulary placeholder (8193 multilingual BPE tokens, blank=8192)
-// TODO: Generate from istupakov/parakeet-tdt-0.6b-v3-onnx vocab.txt
+// V3 Vocabulary (8193 multilingual BPE tokens, blank=8192)
+// From istupakov/parakeet-tdt-0.6b-v3-onnx on HuggingFace (vocab.txt).
+// The U+2581 separator is pre-converted to ASCII space.
 // ---------------------------------------------------------------------------
+#include "vocab_v3.h"
 
 // Detokenize: join token strings, trim leading space.
 // vocab_arr/vocab_size are selected at runtime based on model version.

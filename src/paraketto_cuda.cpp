@@ -186,7 +186,8 @@ private:
             else if (token == blank_id || emitted >= 10) { t++; emitted = 0; }
         }
 
-        return detokenize(tokens, VOCAB_V2, weights.config.n_vocab);
+        const char* const* vocab = (weights.config.version == 3) ? VOCAB_V3 : VOCAB_V2;
+        return detokenize(tokens, vocab, weights.config.n_vocab);
     }
 };
 
