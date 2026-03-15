@@ -44,7 +44,7 @@ static constexpr uint32_t WEIGHTS_VERSION  = 2;
 static constexpr size_t   WEIGHTS_HEADER   = 8;  // magic(4) + version(4)
 
 static constexpr uint32_t FP8_WEIGHTS_VERSION = 1;
-static constexpr size_t   FP8_WEIGHTS_HEADER  = 16;  // magic(8) + version(4) + pad(4)
+static constexpr size_t   FP8_WEIGHTS_HEADER  = 16;  // magic(8) + version(4) + model_version(4)
 
 // ---------------------------------------------------------------------------
 // Model constants

@@ -3,13 +3,18 @@
 
 paraketto-fp16.bin format:
   uint32  magic   = 0x544B5250  ("PRKT" little-endian)
-  uint32  version = 2
+  uint32  version = 2 (V2 English) or 3 (V3 multilingual)
   [raw FP16 tensor data, 256-byte aligned, in fixed order matching source layout]
 
 The tensor order here matches assign_weight_pointers() in weights.cpp exactly.
 This file IS the format specification — no separate index in the binary.
+
+Usage:
+  uv run python scripts/export_weights.py         # V2 English
+  uv run python scripts/export_weights.py --v3    # V3 multilingual
 """
 
+import argparse
 import struct
 import subprocess
 import sys
@@ -18,9 +23,11 @@ from pathlib import Path
 import numpy as np
 import onnx
 
-REPO_ID       = "istupakov/parakeet-tdt-0.6b-v2-onnx"
+REPOS = {
+    2: "istupakov/parakeet-tdt-0.6b-v2-onnx",
+    3: "istupakov/parakeet-tdt-0.6b-v3-onnx",
+}
 MAGIC         = struct.pack("<I", 0x544B5250)  # "PRKT"
-VERSION       = struct.pack("<I", 2)
 TENSOR_ALIGN  = 256
 
 # ---------------------------------------------------------------------------
@@ -176,10 +183,11 @@ def extract_tensors(onnx_path: Path, prefix: str) -> dict[str, np.ndarray]:
     return tensors
 
 
-def export_weights(output_path: Path) -> dict[str, np.ndarray]:
-    print("Downloading ONNX models...")
+def export_weights(output_path: Path, version: int = 2) -> dict[str, np.ndarray]:
+    repo_id = REPOS[version]
+    print(f"Downloading ONNX models from {repo_id}...")
     result = subprocess.run(
-        ["uvx", "hf", "download", REPO_ID],
+        ["uvx", "hf", "download", repo_id],
         capture_output=True, text=True, check=True,
     )
     onnx_dir = Path(result.stdout.strip())
@@ -210,10 +218,10 @@ def export_weights(output_path: Path) -> dict[str, np.ndarray]:
             print(f"  {n}")
         sys.exit(1)
 
-    print(f"\nWriting {output_path} ({len(ordered)} tensors, fixed order)...")
+    print(f"\nWriting {output_path} ({len(ordered)} tensors, version={version})...")
     with open(output_path, "wb") as f:
         f.write(MAGIC)
-        f.write(VERSION)
+        f.write(struct.pack("<I", version))
         offset = 0
         for name in ordered:
             arr = all_tensors[name]
@@ -236,8 +244,17 @@ def export_weights(output_path: Path) -> dict[str, np.ndarray]:
 
 
 def main() -> None:
-    output_path = Path(__file__).resolve().parent.parent / "paraketto-fp16.bin"
-    export_weights(output_path)
+    parser = argparse.ArgumentParser(description="Export ONNX weights to paraketto-fp16.bin")
+    parser.add_argument("--v3", action="store_true", help="Export V3 multilingual model")
+    args = parser.parse_args()
+
+    root = Path(__file__).resolve().parent.parent
+    if args.v3:
+        output_path = root / "paraketto-v3-fp16.bin"
+        export_weights(output_path, version=3)
+    else:
+        output_path = root / "paraketto-fp16.bin"
+        export_weights(output_path, version=2)
     print("\nDone.")
 
 

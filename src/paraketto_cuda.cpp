@@ -205,6 +205,7 @@ int main(int argc, char** argv) {
             "Weights are auto-downloaded from HuggingFace on first run.\n"
             "\n"
             "Options:\n"
+            "  --model v2|v3              Model version [default: v2 English, v3 multilingual]\n"
             "  --weights FILE             Model weights [default: ~/.cache/paraketto/]\n"
             "  --server [[host]:port]     Start HTTP server [default: 0.0.0.0:8080]\n"
 #ifdef WITH_CORRECTOR
@@ -219,12 +220,8 @@ int main(int argc, char** argv) {
 
     std::string dir = cache_dir();
     bool custom_weights = false;
-#ifdef PARAKETTO_FP8
-    std::string weights_path = dir + "/paraketto-fp8.bin";
-    std::string fp16_path    = dir + "/paraketto-fp16.bin";
-#else
-    std::string weights_path = dir + "/paraketto-fp16.bin";
-#endif
+    int model_version = 2;  // default: V2 English
+    std::string weights_path;
     std::vector<std::string> wav_files;
     bool server_mode = false;
     std::string server_host = "0.0.0.0";
@@ -237,7 +234,12 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--help" || arg == "-h") { usage(); return 0; }
-        if (arg == "--weights" && i + 1 < argc) {
+        if (arg == "--model" && i + 1 < argc) {
+            std::string v = argv[++i];
+            if (v == "v2" || v == "2") model_version = 2;
+            else if (v == "v3" || v == "3") model_version = 3;
+            else { fprintf(stderr, "Unknown model version: %s (use v2 or v3)\n", v.c_str()); return 1; }
+        } else if (arg == "--weights" && i + 1 < argc) {
             weights_path = argv[++i];
             custom_weights = true;
 #ifdef WITH_CORRECTOR
@@ -267,6 +269,29 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Set default weight paths based on model version (if not overridden by --weights)
+#ifdef PARAKETTO_FP8
+    std::string fp16_path;
+#endif
+    const char* hf_base = "https://huggingface.co/localoptima/paraketto/resolve/main";
+    if (!custom_weights) {
+        if (model_version == 3) {
+#ifdef PARAKETTO_FP8
+            weights_path = dir + "/paraketto-v3-fp8.bin";
+            fp16_path    = dir + "/paraketto-v3-fp16.bin";
+#else
+            weights_path = dir + "/paraketto-v3-fp16.bin";
+#endif
+        } else {
+#ifdef PARAKETTO_FP8
+            weights_path = dir + "/paraketto-fp8.bin";
+            fp16_path    = dir + "/paraketto-fp16.bin";
+#else
+            weights_path = dir + "/paraketto-fp16.bin";
+#endif
+        }
+    }
+
 #ifdef WITH_CORRECTOR
     if (server_mode) enable_correct = true;
 #endif
@@ -274,13 +299,15 @@ int main(int argc, char** argv) {
     using clk = std::chrono::high_resolution_clock;
     auto t_main_start = clk::now();
 
+#ifndef PARAKETTO_FP8
+    // FP16 builds: download weights if missing
     if (!custom_weights) {
-#ifdef PARAKETTO_FP8
-        ensure_file(weights_path, "https://huggingface.co/localoptima/paraketto/resolve/main/paraketto-fp8.bin");
-#else
-        ensure_file(weights_path, "https://huggingface.co/localoptima/paraketto/resolve/main/paraketto-fp16.bin");
-#endif
+        const char* fname = (model_version == 3) ? "paraketto-v3-fp16.bin" : "paraketto-fp16.bin";
+        std::string url = std::string(hf_base) + "/" + fname;
+        ensure_file(weights_path, url.c_str());
     }
+#endif
+    // FP8 builds: download handled below (check fp8 cache, fall back to fp16)
 
     Weights prefetched;
     std::thread prefetch_thread;
@@ -296,18 +323,30 @@ int main(int argc, char** argv) {
     {
         int fd = open(weights_path.c_str(), O_RDONLY);
         if (fd >= 0) {
-            char hdr[12];
-            if (read(fd, hdr, 12) == 12
+            char hdr[16];
+            if (read(fd, hdr, 16) == 16
                     && memcmp(hdr, "PRKTFP8", 7) == 0) {
-                uint32_t version; memcpy(&version, hdr + 8, 4);
-                if (version == FP8_WEIGHTS_VERSION)
+                uint32_t fp8_ver; memcpy(&fp8_ver, hdr + 8, 4);
+                uint32_t model_ver; memcpy(&model_ver, hdr + 12, 4);
+                if (fp8_ver == FP8_WEIGHTS_VERSION) {
                     fp8_path_for_init = weights_path;
+                    // Set config from FP8 header so pool sizes are correct
+                    if (model_ver == 3) {
+                        prefetched.config.version  = 3;
+                        prefetched.config.n_vocab  = 8193;
+                        prefetched.config.d_output = 8198;
+                        prefetched.config.blank_id = 8192;
+                    }
+                }
             }
             close(fd);
         }
         // FP8 file missing or invalid — need FP16 weights for quantization
         if (fp8_path_for_init.empty() && !custom_weights) {
-            ensure_file(fp16_path, "https://huggingface.co/localoptima/paraketto/resolve/main/paraketto-fp16.bin");
+            const char* fp16_fname = (model_version == 3)
+                ? "paraketto-v3-fp16.bin" : "paraketto-fp16.bin";
+            std::string fp16_url = std::string(hf_base) + "/" + fp16_fname;
+            ensure_file(fp16_path, fp16_url.c_str());
         }
     }
 #endif
@@ -399,7 +438,8 @@ int main(int argc, char** argv) {
         double weights_mb = file_size_mb(weights_path);
 
         fprintf(stderr, "\n");
-        fprintf(stderr, "model:     parakeet-tdt-0.6b-v2 (custom CUDA)\n");
+        fprintf(stderr, "model:     parakeet-tdt-0.6b-v%d (custom CUDA)\n",
+                pipeline.weights.config.version);
         fprintf(stderr, "weights:   %s (%.0f MB)\n", weights_path.c_str(), weights_mb);
         fprintf(stderr, "device:    %s (compute %d.%d, %.0f MB VRAM, %.0f MB free)\n",
                 prop.name, prop.major, prop.minor,

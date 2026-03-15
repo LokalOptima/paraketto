@@ -1704,3 +1704,21 @@ struct ModelConfig {
 `Weights::prefetch()` reads the weight file version from the header (PRKT v2 or v3) and sets the config accordingly. All downstream code — weight layout, pool sizing, FP8 quantization, FP8 save/load, greedy decode, argmax — reads from `w->config` instead of compile-time constants.
 
 **Updated detokenize to accept runtime vocab.** The `detokenize()` function now takes a vocab array pointer and size instead of using hardcoded globals, preparing for V3's 8193-token vocabulary which will be embedded alongside V2's in `vocab.h`.
+
+### Step 2: V3 weights, vocabulary, and CLI
+
+**Embedded V3 vocabulary.** Generated `VOCAB_V3[]` (8193 tokens) from `istupakov/parakeet-tdt-0.6b-v3-onnx` vocab.txt and embedded it in `src/vocab_v3.h` alongside the existing V2 vocab. Uses octal escapes to avoid C compiler hex-digit-eating warnings. Runtime selection based on weight file version.
+
+**Export script for V3.** Added `--v3` flag to `scripts/export_weights.py` — points to the V3 ONNX repo, writes version=3 in the header. Same tensor order (encoder is identical), just different shapes for embed_w and out_proj_w/b.
+
+**FP8 header stores model version.** The `pad` field at offset 12 in the FP8 header now stores the model version (2 or 3). This makes FP8 weight files self-describing — `fp8_load` reads the model version and sets `ModelConfig` accordingly, so pool sizes and weight layouts are correct without relying on CLI flags.
+
+**`--model v3` CLI flag.** Selects V3 weights and vocabulary:
+```bash
+./paraketto.fp8 --model v3 audio.wav          # multilingual (25 EU languages)
+./paraketto.fp8 audio.wav                      # default: V2 English
+```
+
+The FP8 path checks for a cached FP8 file first; if missing, downloads the FP16 file and quantizes on first run. Server banner shows the detected model version.
+
+**V3 results.** Same RTFx as V2 (encoder is identical). On English test data, V3 produces slightly different but equally correct transcriptions — expected since the model was retrained on multilingual data with a different tokenizer.

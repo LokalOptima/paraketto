@@ -365,12 +365,13 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames,
             FILE* f = fopen(path, "wb");
             if (!f) { fprintf(stderr, "  warning: cannot write %s\n", path); return; }
 
-            // 16-byte header: magic(8) + version(4) + pad(4)
+            // 16-byte header: magic(8) + fp8_version(4) + model_version(4)
             const char magic[8] = "PRKTFP8";
-            uint32_t version = FP8_WEIGHTS_VERSION, pad = 0;
+            uint32_t fp8_ver = FP8_WEIGHTS_VERSION;
+            uint32_t model_ver = (uint32_t)w->config.version;
             fwrite(magic,           8, 1, f);
-            fwrite(&version,        4, 1, f);
-            fwrite(&pad,            4, 1, f);
+            fwrite(&fp8_ver,        4, 1, f);
+            fwrite(&model_ver,      4, 1, f);
             fwrite(pool_buf.data(), 1, pool_weights_size, f);
             fwrite(fp16_buf.data(), sizeof(half), fp16_buf.size(), f);
             fclose(f);
