@@ -118,6 +118,9 @@ bench-fp8: paraketto.fp8 data/librispeech/manifest.json $(WEIGHTS_FP8) check-wei
 bench-corrector: paraketto.fp8 data/librispeech/manifest.json $(WEIGHTS_FP8)
 	uv run python tests/bench_corrector.py paraketto.fp8
 
+bench-v3: paraketto.fp8
+	uv run python tests/test_v3_multilingual.py paraketto.fp8
+
 # Re-generate weights from ONNX (only needed if export script changes)
 weights-export: scripts/export_weights.py
 	uv run python scripts/export_weights.py
