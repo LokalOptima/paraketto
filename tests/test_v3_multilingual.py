@@ -18,10 +18,12 @@ from pathlib import Path
 
 import requests
 from jiwer import wer as compute_wer
+from num2words import num2words
 
 from bench_common import ROOT, DATA_DIR, load_manifest, print_results
 
 DATASETS_V3 = ["german", "italian", "french"]
+LANG_CODES = {"german": "de", "italian": "it", "french": "fr"}
 
 
 # HuggingFace Open ASR Leaderboard multilingual normalizer
@@ -34,10 +36,38 @@ def _remove_symbols_and_diacritics(s: str) -> str:
         for c in unicodedata.normalize("NFKD", s)
     )
 
-def multilingual_normalize(s: str) -> str:
+def _expand_numbers(s: str, lang: str) -> str:
+    """Replace digit sequences with written-out words using num2words."""
+    def _replace(m: re.Match) -> str:
+        text = m.group(0)
+        # Handle decimal with comma (European: 3,5 → drei Komma fünf)
+        if "," in text:
+            parts = text.split(",")
+            if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                try:
+                    return num2words(float(f"{parts[0]}.{parts[1]}"), lang=lang)
+                except Exception:
+                    pass
+        # Handle thousands separator with dot (European: 10.000 → zehntausend)
+        nodot = text.replace(".", "")
+        if "." in text and nodot.isdigit() and len(nodot) > 3:
+            try:
+                return num2words(int(nodot), lang=lang)
+            except Exception:
+                pass
+        # Plain integer
+        try:
+            return num2words(int(text), lang=lang)
+        except Exception:
+            return text
+    # Match sequences of digits possibly separated by dots or commas
+    return re.sub(r"\d[\d.,]*\d|\d+", _replace, s)
+
+def multilingual_normalize(s: str, lang: str = "de") -> str:
     s = s.lower()
     s = re.sub(r"[<\[][^>\]]*[>\]]", "", s)
     s = re.sub(r"\(([^)]+?)\)", "", s)
+    s = _expand_numbers(s, lang)
     s = _remove_symbols_and_diacritics(s).lower()
     s = re.sub(r"[^\w\s]", "", s)
     s = re.sub(r"\s+", " ", s).strip()
@@ -100,9 +130,10 @@ def bench_v3_server(binary: Path, port: int = 18090) -> None:
                 references.append(entry["reference"])
                 ds_inference += result["inference_time_s"]
 
+            lang = LANG_CODES[name]
             wer_pct = compute_wer(
-                [multilingual_normalize(r) for r in references],
-                [multilingual_normalize(h) for h in hypotheses],
+                [multilingual_normalize(r, lang) for r in references],
+                [multilingual_normalize(h, lang) for h in hypotheses],
             ) * 100
             rtfx = ds_audio / ds_inference if ds_inference > 0 else 0
             rows.append(dict(
