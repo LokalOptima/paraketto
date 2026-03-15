@@ -1719,6 +1719,24 @@ struct ModelConfig {
 ./paraketto.fp8 audio.wav                      # default: V2 English
 ```
 
-The FP8 path checks for a cached FP8 file first; if missing, downloads the FP16 file and quantizes on first run. Server banner shows the detected model version.
+Pre-built FP8 weights are downloaded directly from HuggingFace — no FP16 fallback or on-device quantization. Server banner shows the detected model version.
 
-**V3 results.** Same RTFx as V2 (encoder is identical). On English test data, V3 produces slightly different but equally correct transcriptions — expected since the model was retrained on multilingual data with a different tokenizer.
+### Step 3: Multilingual benchmarks and WER normalization
+
+Created a curated FLEURS test set: 50 clips each for German, Italian, and French (~1925s total audio), packaged as `bench-data-v3.tar.gz` with the same `manifest.json` format as the English benchmarks.
+
+**WER normalization is a mess.** NVIDIA reports FLEURS WER "after removing Punctuation and Capitalization" using the [HF Open ASR Leaderboard normalizer](https://github.com/huggingface/open_asr_leaderboard/tree/main/normalizer). We vendor the same `BasicMultilingualTextNormalizer` (lowercase + strip diacritics + remove punctuation). On top of that, we add `num2words` expansion to convert digits to spoken words in both reference and hypothesis — without this, "2017" vs "duemila diciassette" counts as multiple word errors even though both are correct.
+
+Even after normalization, WER is inflated by artifacts: parenthesized content in references gets stripped by the normalizer but correctly transcribed by the model (adding "extra" words), compound word boundaries differ ("Nordkivu" vs "Nord-Kivu"), and minor grammatical variants ("étroite" vs "étroites") count as errors. Qualitative review of all 94 error clips shows only ~15-20 genuine mishearings out of 150 total clips.
+
+**V3 FP8 results** (RTX 5070 Ti, 50 clips per language):
+
+```
+               RTFx    WER    Audio  Time
+german        1290x   9.18%   695s  539ms
+italian       1590x   4.83%   732s  461ms
+french        1232x   6.29%   498s  405ms
+Total         1372x          1925s  1.40s
+```
+
+NVIDIA's official FLEURS WER (FP16, full test set): German 5.04%, Italian 3.00%, French 5.15%. Our numbers are higher due to FP8 quantization and a smaller/harder clip selection, but qualitatively the transcriptions are excellent.
