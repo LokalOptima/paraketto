@@ -82,35 +82,34 @@ static void run_server(PipelineT& pipeline, const std::string& host, int port) {
   .container { width: 100%; max-width: 640px; }
   h1 { font-size: 1.3rem; font-weight: 600; margin-bottom: 0.3rem; color: #fff; }
   .subtitle { font-size: 0.85rem; color: #666; margin-bottom: 1.5rem; }
-  .drop-zone { border: 2px dashed #333; border-radius: 12px; padding: 2.5rem 1.5rem;
-               text-align: center; cursor: pointer; transition: all 0.2s; }
+  .toprow { display: flex; gap: 10px; align-items: stretch; }
+  .drop-zone { flex: 1; border: 1px dashed #333; border-radius: 8px; padding: 12px 16px;
+               text-align: center; cursor: pointer; transition: all 0.2s;
+               display: flex; align-items: center; justify-content: center; gap: 8px; }
   .drop-zone:hover, .drop-zone.dragover { border-color: #2563eb; background: #0d1117; }
-  .drop-zone p { color: #888; font-size: 0.9rem; }
-  .drop-zone .icon { font-size: 2rem; margin-bottom: 0.5rem; }
-  .controls { display: flex; gap: 10px; margin-top: 16px; justify-content: center; }
+  .drop-zone p { color: #666; font-size: 0.8rem; }
   button { background: #1a1a1a; color: #e0e0e0; border: 1px solid #333; border-radius: 8px;
            padding: 10px 20px; font-size: 0.9rem; font-weight: 500; cursor: pointer;
-           transition: all 0.15s; display: flex; align-items: center; gap: 6px; }
+           transition: all 0.15s; display: flex; align-items: center; gap: 6px;
+           white-space: nowrap; }
   button:hover { background: #222; border-color: #555; }
   button.recording { background: #7f1d1d; border-color: #dc2626; color: #fca5a5; }
   button:disabled { opacity: 0.4; cursor: default; }
-  .result { margin-top: 20px; display: none; }
+  .result { margin-top: 16px; display: none; }
   .result.visible { display: block; }
   .transcript { background: #111; border: 1px solid #222; border-radius: 10px;
                 padding: 16px 20px; font-size: 1.05rem; line-height: 1.6;
                 color: #f0f0f0; min-height: 60px; white-space: pre-wrap; }
-  .meta { display: flex; gap: 16px; margin-top: 10px; flex-wrap: wrap; }
-  .meta span { font-size: 0.8rem; color: #555; font-variant-numeric: tabular-nums; }
+  .transcript.live { color: #888; border-color: #1a1a1a; }
+  .meta { display: flex; gap: 16px; margin-top: 8px; flex-wrap: wrap; }
+  .meta span { font-size: 0.78rem; color: #555; font-variant-numeric: tabular-nums; }
   .meta .val { color: #888; }
-  .spinner { display: none; margin: 20px auto; width: 24px; height: 24px;
+  .spinner { display: none; margin: 16px auto; width: 20px; height: 20px;
              border: 2px solid #333; border-top-color: #2563eb; border-radius: 50%;
              animation: spin 0.6s linear infinite; }
   .spinner.visible { display: block; }
   @keyframes spin { to { transform: rotate(360deg); } }
   input[type="file"] { display: none; }
-  .wave { height: 40px; margin-top: 12px; display: none; }
-  .wave.visible { display: block; }
-  .wave canvas { width: 100%; height: 100%; border-radius: 6px; }
 </style>
 </head>
 <body>
@@ -118,13 +117,7 @@ static void run_server(PipelineT& pipeline, const std::string& host, int port) {
   <h1>paraketto</h1>
   <p class="subtitle">speech-to-text</p>
 
-  <div class="drop-zone" id="dropzone">
-    <div class="icon">&#127908;</div>
-    <p>Drop a WAV file here, or click to upload</p>
-  </div>
-  <input type="file" id="fileinput" accept="audio/*">
-
-  <div class="controls">
+  <div class="toprow">
     <button id="recbtn" onclick="toggleRecord()">
       <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
         <circle cx="8" cy="5" r="3.5"/>
@@ -133,9 +126,12 @@ static void run_server(PipelineT& pipeline, const std::string& host, int port) {
       </svg>
       Record
     </button>
+    <div class="drop-zone" id="dropzone">
+      <p>or drop / click to upload audio</p>
+    </div>
   </div>
+  <input type="file" id="fileinput" accept="audio/*">
 
-  <div class="wave" id="wave"><canvas id="wavecanvas"></canvas></div>
   <div class="spinner" id="spinner"></div>
 
   <div class="result" id="result">
@@ -157,79 +153,86 @@ $('dropzone').addEventListener('drop', e => {
   if (e.dataTransfer.files[0]) sendFile(e.dataTransfer.files[0]);
 });
 
-// --- Microphone recording ---
-let mediaRec = null, audioChunks = [];
-async function toggleRecord() {
-  if (mediaRec && mediaRec.state === 'recording') {
-    mediaRec.stop();
-    return;
+// --- WAV encoding helper ---
+function pcmToWav(chunks) {
+  const n = chunks.reduce((a, c) => a + c.length, 0);
+  const buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
+  const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  w(0,'RIFF'); v.setUint32(4, 36 + n * 2, true); w(8,'WAVE');
+  w(12,'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, 16000, true); v.setUint32(28, 32000, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  w(36,'data'); v.setUint32(40, n * 2, true);
+  let o = 44;
+  for (const c of chunks) for (let i = 0; i < c.length; i++) {
+    const x = Math.max(-1, Math.min(1, c[i]));
+    v.setInt16(o, x < 0 ? x * 0x8000 : x * 0x7FFF, true); o += 2;
   }
+  return new Blob([buf], { type: 'audio/wav' });
+}
+
+// --- Microphone: persistent stream, toggle recording on/off ---
+let micStream = null, micCtx = null, recording = false, recPcm = [], previewTimer = null, previewSeq = 0;
+async function initMic() {
+  if (micStream) return true;
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: 16000, channelCount: 1 } });
-    audioChunks = [];
-    mediaRec = new MediaRecorder(stream, { mimeType: MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-                                            ? 'audio/webm;codecs=opus' : 'audio/webm' });
-    mediaRec.ondataavailable = e => audioChunks.push(e.data);
-    mediaRec.onstop = () => {
-      stream.getTracks().forEach(t => t.stop());
-      $('recbtn').classList.remove('recording');
-      $('recbtn').innerHTML = micSvg + ' Record';
-      stopWave();
-      const blob = new Blob(audioChunks, { type: mediaRec.mimeType });
-      sendFile(blob, 'recording.webm');
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: 16000, channelCount: 1 } });
+    micCtx = new AudioContext({ sampleRate: 16000 });
+    const source = micCtx.createMediaStreamSource(micStream);
+    const proc = micCtx.createScriptProcessor(4096, 1, 1);
+    proc.onaudioprocess = e => {
+      if (recording) recPcm.push(new Float32Array(e.inputBuffer.getChannelData(0)));
     };
-    mediaRec.start();
-    $('recbtn').classList.add('recording');
-    $('recbtn').innerHTML = '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><rect x="3" y="3" width="10" height="10" rx="2"/></svg> Stop';
-    startWave(stream);
+    source.connect(proc);
+    proc.connect(micCtx.destination);
+    return true;
   } catch(e) {
     alert('Microphone access denied');
+    return false;
   }
+}
+async function toggleRecord() {
+  if (recording) { stopRecord(); return; }
+  if (!await initMic()) return;
+  recPcm = [];
+  previewSeq = 0;
+  recording = true;
+  $('recbtn').classList.add('recording');
+  $('recbtn').innerHTML = stopSvg + ' Stop';
+  $('transcript').textContent = '';
+  $('transcript').classList.add('live');
+  $('meta').innerHTML = '';
+  $('result').classList.add('visible');
+  previewTimer = setInterval(sendPreview, 640);
+}
+async function sendPreview() {
+  if (!recPcm.length) return;
+  const seq = ++previewSeq;
+  const wav = pcmToWav(recPcm);
+  const fd = new FormData();
+  fd.append('file', wav, 'preview.wav');
+  try {
+    const r = await fetch('/transcribe', { method: 'POST', body: fd });
+    if (r.ok && seq >= previewSeq) {
+      const j = await r.json();
+      $('transcript').textContent = j.text || '...';
+    }
+  } catch(e) {}
+}
+function stopRecord() {
+  recording = false;
+  clearInterval(previewTimer);
+  $('recbtn').classList.remove('recording');
+  $('recbtn').innerHTML = micSvg + ' Record';
+  $('transcript').classList.remove('live');
+  if (recPcm.length) sendFile(pcmToWav(recPcm), 'recording.wav');
 }
 const micSvg = $('recbtn').innerHTML.split('Record')[0];
+const stopSvg = '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><rect x="3" y="3" width="10" height="10" rx="2"/></svg>';
 
-// --- Waveform visualizer ---
-let waveAnim = null, analyser = null, waveCtx = null;
-function startWave(stream) {
-  const ac = new AudioContext();
-  analyser = ac.createAnalyser();
-  analyser.fftSize = 256;
-  ac.createMediaStreamSource(stream).connect(analyser);
-  const canvas = $('wavecanvas');
-  canvas.width = canvas.offsetWidth * 2;
-  canvas.height = 80;
-  waveCtx = canvas.getContext('2d');
-  $('wave').classList.add('visible');
-  drawWave();
-}
-function drawWave() {
-  if (!analyser) return;
-  waveAnim = requestAnimationFrame(drawWave);
-  const data = new Uint8Array(analyser.frequencyBinCount);
-  analyser.getByteTimeDomainData(data);
-  const ctx = waveCtx, w = ctx.canvas.width, h = ctx.canvas.height;
-  ctx.fillStyle = '#111';
-  ctx.fillRect(0, 0, w, h);
-  ctx.strokeStyle = '#2563eb';
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  const step = w / data.length;
-  for (let i = 0; i < data.length; i++) {
-    const y = (data[i] / 255) * h;
-    i === 0 ? ctx.moveTo(0, y) : ctx.lineTo(i * step, y);
-  }
-  ctx.stroke();
-}
-function stopWave() {
-  cancelAnimationFrame(waveAnim);
-  $('wave').classList.remove('visible');
-  analyser = null;
-}
-
-// --- Transcribe ---
+// --- Transcribe (file upload or final recording) ---
 async function sendFile(file, name) {
   $('spinner').classList.add('visible');
-  $('result').classList.remove('visible');
+  $('transcript').classList.remove('live');
   const fd = new FormData();
   fd.append('file', file, name || file.name);
   try {
@@ -241,12 +244,10 @@ async function sendFile(file, name) {
       const dur = j.audio_duration_s.toFixed(1);
       const inf = (j.inference_time_s * 1000).toFixed(0);
       const rtfx = (j.audio_duration_s / j.inference_time_s).toFixed(0);
-      const mel = j.mel_ms.toFixed(1), enc = j.enc_ms.toFixed(1), dec = j.dec_ms.toFixed(1);
       $('meta').innerHTML =
         `<span>${dur}s audio</span>` +
-        `<span>inference <span class="val">${inf}ms</span></span>` +
-        `<span>RTFx <span class="val">${rtfx}x</span></span>` +
-        `<span>mel <span class="val">${mel}ms</span>  enc <span class="val">${enc}ms</span>  dec <span class="val">${dec}ms</span></span>`;
+        `<span><span class="val">${inf}ms</span> inference</span>` +
+        `<span><span class="val">${rtfx}x</span> RTFx</span>`;
     }
     $('result').classList.add('visible');
   } catch(e) {
