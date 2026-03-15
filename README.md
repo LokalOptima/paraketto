@@ -4,8 +4,9 @@
 
 # parakettő
 
-Speech-to-text inference for NVIDIA's [Parakeet TDT 0.6B V2](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2), written in C++ with custom CUDA kernels. No frameworks, no Python at runtime.
+Speech-to-text inference for NVIDIA's [Parakeet TDT 0.6B](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2), written in C++ with custom CUDA kernels. No frameworks, no Python at runtime.
 
+- **V2** (English) and **V3** (25 EU languages, auto-detect) — `--model v3`
 - Batch 1, 1200x–1400x real-time — fast on a single WAV
 - Custom CUDA/CUTLASS kernels — only `libcudart.so`
 - Optional FP8 quantization — half the weight size, ~35% less VRAM
@@ -47,6 +48,21 @@ difficult     1350x  16.62%   509s  377ms
 Total         1288x          7236s  5.62s
 ```
 
+V3 multilingual (FP8, FLEURS test clips, 50 per language):
+
+```
+                 V3 FP8 multilingual (cublasLt E4M3)
+              ────────────────────────────
+               RTFx    WER    Audio  Time
+german        1290x   9.18%   695s  539ms
+italian       1590x   4.83%   732s  461ms
+french        1232x   6.29%   498s  405ms
+              ────────────────────────────
+Total         1372x          1925s  1.40s
+```
+
+WER uses the [HF Open ASR Leaderboard](https://github.com/huggingface/open_asr_leaderboard) multilingual normalizer (lowercase + strip diacritics + remove punctuation) with `num2words` number expansion. Note: WER is inflated by normalizer artifacts (parenthesized reference text being stripped, compound word boundary differences) — qualitative review shows ~2-4% genuine transcription errors.
+
 ### Startup time
 
 Time from process start to first inference, measured with `tests/bench_startup.py`:
@@ -73,13 +89,15 @@ Cold = weight files not in OS page cache. Warm = cached.
 
 ## Backends
 
-Three CUDA backends, same driver and weight loader:
+Three CUDA backends, same driver and weight loader. All support both V2 (English) and V3 (multilingual) via `--model v2|v3`:
 
 | Binary | GEMM backend | Weights | Notes |
 |--------|-------------|---------|-------|
 | `paraketto.cuda` | CUTLASS FP16 (custom-tuned) | `paraketto-fp16.bin` (1.2 GB) | default, no cuBLAS dep |
 | `paraketto.cublas` | cuBLAS/cublasLt FP16 | `paraketto-fp16.bin` (1.2 GB) | |
 | `paraketto.fp8` | cublasLt FP8 E4M3 | `paraketto-fp8.bin` (604 MB) | Blackwell only |
+
+V3 weights: `paraketto-v3-fp16.bin` (1.2 GB) / `paraketto-v3-fp8.bin` (627 MB). Auto-downloaded on first `--model v3` run.
 
 ## Quick start
 
@@ -104,6 +122,15 @@ Weights are downloaded from [HuggingFace](https://huggingface.co/localoptima/par
 make paraketto.fp8               # build FP8 binary
 ./paraketto.fp8 audio.wav        # auto-downloads paraketto-fp8.bin (~604 MB)
 ```
+
+### Multilingual (V3)
+
+```bash
+./paraketto.fp8 --model v3 audio.wav    # 25 EU languages, auto-detect
+./paraketto.cuda --model v3 audio.wav   # works with any backend
+```
+
+Supports: bg, cs, da, de, el, en, es, et, fi, fr, hr, hu, it, lt, lv, mt, nl, pl, pt, ro, ru, sk, sl, sv, uk.
 
 ## Usage
 
@@ -140,6 +167,7 @@ make bench-cuda    # WER + RTFx (CUTLASS backend)
 make bench-cublas  # WER + RTFx (cuBLAS backend)
 make bench-fp8     # WER + RTFx (FP8 backend)
 make bench-all     # all backends
+make bench-v3      # WER + RTFx (V3 multilingual: de/it/fr)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   C++ CUDA · paraketto_cuda.cpp + CUTLASS FP16
@@ -203,7 +231,9 @@ scripts/export_weights.py # NeMo → paraketto-fp16.bin converter
 
 ## References
 
-- [Parakeet TDT 0.6B V2](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) — NVIDIA's ASR model
+- [Parakeet TDT 0.6B V2](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) — NVIDIA's English ASR model
+- [Parakeet TDT 0.6B V3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) — NVIDIA's multilingual ASR model (25 EU languages)
+- [V3 paper](https://arxiv.org/abs/2509.14128) — Canary-1B-v2 & Parakeet-TDT-0.6B-v3
 - [TDT paper](https://arxiv.org/abs/2304.06795) — Token-and-Duration Transducer (ICML 2023)
 - [FastConformer paper](https://arxiv.org/abs/2305.05084) — encoder architecture
 - [CUTLASS](https://github.com/NVIDIA/cutlass) — CUDA Templates for Linear Algebra Subroutines
