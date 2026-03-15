@@ -1,16 +1,16 @@
-// vocab.h — Vocabulary and detokenize for Parakeet TDT 0.6B V2 (header-only)
+// vocab.h — Vocabulary for Parakeet TDT models (header-only)
 #pragma once
 
 #include <string>
 #include <vector>
 
 // ---------------------------------------------------------------------------
-// Vocabulary (1025 BPE tokens, blank=1024)
+// V2 Vocabulary (1025 BPE tokens, blank=1024)
 // From istupakov/parakeet-tdt-0.6b-v2-onnx on HuggingFace (vocab.txt).
 // The U+2581 separator is pre-converted to ASCII space.
 // ---------------------------------------------------------------------------
 
-static const char* const VOCAB[] = {
+static const char* const VOCAB_V2[] = {
     "<unk>"," t"," th"," a","in"," the","re"," w"," o"," s","at","ou","er","nd"," i"," b",
     " c","on"," h","ing"," to"," m","en"," f"," p","an"," d","es","or","ll"," of"," and",
     " y"," l"," I","it"," in","is","ed"," g"," you","ar"," that","om","as"," n","ve",
@@ -103,14 +103,19 @@ static const char* const VOCAB[] = {
     "\xc4\x97","\xc5\xa0","\xc5\xba","\xce\x9a","\xce\xa8","\xce\xac","\xce\xbe",
     "\xce\xbf","<blk>"
 };
-static constexpr int VOCAB_SIZE = 1025;
-static constexpr int BLANK_ID = 1024;
+// ---------------------------------------------------------------------------
+// V3 Vocabulary placeholder (8193 multilingual BPE tokens, blank=8192)
+// TODO: Generate from istupakov/parakeet-tdt-0.6b-v3-onnx vocab.txt
+// ---------------------------------------------------------------------------
 
-static std::string detokenize(const std::vector<int>& ids) {
+// Detokenize: join token strings, trim leading space.
+// vocab_arr/vocab_size are selected at runtime based on model version.
+static std::string detokenize(const std::vector<int>& ids,
+                              const char* const* vocab_arr, int vocab_size) {
     std::string text;
     for (int id : ids)
-        if (id >= 0 && id < VOCAB_SIZE)
-            text += VOCAB[id];
+        if (id >= 0 && id < vocab_size)
+            text += vocab_arr[id];
     size_t start = text.find_first_not_of(' ');
     return (start == std::string::npos) ? "" : text.substr(start);
 }

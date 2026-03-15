@@ -95,7 +95,7 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames)
         (size_t)D_PRED, (size_t)D_PRED,         // lstm_c_out[0], lstm_c_out[1]
         (size_t)(T_max * D_JOINT),              // enc_proj_all
         (size_t)D_JOINT, (size_t)D_JOINT,       // dec_proj_buf, joint_act
-        (size_t)D_OUTPUT,                       // joint_out
+        (size_t)w->config.d_output,             // joint_out
         (size_t)(4 * D_PRED * 2 * D_PRED),     // lstm_combined_w[0]
         (size_t)(4 * D_PRED * 2 * D_PRED),     // lstm_combined_w[1]
         (size_t)(4 * D_PRED),                   // lstm_combined_bias[0]
@@ -462,7 +462,7 @@ half* CudaModel::decode_step(int enc_frame_idx, int prev_token) {
     half* enc_proj_t = enc_proj_all + enc_frame_idx * D_JOINT;
     gnn_b(lstm_h_out[1], 1, D_PRED, w->dec_proj_w, D_JOINT, w->dec_proj_b, dec_proj_buf);
     add_relu_fp16(enc_proj_t, dec_proj_buf, joint_act, D_JOINT, stream);
-    gnn_b(joint_act, 1, D_JOINT, w->out_proj_w, D_OUTPUT, w->out_proj_b, joint_out);
+    gnn_b(joint_act, 1, D_JOINT, w->out_proj_w, w->config.d_output, w->out_proj_b, joint_out);
 
     return joint_out;
 }

@@ -1681,3 +1681,26 @@ Pre-concatenated QKV weights (`qkv_w[24]`, each `[D_MODEL, 3*D_MODEL]`) were all
 FP8 now uses **660 MB less** than FP16 (1213 vs 1873 MB).
 
 Regression test (5 sessions × 3 runs): WER improved on 3/4 datasets (conv2d_fp16 is slightly more numerically accurate than im2col+gnn), +0.08pp on difficult. RTFx within noise.
+
+## V3 Multilingual Support: Preparing for parakeet-tdt-0.6b-v3
+
+NVIDIA's Parakeet TDT 0.6B V3 extends V2 with 25 European languages (auto-detecting language from audio). The encoder architecture is **identical** — same FastConformer-XL (d=1024, 24 blocks, 8 heads). The only structural change is the vocabulary: 8193 multilingual BPE tokens (V2 had 1025 English-only). This cascades to the joint network output dimension: D_OUTPUT goes from 1030 to 8198. Total VRAM impact: +18 MB.
+
+### Step 1: Runtime model dimensions and cleanup
+
+**Dropped static embedded build.** The `EMBEDDED_WEIGHTS` code path (baking weights into the binary via `objcopy`) added complexity for diminishing value now that auto-download works. Removed all `#ifdef EMBEDDED_WEIGHTS` guards, `Weights::from_embedded()`, the `_binary_*` extern declarations, and the `paraketto.static` / `paraketto.fp8.static` Makefile targets.
+
+**Made N_VOCAB and D_OUTPUT runtime variables.** These were `static constexpr int` constants used in ~15 locations across `weights.cpp`, `conformer.cpp`, `conformer_fp8.cpp`, and `paraketto_cuda.cpp`. Replaced with a `ModelConfig` struct on `Weights`:
+
+```cpp
+struct ModelConfig {
+    int n_vocab  = 1025;   // V2 default
+    int d_output = 1030;   // n_vocab + 5 TDT durations
+    int blank_id = 1024;   // n_vocab - 1
+    int version  = 2;      // weight file version
+};
+```
+
+`Weights::prefetch()` reads the weight file version from the header (PRKT v2 or v3) and sets the config accordingly. All downstream code — weight layout, pool sizing, FP8 quantization, FP8 save/load, greedy decode, argmax — reads from `w->config` instead of compile-time constants.
+
+**Updated detokenize to accept runtime vocab.** The `detokenize()` function now takes a vocab array pointer and size instead of using hardcoded globals, preparing for V3's 8193-token vocabulary which will be embedded alongside V2's in `vocab.h`.

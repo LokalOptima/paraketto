@@ -72,17 +72,6 @@ static void ensure_file(const std::string& path, const char* url) {
 #include "corrector.h"
 #endif
 
-#ifdef EMBEDDED_WEIGHTS
-extern "C" {
-#  ifdef PARAKETTO_FP8
-    extern const uint8_t _binary_paraketto_fp8_bin_start[];
-    extern const uint8_t _binary_paraketto_fp8_bin_end[];
-#  else
-    extern const uint8_t _binary_paraketto_fp16_bin_start[];
-    extern const uint8_t _binary_paraketto_fp16_bin_end[];
-#  endif
-}
-#endif
 
 // ---------------------------------------------------------------------------
 // Inference pipeline (CUDA backend)
@@ -161,8 +150,12 @@ private:
     std::string decode(int enc_len) {
         cuda_model.decoder_reset();
 
+        const int blank_id = weights.config.blank_id;
+        const int n_vocab  = weights.config.n_vocab;
+        const int d_output = weights.config.d_output;
+
         std::vector<int> tokens;
-        int last_token = BLANK_ID;
+        int last_token = blank_id;
         int t = 0, emitted = 0;
 
         // Host buffer for argmax results (just 2 ints: token, step)
@@ -173,7 +166,7 @@ private:
 
             // GPU argmax: finds token and step on device, transfers just 2 ints
             dual_argmax_fp16(joint_out, cuda_model.argmax_out,
-                              VOCAB_SIZE, D_OUTPUT, stream);
+                              n_vocab, d_output, stream);
             CUDA_CHECK(cudaMemcpyAsync(argmax_host, cuda_model.argmax_out,
                                         2 * sizeof(int),
                                         cudaMemcpyDeviceToHost, stream));
@@ -182,7 +175,7 @@ private:
             int token = argmax_host[0];
             int step = argmax_host[1];
 
-            if (token != BLANK_ID) {
+            if (token != blank_id) {
                 cuda_model.decoder_commit();
                 tokens.push_back(token);
                 last_token = token;
@@ -190,10 +183,10 @@ private:
             }
 
             if (step > 0) { t += step; emitted = 0; }
-            else if (token == BLANK_ID || emitted >= 10) { t++; emitted = 0; }
+            else if (token == blank_id || emitted >= 10) { t++; emitted = 0; }
         }
 
-        return detokenize(tokens);
+        return detokenize(tokens, VOCAB_V2, weights.config.n_vocab);
     }
 };
 
@@ -280,16 +273,13 @@ int main(int argc, char** argv) {
     using clk = std::chrono::high_resolution_clock;
     auto t_main_start = clk::now();
 
-#ifndef EMBEDDED_WEIGHTS
     if (!custom_weights) {
-#  ifdef PARAKETTO_FP8
+#ifdef PARAKETTO_FP8
         ensure_file(weights_path, "https://huggingface.co/localoptima/paraketto/resolve/main/paraketto-fp8.bin");
-        // FP16 weights needed only for first-run quantization (if fp8 file is missing/invalid)
-#  else
+#else
         ensure_file(weights_path, "https://huggingface.co/localoptima/paraketto/resolve/main/paraketto-fp16.bin");
-#  endif
-    }
 #endif
+    }
 
     Weights prefetched;
     std::thread prefetch_thread;
@@ -301,7 +291,7 @@ int main(int argc, char** argv) {
     std::string fp8_path_for_init;
     void* fp8_prefetch_ptr = nullptr;
     size_t fp8_prefetch_size = 0;
-#if defined(PARAKETTO_FP8) && !defined(EMBEDDED_WEIGHTS)
+#ifdef PARAKETTO_FP8
     {
         int fd = open(weights_path.c_str(), O_RDONLY);
         if (fd >= 0) {
@@ -321,18 +311,9 @@ int main(int argc, char** argv) {
     }
 #endif
 
-#ifdef EMBEDDED_WEIGHTS
-#  ifdef PARAKETTO_FP8
-    fp8_path_for_init = "embedded";  // FP8 static: paraketto-fp8.bin is embedded
-    prefetched = Weights{};          // allocate_only() computes layout from constants
-#  else
-    prefetched = Weights::from_embedded(_binary_paraketto_fp16_bin_start,
-        _binary_paraketto_fp16_bin_end - _binary_paraketto_fp16_bin_start);
-#  endif
-#else
     // Prefetch in background while CUDA context inits.
     prefetch_thread = std::thread([&]() {
-#  ifdef PARAKETTO_FP8
+#ifdef PARAKETTO_FP8
         if (fp8_path_for_init.empty()) {
             prefetched = Weights::prefetch(fp16_path);  // need FP16 data for quantization
         } else {
@@ -352,11 +333,10 @@ int main(int argc, char** argv) {
                 }
             }
         }
-#  else
+#else
         prefetched = Weights::prefetch(weights_path);
-#  endif
-    });
 #endif
+    });
 
     // Force eager CUDA context initialization (overlaps with weight prefetch)
     cudaFree(0);

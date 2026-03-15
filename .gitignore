@@ -66,5 +66,11 @@ bench-data.tar.gz
 # CUDA/driver logs
 cufile.log
 
+# Scratch (one-off experiments, working notes)
+scratch/
+
+# Benchmark baselines (generated, machine-specific)
+baseline_*.json
+
 # Agent workspace
 .claude/

@@ -12,7 +12,6 @@ Speech-to-text inference for NVIDIA's [Parakeet TDT 0.6B V2](https://huggingface
 - Low VRAM: 1.8 GB (FP16), 1.2 GB (FP8)
 - ~240ms warm startup (FP16), ~180ms (FP8)
 - Builtin HTTP server
-- Optional static build with zero runtime files
 
 ```
 WAV (16kHz/24kHz mono) → mel spectrogram → conformer encoder → TDT greedy decoder → text
@@ -184,15 +183,6 @@ make bench-all     # all backends
 │ Total       │          │   1288x │    240 │   7236s │    5.62s │
 └─────────────┴──────────┴─────────┴────────┴─────────┴──────────┘
 ```
-
-## Static binary (no runtime files)
-
-```bash
-make paraketto.static      # embeds paraketto-fp16.bin, CUTLASS FP16
-make paraketto.fp8.static  # embeds paraketto-fp8.bin, FP8
-```
-
-Requires only the NVIDIA driver + shared CUDA/cuBLAS libraries. No weights files at runtime.
 
 ## Project structure
 

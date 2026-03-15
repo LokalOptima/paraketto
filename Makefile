@@ -172,34 +172,6 @@ paraketto.fp8: src/paraketto_cuda.cpp src/conformer_fp8.h src/conformer_fp8.o sr
 repack: $(WEIGHTS)
 	uv run python scripts/repack_weights.py
 
-# Static build with embedded weights (single file, only needs NVIDIA driver)
-weights_embedded.o: $(WEIGHTS)
-	objcopy -I binary -O elf64-x86-64 -B i386:x86-64 \
-		--rename-section .data=.rodata,alloc,load,readonly,data,contents \
-		$< $@
-
-weights_fp8_embedded.o: $(WEIGHTS_FP8)
-	objcopy -I binary -O elf64-x86-64 -B i386:x86-64 \
-		--rename-section .data=.rodata,alloc,load,readonly,data,contents \
-		$< $@
-
-paraketto.static: $(CONFORMER_DEPS) src/kernels.o src/cutlass_gemm.o src/cutlass_gemm.h weights_embedded.o
-	$(CXX) $(CUDA_CXXFLAGS) -DEMBEDDED_WEIGHTS \
-		src/paraketto_cuda.cpp src/conformer.cpp src/kernels.o src/cutlass_gemm.o weights_embedded.o \
-		-static-libstdc++ -static-libgcc \
-		-L$(CUDA_HOME)/lib64 $(CUDA_HOME)/lib64/libcudart_static.a -ldl -lpthread -lrt \
-		-o $@
-
-# FP8 static: embeds only paraketto-fp8.bin — no paraketto-fp16.bin needed at runtime
-paraketto.fp8.static: src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o weights_fp8_embedded.o $(SHARED_HEADERS) src/conformer_fp8.h
-	$(CXX) $(CUDA_CXXFLAGS) -DEMBEDDED_WEIGHTS -include src/conformer_fp8.h \
-		src/paraketto_cuda.cpp src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o \
-		weights_fp8_embedded.o \
-		-static-libstdc++ -static-libgcc \
-		-L$(CUDA_HOME)/lib64 $(CUDA_HOME)/lib64/libcudart_static.a -ldl -lpthread -lrt \
-		-lcublas -lcublasLt \
-		-o $@
-
 bench_gemm: tests/bench_gemm.cu
 	$(NVCC) $(NVFLAGS) -arch=sm_120 $(CUTLASS_INC) tests/bench_gemm.cu -lcublas -lcublasLt -o $@
 
@@ -213,4 +185,4 @@ bench_ff2: tests/bench_ff2.cu
 	$(NVCC) $(NVFLAGS) -arch=sm_120 $(CUTLASS_INC) tests/bench_ff2.cu -lcublas -lcublasLt -o $@
 
 clean:
-	rm -f paraketto.cuda paraketto.cublas paraketto.fp8 paraketto.static paraketto.fp8.static src/kernels.o src/kernels_fp8.o src/cutlass_gemm.o src/cublas_gemm.o src/weights.o src/conformer_fp8.o src/corrector.o weights_embedded.o weights_fp8_embedded.o
+	rm -f paraketto.cuda paraketto.cublas paraketto.fp8 src/kernels.o src/kernels_fp8.o src/cutlass_gemm.o src/cublas_gemm.o src/weights.o src/conformer_fp8.o src/corrector.o

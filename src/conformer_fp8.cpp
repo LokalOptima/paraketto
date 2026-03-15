@@ -26,13 +26,6 @@
 
 // Weight loading is in weights.cpp (shared with FP16 backends).
 
-#ifdef EMBEDDED_WEIGHTS
-extern "C" {
-    extern const uint8_t _binary_paraketto_fp8_bin_start[];
-    extern const uint8_t _binary_paraketto_fp8_bin_end[];
-}
-#endif
-
 // =========================================================================
 // CudaModel — encoder + decoder forward pass
 // =========================================================================
@@ -129,7 +122,7 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames,
         (size_t)D_PRED, (size_t)D_PRED,         // lstm_c_out[0], lstm_c_out[1]
         (size_t)(T_max * D_JOINT),              // enc_proj_all
         (size_t)D_JOINT, (size_t)D_JOINT,       // dec_proj_buf, joint_act
-        (size_t)D_OUTPUT,                       // joint_out
+        (size_t)w->config.d_output,             // joint_out
         (size_t)(4 * D_PRED * 2 * D_PRED),     // lstm_combined_w[0]
         (size_t)(4 * D_PRED * 2 * D_PRED),     // lstm_combined_w[1]
         (size_t)(4 * D_PRED),                   // lstm_combined_bias[0]
@@ -242,7 +235,7 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames,
                          + (size_t)D_MODEL * D_JOINT              // enc_proj_w
                          + (size_t)4 * D_PRED * 2 * D_PRED * 2   // lstm_combined_w[0,1]
                          + (size_t)D_PRED * D_JOINT               // dec_proj_w
-                         + (size_t)D_JOINT * D_OUTPUT;            // out_proj_w
+                         + (size_t)D_JOINT * w->config.d_output;  // out_proj_w
         // Add alignment padding (256 per weight) + scales + act buffer
         int n_fp8_ptrs = N_BLOCKS * 9 + 6;
         size_t fp8_pool_bytes = fp8_total + (size_t)n_fp8_ptrs * 256
@@ -278,7 +271,7 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames,
         fp8_lstm_combined_w[0] = take8(4 * D_PRED * 2 * D_PRED);
         fp8_lstm_combined_w[1] = take8(4 * D_PRED * 2 * D_PRED);
         fp8_dec_proj_w       = take8(D_PRED * D_JOINT);
-        fp8_out_proj_w       = take8(D_JOINT * D_OUTPUT);
+        fp8_out_proj_w       = take8(D_JOINT * w->config.d_output);
 
         // Scales array
         fp8p = (char*)(((uintptr_t)fp8p + 255) & ~(uintptr_t)255);
@@ -347,16 +340,16 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames,
                 save16(blk.ff2_ln_w,   D_MODEL); save16(blk.ff2_ln_b,   D_MODEL);
                 save16(blk.final_ln_w, D_MODEL); save16(blk.final_ln_b, D_MODEL);
             }
-            save16(weights.embed_w,       (size_t)N_VOCAB * D_PRED);
+            save16(weights.embed_w,       (size_t)w->config.n_vocab * D_PRED);
             save16(lstm_combined_w[0],    (size_t)4 * D_PRED * 2 * D_PRED);
             save16(lstm_combined_w[1],    (size_t)4 * D_PRED * 2 * D_PRED);
             save16(lstm_combined_bias[0], 4 * D_PRED);
             save16(lstm_combined_bias[1], 4 * D_PRED);
             save16(weights.dec_proj_w,    (size_t)D_PRED  * D_JOINT);
-            save16(weights.out_proj_w,    (size_t)D_JOINT * D_OUTPUT);
+            save16(weights.out_proj_w,    (size_t)D_JOINT * w->config.d_output);
             save16(weights.enc_proj_b,    D_JOINT);
             save16(weights.dec_proj_b,    D_JOINT);
-            save16(weights.out_proj_b,    D_OUTPUT);
+            save16(weights.out_proj_b,    w->config.d_output);
 
             // Create parent directory (path may be in ~/.cache/paraketto/)
             {
@@ -391,10 +384,6 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames,
             size_t map_size = 0;
             void* mmap_ptr = nullptr;  // only set if we did our own mmap (need to munmap)
 
-#ifdef EMBEDDED_WEIGHTS
-            base     = _binary_paraketto_fp8_bin_start;
-            map_size = (size_t)(_binary_paraketto_fp8_bin_end - _binary_paraketto_fp8_bin_start);
-#else
             if (fp8_prefetch) {
                 // Use pre-populated mapping from background prefetch thread
                 base = (const uint8_t*)fp8_prefetch;
@@ -410,7 +399,6 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames,
                 madvise(mmap_ptr, map_size, MADV_SEQUENTIAL);
                 base = (const uint8_t*)mmap_ptr;
             }
-#endif
 
             // Validate header (16 bytes: magic + version + pad)
             if (map_size < FP8_WEIGHTS_HEADER
@@ -459,16 +447,16 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames,
                 ul16(blk.ff2_ln_w,   D_MODEL); ul16(blk.ff2_ln_b,   D_MODEL);
                 ul16(blk.final_ln_w, D_MODEL); ul16(blk.final_ln_b, D_MODEL);
             }
-            ul16(weights.embed_w,       (size_t)N_VOCAB * D_PRED);
+            ul16(weights.embed_w,       (size_t)w->config.n_vocab * D_PRED);
             ul16(lstm_combined_w[0],    (size_t)4 * D_PRED * 2 * D_PRED);
             ul16(lstm_combined_w[1],    (size_t)4 * D_PRED * 2 * D_PRED);
             ul16(lstm_combined_bias[0], 4 * D_PRED);
             ul16(lstm_combined_bias[1], 4 * D_PRED);
             ul16(weights.dec_proj_w,    (size_t)D_PRED  * D_JOINT);
-            ul16(weights.out_proj_w,    (size_t)D_JOINT * D_OUTPUT);
+            ul16(weights.out_proj_w,    (size_t)D_JOINT * w->config.d_output);
             ul16(weights.enc_proj_b,    D_JOINT);
             ul16(weights.dec_proj_b,    D_JOINT);
-            ul16(weights.out_proj_b,    D_OUTPUT);
+            ul16(weights.out_proj_b,    w->config.d_output);
 
             CUDA_CHECK(cudaStreamSynchronize(stream));
             if (mmap_ptr) munmap(mmap_ptr, map_size);
@@ -551,7 +539,7 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames,
             quantize_absmax_fp16_to_fp8(lstm_combined_w[0], fp8_lstm_combined_w[0], &fp8_scales[si++], (size_t)4 * D_PRED * 2 * D_PRED, fp8_amax_buf, stream);
             quantize_absmax_fp16_to_fp8(lstm_combined_w[1], fp8_lstm_combined_w[1], &fp8_scales[si++], (size_t)4 * D_PRED * 2 * D_PRED, fp8_amax_buf, stream);
             quantize_absmax_fp16_to_fp8(weights.dec_proj_w, fp8_dec_proj_w, &fp8_scales[si++], (size_t)D_PRED  * D_JOINT,           fp8_amax_buf, stream);
-            quantize_absmax_fp16_to_fp8(weights.out_proj_w, fp8_out_proj_w, &fp8_scales[si++], (size_t)D_JOINT * D_OUTPUT,          fp8_amax_buf, stream);
+            quantize_absmax_fp16_to_fp8(weights.out_proj_w, fp8_out_proj_w, &fp8_scales[si++], (size_t)D_JOINT * w->config.d_output, fp8_amax_buf, stream);
             assert(si == N_FP8_SCALES);
 
             if (fp8_path) fp8_save(fp8_path);
@@ -1247,7 +1235,7 @@ half* CudaModel::decode_step(int enc_frame_idx, int prev_token) {
     half* enc_proj_t = enc_proj_all + enc_frame_idx * D_JOINT;
     gnn_b(lstm_h_out[1], 1, D_PRED, w->dec_proj_w, D_JOINT, w->dec_proj_b, dec_proj_buf);
     add_relu_fp16(enc_proj_t, dec_proj_buf, joint_act, D_JOINT, stream);
-    gnn_b(joint_act, 1, D_JOINT, w->out_proj_w, D_OUTPUT, w->out_proj_b, joint_out);
+    gnn_b(joint_act, 1, D_JOINT, w->out_proj_w, w->config.d_output, w->out_proj_b, joint_out);
 
     return joint_out;
 }

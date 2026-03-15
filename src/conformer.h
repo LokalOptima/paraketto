@@ -43,9 +43,20 @@ static constexpr int D_CONV_PW  = 2048;
 static constexpr int CONV_K     = 9;
 static constexpr int SUB_CHANNELS = 256;
 static constexpr int D_PRED     = 640;   // decoder hidden dim
-static constexpr int N_VOCAB    = 1025;  // vocab size (0..1024)
 static constexpr int D_JOINT    = 640;
-static constexpr int D_OUTPUT   = 1030;  // joint output (vocab + durations)
+
+// V2 defaults — used as compile-time constants where safe, overridden at
+// runtime for V3 via ModelConfig (larger vocab).
+static constexpr int N_VOCAB_V2  = 1025;  // vocab size (0..1024)
+static constexpr int D_OUTPUT_V2 = 1030;  // joint output (vocab + durations)
+
+// Runtime model configuration (set from weight file header)
+struct ModelConfig {
+    int n_vocab  = N_VOCAB_V2;     // 1025 (v2) or 8193 (v3)
+    int d_output = D_OUTPUT_V2;    // n_vocab + 5 TDT durations
+    int blank_id = N_VOCAB_V2 - 1; // n_vocab - 1
+    int version  = 2;              // weight file version
+};
 
 // ---------------------------------------------------------------------------
 // Weights struct — all model weight pointers into a single GPU allocation
@@ -77,11 +88,11 @@ static constexpr int D_OUTPUT   = 1030;  // joint output (vocab + durations)
 struct Weights {
     void* gpu_data = nullptr;
     size_t gpu_data_size = 0;
+    ModelConfig config;
 
     // Prefetch state (temporary — cleared after upload)
     void*          mmap_ptr     = nullptr;
     size_t         mmap_size    = 0;
-    const uint8_t* embedded_ptr = nullptr;
 
     // ---------------------------------------------------------------------------
     // Subsampling (pre_encode)
@@ -150,10 +161,7 @@ struct Weights {
     /// populate=false skips MAP_POPULATE (FP8 path: only GPU layout needed).
     static Weights prefetch(const std::string& path, bool populate = true);
 
-    /// Embedded variant: point at in-memory data (no mmap).
-    static Weights from_embedded(const uint8_t* data, size_t size);
-
-    /// Upload prefetched/embedded data to GPU, assign weight pointers.
+    /// Upload prefetched data to GPU, assign weight pointers.
     void upload(cudaStream_t stream = nullptr);
 
     /// FP8 first-run: full layout cudaMalloc + assign pointers (no data upload).

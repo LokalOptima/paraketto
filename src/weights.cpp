@@ -85,21 +85,21 @@ static size_t assign_weight_pointers(Weights& w) {
     }
 
     // --- Decoder ---
-    take(w.embed_w,    (size_t)N_VOCAB * D_PRED);        // [1025, 640]
-    take(w.lstm0_w_ih, (size_t)4 * D_PRED * D_PRED);    // [1, 2560, 640]
+    take(w.embed_w,    (size_t)w.config.n_vocab * D_PRED);  // [N_VOCAB, 640]
+    take(w.lstm0_w_ih, (size_t)4 * D_PRED * D_PRED);        // [1, 2560, 640]
     take(w.lstm0_w_hh, (size_t)4 * D_PRED * D_PRED);
-    take(w.lstm0_bias,  8 * D_PRED);                     // [1, 5120] = b_ih||b_hh
+    take(w.lstm0_bias,  8 * D_PRED);                         // [1, 5120] = b_ih||b_hh
     take(w.lstm1_w_ih, (size_t)4 * D_PRED * D_PRED);
     take(w.lstm1_w_hh, (size_t)4 * D_PRED * D_PRED);
     take(w.lstm1_bias,  8 * D_PRED);
 
     // --- Joint network ---
-    take(w.enc_proj_w, (size_t)D_MODEL * D_JOINT);   // [1024, 640]
+    take(w.enc_proj_w, (size_t)D_MODEL * D_JOINT);          // [1024, 640]
     take(w.enc_proj_b, D_JOINT);
-    take(w.dec_proj_w, (size_t)D_PRED  * D_JOINT);   // [640, 640]
+    take(w.dec_proj_w, (size_t)D_PRED  * D_JOINT);          // [640, 640]
     take(w.dec_proj_b, D_JOINT);
-    take(w.out_proj_w, (size_t)D_JOINT * D_OUTPUT);  // [640, 1030]
-    take(w.out_proj_b, D_OUTPUT);
+    take(w.out_proj_w, (size_t)D_JOINT * w.config.d_output); // [640, D_OUTPUT]
+    take(w.out_proj_b, w.config.d_output);
 
     off = (off + 255) & ~(size_t)255;
     return off;
@@ -134,11 +134,19 @@ Weights Weights::prefetch(const std::string& path, bool populate) {
     uint32_t magic, version;
     memcpy(&magic,   base,     4);
     memcpy(&version, base + 4, 4);
-    if (magic != WEIGHTS_MAGIC || version != WEIGHTS_VERSION) {
-        fprintf(stderr, "Bad weights file %s (magic=0x%08x version=%u, expected magic=0x%08x version=%u)\n",
-                path.c_str(), magic, version, WEIGHTS_MAGIC, WEIGHTS_VERSION);
+    if (magic != WEIGHTS_MAGIC || (version != 2 && version != 3)) {
+        fprintf(stderr, "Bad weights file %s (magic=0x%08x version=%u, expected PRKT v2 or v3)\n",
+                path.c_str(), magic, version);
         munmap(mapped, file_size);
         std::exit(1);
+    }
+
+    // Set model config from weight file version
+    w.config.version = (int)version;
+    if (version == 3) {
+        w.config.n_vocab  = 8193;  // multilingual SentencePiece + blank
+        w.config.d_output = 8198;  // n_vocab + 5 TDT durations
+        w.config.blank_id = 8192;
     }
 
     w.mmap_ptr  = mapped;
@@ -147,31 +155,11 @@ Weights Weights::prefetch(const std::string& path, bool populate) {
 }
 
 // ---------------------------------------------------------------------------
-// Weights::from_embedded — point at in-memory data (static binary)
-// ---------------------------------------------------------------------------
-
-Weights Weights::from_embedded(const uint8_t* data, size_t size) {
-    Weights w;
-    // Validate header
-    uint32_t magic, version;
-    memcpy(&magic,   data,     4);
-    memcpy(&version, data + 4, 4);
-    if (magic != WEIGHTS_MAGIC || version != WEIGHTS_VERSION) {
-        fprintf(stderr, "Bad embedded weights (magic=0x%08x version=%u)\n", magic, version);
-        std::exit(1);
-    }
-    w.embedded_ptr = data;
-    w.mmap_size    = size;
-    return w;
-}
-
-// ---------------------------------------------------------------------------
-// Weights::upload — cudaMalloc + copy from prefetched/embedded data
+// Weights::upload — cudaMalloc + copy from prefetched data
 // ---------------------------------------------------------------------------
 
 void Weights::upload(cudaStream_t stream) {
-    const uint8_t* src = embedded_ptr ? embedded_ptr : (const uint8_t*)mmap_ptr;
-    const uint8_t* data = src + WEIGHTS_HEADER;  // skip 8-byte header
+    const uint8_t* data = (const uint8_t*)mmap_ptr + WEIGHTS_HEADER;  // skip 8-byte header
 
     // Compute GPU allocation size from layout
     gpu_data_size = assign_weight_pointers(*this);  // gpu_data=null → compute only
@@ -199,7 +187,6 @@ void Weights::upload(cudaStream_t stream) {
         mmap_ptr  = nullptr;
         mmap_size = 0;
     }
-    embedded_ptr = nullptr;
 
     assign_weight_pointers(*this);  // assign real pointers into gpu_data
 }
@@ -217,7 +204,6 @@ void Weights::allocate_only() {
         mmap_ptr  = nullptr;
         mmap_size = 0;
     }
-    embedded_ptr = nullptr;
 
     assign_weight_pointers(*this);  // assign pointers into gpu_data
 }
@@ -265,11 +251,11 @@ static size_t assign_nongemm_weight_pointers(Weights& w) {
     }
 
     // Decoder weights (FP16 GEMMs — cublasLt FP8 doesn't support N=1)
-    take(w.embed_w,    (size_t)N_VOCAB * D_PRED);
+    take(w.embed_w,    (size_t)w.config.n_vocab * D_PRED);
     take(w.dec_proj_w, (size_t)D_PRED  * D_JOINT);
     take(w.dec_proj_b, D_JOINT);
-    take(w.out_proj_w, (size_t)D_JOINT * D_OUTPUT);
-    take(w.out_proj_b, D_OUTPUT);
+    take(w.out_proj_w, (size_t)D_JOINT * w.config.d_output);
+    take(w.out_proj_b, w.config.d_output);
     take(w.enc_proj_b, D_JOINT);
 
     off = (off + 255) & ~(size_t)255;
@@ -289,7 +275,6 @@ void Weights::allocate_nongemm_only() {
         mmap_ptr  = nullptr;
         mmap_size = 0;
     }
-    embedded_ptr = nullptr;
 
     assign_nongemm_weight_pointers(*this);
 }

@@ -59,9 +59,17 @@ static constexpr int D_CONV_PW  = 2048;
 static constexpr int CONV_K     = 9;
 static constexpr int SUB_CHANNELS = 256;
 static constexpr int D_PRED     = 640;
-static constexpr int N_VOCAB    = 1025;
 static constexpr int D_JOINT    = 640;
-static constexpr int D_OUTPUT   = 1030;
+
+static constexpr int N_VOCAB_V2  = 1025;
+static constexpr int D_OUTPUT_V2 = 1030;
+
+struct ModelConfig {
+    int n_vocab  = N_VOCAB_V2;
+    int d_output = D_OUTPUT_V2;
+    int blank_id = N_VOCAB_V2 - 1;
+    int version  = 2;
+};
 
 // ---------------------------------------------------------------------------
 // Weights struct
@@ -70,10 +78,10 @@ static constexpr int D_OUTPUT   = 1030;
 struct Weights {
     void* gpu_data = nullptr;
     size_t gpu_data_size = 0;
+    ModelConfig config;
 
     void*          mmap_ptr     = nullptr;
     size_t         mmap_size    = 0;
-    const uint8_t* embedded_ptr = nullptr;
 
     struct SubConv {
         half *weight = nullptr, *bias = nullptr;
@@ -121,7 +129,6 @@ struct Weights {
     half *out_proj_w = nullptr, *out_proj_b = nullptr;
 
     static Weights prefetch(const std::string& path, bool populate = true);
-    static Weights from_embedded(const uint8_t* data, size_t size);
     void upload(cudaStream_t stream = nullptr);
     void allocate_only();
     void allocate_nongemm_only();
@@ -209,7 +216,6 @@ struct CudaModel {
     size_t           lt_workspace_size = 0;
 
     /// fp8_path: path to paraketto-fp8.bin (load if exists, save after quantization).
-    /// Pass "embedded" when paraketto-fp8.bin is compiled in (EMBEDDED_WEIGHTS build).
     /// fp8_prefetch: pre-populated mmap of paraketto-fp8.bin (from background prefetch thread).
     void init(const Weights& weights, cudaStream_t s, int max_mel_frames,
               const char* fp8_path = nullptr,
