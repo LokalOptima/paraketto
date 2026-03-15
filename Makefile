@@ -77,7 +77,15 @@ data/librispeech/manifest.json:
 		rm bench-data.tar.gz && \
 		echo "Downloaded $$(find data/ -name '*.wav' | wc -l) wav files"
 
+data/german/manifest.json:
+	@echo "Downloading V3 benchmark data..."
+	@wget -q --show-progress -O bench-data-v3.tar.gz $(HF_BASE)/bench-data-v3.tar.gz && \
+		tar xzf bench-data-v3.tar.gz && \
+		rm bench-data-v3.tar.gz && \
+		echo "Downloaded $$(find data/german data/italian data/french -name '*.wav' | wc -l) wav files"
+
 download-data: data/librispeech/manifest.json
+download-data-v3: data/german/manifest.json
 
 # Download weights from HuggingFace
 $(WEIGHTS):
@@ -118,7 +126,7 @@ bench-fp8: paraketto.fp8 data/librispeech/manifest.json $(WEIGHTS_FP8) check-wei
 bench-corrector: paraketto.fp8 data/librispeech/manifest.json $(WEIGHTS_FP8)
 	uv run python tests/bench_corrector.py paraketto.fp8
 
-bench-v3: paraketto.fp8
+bench-v3: paraketto.fp8 data/german/manifest.json
 	uv run python tests/test_v3_multilingual.py paraketto.fp8
 
 # Re-generate weights from ONNX (only needed if export script changes)
