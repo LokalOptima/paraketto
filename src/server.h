@@ -77,35 +77,47 @@ static void run_server(PipelineT& pipeline, const std::string& host, int port) {
 <title>paraketto</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: system-ui, -apple-system, sans-serif; background: #0a0a0a; color: #e0e0e0;
-         display: flex; justify-content: center; padding: 2rem; min-height: 100vh; }
-  .container { width: 100%; max-width: 640px; }
-  h1 { font-size: 1.3rem; font-weight: 600; margin-bottom: 0.3rem; color: #fff; }
-  .subtitle { font-size: 0.85rem; color: #666; margin-bottom: 1.5rem; }
-  .toprow { display: flex; gap: 10px; align-items: stretch; }
-  .drop-zone { flex: 1; border: 1px dashed #333; border-radius: 8px; padding: 12px 16px;
-               text-align: center; cursor: pointer; transition: all 0.2s;
-               display: flex; align-items: center; justify-content: center; gap: 8px; }
-  .drop-zone:hover, .drop-zone.dragover { border-color: #2563eb; background: #0d1117; }
-  .drop-zone p { color: #666; font-size: 0.8rem; }
-  button { background: #1a1a1a; color: #e0e0e0; border: 1px solid #333; border-radius: 8px;
-           padding: 10px 20px; font-size: 0.9rem; font-weight: 500; cursor: pointer;
-           transition: all 0.15s; display: flex; align-items: center; gap: 6px;
-           white-space: nowrap; }
-  button:hover { background: #222; border-color: #555; }
-  button.recording { background: #7f1d1d; border-color: #dc2626; color: #fca5a5; }
-  button:disabled { opacity: 0.4; cursor: default; }
-  .result { margin-top: 16px; display: none; }
+  body { font-family: 'Inter', system-ui, -apple-system, sans-serif; background: #09090b;
+         color: #e0e0e0; display: flex; justify-content: center; padding: 3rem 1.5rem;
+         min-height: 100vh; }
+  .container { width: 100%; max-width: 580px; }
+  header { text-align: center; margin-bottom: 2rem; }
+  header h1 { font-size: 1.5rem; font-weight: 700; color: #fff; letter-spacing: -0.02em; }
+  header p { font-size: 0.82rem; color: #52525b; margin-top: 2px; }
+  .rec-area { display: flex; flex-direction: column; align-items: center; gap: 12px; }
+  #recbtn { width: 72px; height: 72px; border-radius: 50%; border: 2px solid #27272a;
+            background: #18181b; cursor: pointer; display: flex; align-items: center;
+            justify-content: center; transition: all 0.2s; padding: 0; }
+  #recbtn:hover { border-color: #3f3f46; background: #1c1c1f; transform: scale(1.05); }
+  #recbtn.recording { border-color: #dc2626; background: #1c1017;
+                      animation: pulse 1.5s ease-in-out infinite; }
+  #recbtn .mic { width: 28px; height: 28px; fill: #a1a1aa; transition: fill 0.2s; }
+  #recbtn:hover .mic { fill: #d4d4d8; }
+  #recbtn.recording .mic { fill: #f87171; }
+  #recbtn .stop { width: 22px; height: 22px; fill: #f87171; display: none; }
+  #recbtn.recording .mic { display: none; }
+  #recbtn.recording .stop { display: block; }
+  @keyframes pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(220,38,38,0.3); }
+                     50% { box-shadow: 0 0 0 12px rgba(220,38,38,0); } }
+  .rec-hint { font-size: 0.78rem; color: #3f3f46; }
+  .divider { display: flex; align-items: center; gap: 12px; margin: 20px 0;
+             color: #27272a; font-size: 0.75rem; }
+  .divider::before, .divider::after { content: ''; flex: 1; height: 1px; background: #1c1c1f; }
+  .drop-zone { border: 1px dashed #27272a; border-radius: 10px; padding: 14px;
+               text-align: center; cursor: pointer; transition: all 0.2s; }
+  .drop-zone:hover, .drop-zone.dragover { border-color: #3f3f46; background: #0f0f11; }
+  .drop-zone p { color: #3f3f46; font-size: 0.82rem; }
+  .result { margin-top: 24px; display: none; }
   .result.visible { display: block; }
-  .transcript { background: #111; border: 1px solid #222; border-radius: 10px;
-                padding: 16px 20px; font-size: 1.05rem; line-height: 1.6;
-                color: #f0f0f0; min-height: 60px; white-space: pre-wrap; }
-  .transcript.live { color: #888; border-color: #1a1a1a; }
-  .meta { display: flex; gap: 16px; margin-top: 8px; flex-wrap: wrap; }
-  .meta span { font-size: 0.78rem; color: #555; font-variant-numeric: tabular-nums; }
-  .meta .val { color: #888; }
-  .spinner { display: none; margin: 16px auto; width: 20px; height: 20px;
-             border: 2px solid #333; border-top-color: #2563eb; border-radius: 50%;
+  .transcript { background: #0f0f11; border: 1px solid #1c1c1f; border-radius: 12px;
+                padding: 20px; font-size: 1.05rem; line-height: 1.7;
+                color: #f4f4f5; min-height: 60px; white-space: pre-wrap; }
+  .transcript.live { color: #71717a; border-style: dashed; }
+  .meta { display: flex; gap: 16px; margin-top: 10px; flex-wrap: wrap; }
+  .meta span { font-size: 0.75rem; color: #3f3f46; font-variant-numeric: tabular-nums; }
+  .meta .val { color: #71717a; }
+  .spinner { display: none; margin: 20px auto; width: 20px; height: 20px;
+             border: 2px solid #27272a; border-top-color: #71717a; border-radius: 50%;
              animation: spin 0.6s linear infinite; }
   .spinner.visible { display: block; }
   @keyframes spin { to { transform: rotate(360deg); } }
@@ -114,21 +126,23 @@ static void run_server(PipelineT& pipeline, const std::string& host, int port) {
 </head>
 <body>
 <div class="container">
-  <h1>paraketto</h1>
-  <p class="subtitle">speech-to-text</p>
+  <header>
+    <h1>parakettő</h1>
+    <p>speech-to-text</p>
+  </header>
 
-  <div class="toprow">
+  <div class="rec-area">
     <button id="recbtn" onclick="toggleRecord()">
-      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
-        <circle cx="8" cy="5" r="3.5"/>
-        <path d="M3 5a5 5 0 0010 0M5 10v1a3 3 0 006 0v-1M8 13v2M6 15h4" fill="none"
-              stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
-      </svg>
-      Record
+      <svg class="mic" viewBox="0 0 24 24"><path d="M12 1a4 4 0 00-4 4v6a4 4 0 008 0V5a4 4 0 00-4-4z"/><path d="M6 11a6 6 0 0012 0" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><line x1="12" y1="17" x2="12" y2="21" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><line x1="9" y1="21" x2="15" y2="21" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+      <svg class="stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
     </button>
-    <div class="drop-zone" id="dropzone">
-      <p>or drop / click to upload audio</p>
-    </div>
+    <div class="rec-hint">click to record</div>
+  </div>
+
+  <div class="divider">or</div>
+
+  <div class="drop-zone" id="dropzone">
+    <p>drop or click to upload an audio file</p>
   </div>
   <input type="file" id="fileinput" accept="audio/*">
 
@@ -197,7 +211,6 @@ async function toggleRecord() {
   previewSeq = 0;
   recording = true;
   $('recbtn').classList.add('recording');
-  $('recbtn').innerHTML = stopSvg + ' Stop';
   $('transcript').textContent = '';
   $('transcript').classList.add('live');
   $('meta').innerHTML = '';
@@ -205,14 +218,15 @@ async function toggleRecord() {
   previewTimer = setInterval(sendPreview, 640);
 }
 async function sendPreview() {
-  if (!recPcm.length) return;
+  if (!recPcm.length || !recording) return;
   const seq = ++previewSeq;
   const wav = pcmToWav(recPcm);
   const fd = new FormData();
   fd.append('file', wav, 'preview.wav');
   try {
     const r = await fetch('/transcribe', { method: 'POST', body: fd });
-    if (r.ok && seq >= previewSeq) {
+    // Only update if still recording and no newer preview has been sent
+    if (r.ok && recording && seq >= previewSeq) {
       const j = await r.json();
       $('transcript').textContent = j.text || '...';
     }
@@ -221,14 +235,11 @@ async function sendPreview() {
 function stopRecord() {
   recording = false;
   clearInterval(previewTimer);
+  previewSeq = Infinity;  // invalidate any in-flight previews
   $('recbtn').classList.remove('recording');
-  $('recbtn').innerHTML = micSvg + ' Record';
   $('transcript').classList.remove('live');
   if (recPcm.length) sendFile(pcmToWav(recPcm), 'recording.wav');
 }
-const micSvg = $('recbtn').innerHTML.split('Record')[0];
-const stopSvg = '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><rect x="3" y="3" width="10" height="10" rx="2"/></svg>';
-
 // --- Transcribe (file upload or final recording) ---
 async function sendFile(file, name) {
   $('spinner').classList.add('visible');
