@@ -10,7 +10,8 @@ dependencies = [
     "requests",
     "onnx",
     "datasets>=4.6.1",
-    "torchcodec>=0.10.0",
+    # No PyPI wheels on Linux aarch64; optional for export/bench scripts on that platform.
+    "torchcodec>=0.10.0; platform_machine != 'aarch64' or sys_platform != 'linux'",
     "whisper-normalizer>=0.1.12",
     "scipy>=1.15.3",
 ]
