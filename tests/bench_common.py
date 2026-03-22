@@ -1,6 +1,7 @@
 """Shared utilities for benchmark scripts."""
 
 import json
+import os
 import signal
 import subprocess
 import sys
@@ -110,6 +111,8 @@ def bench_server(binary: Path, binary_name: str, port: int = 18080, use_correcte
     ensure_bench_data()
 
     server_url = f"http://localhost:{port}"
+    # First run downloads ~1.2GB weights; allow long startup (override with PARAKETTO_BENCH_SERVER_TIMEOUT).
+    start_timeout = float(os.environ.get("PARAKETTO_BENCH_SERVER_TIMEOUT", "900"))
 
     def transcribe(path: str) -> dict:
         with open(path, "rb") as f:
@@ -117,15 +120,18 @@ def bench_server(binary: Path, binary_name: str, port: int = 18080, use_correcte
         r.raise_for_status()
         return r.json()
 
-    def wait_for_server(timeout: float = 30) -> None:
+    def wait_for_server(timeout: float) -> None:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             ret = server.poll()
             if ret is not None:
-                err = server.stderr.read().decode() if server.stderr else ""
                 print(f"Server exited with code {ret}", file=sys.stderr)
-                if err:
-                    print(err, file=sys.stderr, end="")
+                if server.stderr:
+                    err = server.stderr.read().decode()
+                    if err:
+                        print(err, file=sys.stderr, end="")
+                else:
+                    print("(stderr was inherited — check messages above)", file=sys.stderr)
                 sys.exit(1)
             try:
                 r = requests.get(f"{server_url}/health", timeout=1)
@@ -134,15 +140,21 @@ def bench_server(binary: Path, binary_name: str, port: int = 18080, use_correcte
             except requests.ConnectionError:
                 pass
             time.sleep(0.1)
-        print("Server failed to start (timeout)", file=sys.stderr)
+        print(
+            f"Server failed to start (timeout after {timeout:.0f}s). "
+            "First run may be downloading weights to ~/.cache/paraketto — wait or run "
+            f"`make download-weights` first. Increase wait: PARAKETTO_BENCH_SERVER_TIMEOUT=1800",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
+    # Do not use stderr=PIPE: weight download (curl progress) can fill the pipe and deadlock the child.
     server = subprocess.Popen(
         [str(binary), "--server", f":{port}"],
-        stderr=subprocess.PIPE,
+        stderr=None,
     )
     try:
-        wait_for_server()
+        wait_for_server(start_timeout)
 
         # Warmup
         manifest = load_manifest(DATASETS[0])

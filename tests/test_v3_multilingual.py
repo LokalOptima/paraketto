@@ -8,6 +8,7 @@ Usage:
 """
 
 import json
+import os
 import re
 import signal
 import subprocess
@@ -82,9 +83,10 @@ def bench_v3_server(binary: Path, port: int = 18090) -> None:
                   file=sys.stderr)
             sys.exit(1)
 
+    start_timeout = float(os.environ.get("PARAKETTO_BENCH_SERVER_TIMEOUT", "900"))
     server = subprocess.Popen(
         [str(binary), "--model", "v3", "--server", f":{port}"],
-        stderr=subprocess.PIPE,
+        stderr=None,
     )
 
     def transcribe(path: str) -> dict:
@@ -94,11 +96,10 @@ def bench_v3_server(binary: Path, port: int = 18090) -> None:
         return r.json()
 
     try:
-        deadline = time.monotonic() + 30
+        deadline = time.monotonic() + start_timeout
         while time.monotonic() < deadline:
             if server.poll() is not None:
-                err = server.stderr.read().decode() if server.stderr else ""
-                print(f"Server exited: {err}", file=sys.stderr)
+                print(f"Server exited with code {server.returncode}", file=sys.stderr)
                 sys.exit(1)
             try:
                 r = requests.get(f"http://localhost:{port}/health", timeout=1)
@@ -108,7 +109,12 @@ def bench_v3_server(binary: Path, port: int = 18090) -> None:
                 pass
             time.sleep(0.1)
         else:
-            print("Server timeout", file=sys.stderr)
+            print(
+                f"Server timeout after {start_timeout:.0f}s "
+                "(first V3 run downloads weights; try `make download-weights` or raise "
+                "PARAKETTO_BENCH_SERVER_TIMEOUT)",
+                file=sys.stderr,
+            )
             sys.exit(1)
 
         # Warmup
