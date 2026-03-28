@@ -143,7 +143,7 @@ SHARED_HEADERS = src/common.h src/wav.h src/mel.h src/vocab.h src/server.h
 CUDA_CXXFLAGS = -std=c++17 -O3 -march=native -flto=auto -Wno-deprecated-declarations -I$(CUDA_HOME)/include -Ithird_party -Isrc
 CUDA_LDFLAGS  = -flto=auto -L$(CUDA_HOME)/lib64 -lcudart -lpthread
 CUTLASS_INC   = -Ithird_party/cutlass/include -Ithird_party/cutlass/tools/util/include
-src/weights.o: src/weights.cpp src/conformer.h src/common.h
+src/weights.o: src/weights.cpp src/conformer.h src/model_defs.h src/common.h
 	$(CXX) $(CUDA_CXXFLAGS) -I$(CUDA_HOME)/include -c $< -o $@
 
 ifdef WITH_CORRECTOR
@@ -151,7 +151,7 @@ src/corrector.o: src/corrector.cpp src/corrector.h $(CORRECTOR_DEP)
 	$(CXX) $(CUDA_CXXFLAGS) $(CORRECTOR_CFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 endif
 
-CONFORMER_DEPS = src/paraketto_cuda.cpp src/conformer.cpp src/conformer.h src/kernels.h src/gemm.h $(SHARED_HEADERS)
+CONFORMER_DEPS = src/paraketto_cuda.cpp src/conformer.cpp src/conformer.h src/model_defs.h src/kernels.h src/gemm.h $(SHARED_HEADERS)
 
 # CUTLASS GEMM backend (default — no cuBLAS dependency, cudart only)
 src/cutlass_gemm.o: src/cutlass_gemm.cu src/cutlass_gemm.h src/gemm.h src/kernels.h
@@ -171,10 +171,10 @@ paraketto.cublas: $(CONFORMER_DEPS) src/weights.o src/kernels.o src/cublas_gemm.
 src/kernels_fp8.o: src/kernels_fp8.cu src/kernels_fp8.h
 	$(NVCC) $(NVFLAGS) -arch=sm_120a -c $< -o $@
 
-src/conformer_fp8.o: src/conformer_fp8.cpp src/conformer_fp8.h src/conformer.h src/kernels.h src/kernels_fp8.h
+src/conformer_fp8.o: src/conformer_fp8.cpp src/conformer_fp8.h src/model_defs.h src/conformer.h src/kernels.h src/kernels_fp8.h
 	$(CXX) $(CUDA_CXXFLAGS) -I$(CUDA_HOME)/include -c $< -o $@
 
-paraketto.fp8: src/paraketto_cuda.cpp src/conformer_fp8.h src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o $(SHARED_HEADERS) $(CORRECTOR_OBJ)
+paraketto.fp8: src/paraketto_cuda.cpp src/conformer_fp8.h src/model_defs.h src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o $(SHARED_HEADERS) $(CORRECTOR_OBJ)
 	$(CXX) $(CUDA_CXXFLAGS) $(CORRECTOR_CFLAGS) -include src/conformer_fp8.h src/paraketto_cuda.cpp src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o $(CORRECTOR_OBJ) $(CUDA_LDFLAGS) -lcublas -lcublasLt $(CORRECTOR_LDFLAGS) -o $@
 
 # (paraketto-fp8.bin generation removed — paraketto.fp8 auto-downloads from HF)

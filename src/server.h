@@ -21,14 +21,23 @@
 static inline std::string json_escape(const std::string& s) {
     std::string out;
     out.reserve(s.size() + 8);
-    for (char c : s) {
+    for (unsigned char c : s) {
         switch (c) {
             case '"':  out += "\\\""; break;
             case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b";  break;
+            case '\f': out += "\\f";  break;
             case '\n': out += "\\n";  break;
             case '\r': out += "\\r";  break;
             case '\t': out += "\\t";  break;
-            default:   out += c;
+            default:
+                if (c < 0x20) {
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    out += buf;
+                } else {
+                    out += (char)c;
+                }
         }
     }
     return out;
@@ -184,20 +193,28 @@ function pcmToWav(chunks) {
   return new Blob([buf], { type: 'audio/wav' });
 }
 
-// --- Microphone: persistent stream, toggle recording on/off ---
+// --- Microphone: persistent stream via AudioWorklet, toggle recording on/off ---
 let micStream = null, micCtx = null, recording = false, recPcm = [], previewTimer = null, previewSeq = 0;
 async function initMic() {
   if (micStream) return true;
   try {
     micStream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: 16000, channelCount: 1 } });
     micCtx = new AudioContext({ sampleRate: 16000 });
+    await micCtx.audioWorklet.addModule(URL.createObjectURL(new Blob([`
+      class R extends AudioWorkletProcessor {
+        process(inputs) {
+          const ch = inputs[0]?.[0];
+          if (ch?.length) this.port.postMessage(new Float32Array(ch));
+          return true;
+        }
+      }
+      registerProcessor('rec', R);
+    `], { type: 'application/javascript' })));
     const source = micCtx.createMediaStreamSource(micStream);
-    const proc = micCtx.createScriptProcessor(4096, 1, 1);
-    proc.onaudioprocess = e => {
-      if (recording) recPcm.push(new Float32Array(e.inputBuffer.getChannelData(0)));
-    };
-    source.connect(proc);
-    proc.connect(micCtx.destination);
+    const node = new AudioWorkletNode(micCtx, 'rec');
+    node.port.onmessage = e => { if (recording) recPcm.push(e.data); };
+    source.connect(node);
+    node.connect(micCtx.destination);
     return true;
   } catch(e) {
     alert('Microphone access denied');

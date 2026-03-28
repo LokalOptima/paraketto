@@ -79,6 +79,10 @@ static void ensure_file(const std::string& path, const char* url) {
 // ---------------------------------------------------------------------------
 
 struct Pipeline {
+    Pipeline() = default;
+    Pipeline(const Pipeline&) = delete;
+    Pipeline& operator=(const Pipeline&) = delete;
+
     Weights weights;
     CudaModel cuda_model;
     MelSpec mel;

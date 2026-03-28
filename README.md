@@ -10,9 +10,10 @@ Speech-to-text inference for NVIDIA's [Parakeet TDT 0.6B](https://huggingface.co
 - Batch 1, 1200x–1400x real-time — fast on a single WAV
 - Custom CUDA/CUTLASS kernels — only `libcudart.so`
 - Optional FP8 quantization — half the weight size, ~35% less VRAM
+- Long audio support — files >120s auto-split at silence boundaries
 - Low VRAM: 1.8 GB (FP16), 1.2 GB (FP8)
 - ~240ms warm startup (FP16), ~180ms (FP8)
-- Builtin HTTP server
+- Builtin HTTP server with web UI (microphone + file upload)
 
 ```
 WAV (16kHz/24kHz mono) → mel spectrogram → conformer encoder → TDT greedy decoder → text
@@ -104,7 +105,8 @@ V3 weights: `paraketto-v3-fp16.bin` (1.2 GB) / `paraketto-v3-fp8.bin` (627 MB). 
 ### Prerequisites
 
 - Linux, NVIDIA GPU (Ampere or newer), CUDA toolkit 12+
-- `wget` (for auto-downloading weights)
+- `curl` (for auto-downloading weights at runtime)
+- `wget` (for Makefile benchmark data downloads)
 - Python 3.10+ with [uv](https://docs.astral.sh/uv/) (for benchmarks only — not needed at runtime)
 
 ### Build & run
@@ -148,10 +150,23 @@ Supports: bg, cs, da, de, el, en, es, et, fi, fr, hr, hu, it, lt, lv, mt, nl, pl
 ./paraketto.cuda --server 127.0.0.1:5001     # bind to localhost
 ```
 
-All backends support the same server mode.
+All backends support the same server mode. Open `http://localhost:8080` in a browser for a web UI with microphone recording and file upload.
+
+### LLM text correction (optional)
+
+Build with `WITH_CORRECTOR=1` to enable post-transcription text correction via an embedded LLM (OLMoE-1B-7B). Removes filler words, fixes capitalization/punctuation.
+
+```bash
+make paraketto.fp8 WITH_CORRECTOR=1    # build with llama.cpp integration
+./paraketto.fp8 --correct audio.wav    # enable correction in CLI mode
+./paraketto.fp8 --server               # correction auto-enabled in server mode
+```
+
+Requires the llama.cpp git submodule (`git submodule update --init`).
 
 ## HTTP API
 
+- `GET /` — web UI (microphone recording + file upload)
 - `GET /health` — returns `{"status":"ok"}`
 - `POST /transcribe` — multipart `file` upload, returns `{"text":"...","audio_duration_s":...,"inference_time_s":...}`
 
@@ -216,9 +231,11 @@ make bench-v3      # WER + RTFx (V3 multilingual: de/it/fr)
 
 ```
 src/paraketto_cuda.cpp    # CUDA backend main (mel, server, greedy decode)
+src/model_defs.h          # Shared model constants, config, Weights struct
+src/conformer.h           # FP16 CudaModel definition
 src/conformer.cpp         # FP16 CudaModel (CUTLASS or cuBLAS via gemm.h)
+src/conformer_fp8.h       # FP8 CudaModel (adds fp8_pool, scales, cublasLt handles)
 src/conformer_fp8.cpp     # FP8 CudaModel (cublasLt E4M3, per-tensor scaling)
-src/conformer_fp8.h       # FP8 CudaModel header (adds fp8_pool, scales, handles)
 src/weights.cpp           # Weight loading (shared by all backends)
 src/gemm.h                # Unified GEMM interface (backend selected at link time)
 src/cutlass_gemm.cu       # CUTLASS FP16 backend
@@ -226,6 +243,9 @@ src/cublas_gemm.cu        # cuBLAS FP16 backend
 src/kernels.cu            # Custom kernels: FFT, LayerNorm, SiLU, GLU, conv, LSTM, ...
 src/kernels_fp8.cu        # FP8 kernels: absmax quantize, static quantize, fused FP8 output
 src/mel.h                 # Custom 512-point FFT + mel filterbank
+src/wav.h                 # WAV file reader (16kHz/24kHz mono, int16/float32)
+src/server.h              # HTTP server + web UI (uses cpp-httplib)
+src/corrector.cpp         # Optional LLM text correction (llama.cpp integration)
 scripts/export_weights.py # NeMo → paraketto-fp16.bin converter
 ```
 

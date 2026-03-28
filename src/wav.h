@@ -100,6 +100,7 @@ static inline WavData read_wav(const std::string& path) {
     while (f) {
         char id[4]; uint32_t sz;
         if (!f.read(id, 4) || !f.read((char*)&sz, 4)) break;
+        if (sz == 0) break;  // malformed chunk
         if (!memcmp(id, "fmt ", 4)) {
             f.read((char*)&fmt.audio_format, 2); f.read((char*)&fmt.num_channels, 2);
             f.read((char*)&fmt.sample_rate, 4);
@@ -107,10 +108,12 @@ static inline WavData read_wav(const std::string& path) {
             f.read((char*)&fmt.bits_per_sample, 2);
             if (sz > 16) f.seekg(sz - 16, std::ios::cur);
         } else if (!memcmp(id, "data", 4)) {
+            if (sz > 512 * 1024 * 1024) { fprintf(stderr, "WAV data chunk too large: %u bytes\n", sz); std::exit(1); }
             fmt.data_size = sz; raw_data.resize(sz); f.read(raw_data.data(), sz);
         } else {
             f.seekg(sz, std::ios::cur);
         }
+        if (sz & 1) f.seekg(1, std::ios::cur);  // WAV chunks are padded to even byte boundaries
     }
 
     if (fmt.num_channels != 1) { fprintf(stderr, "Need mono, got %d ch\n", fmt.num_channels); std::exit(1); }
@@ -132,6 +135,7 @@ static inline WavData read_wav_from_memory(const char* buf, size_t len) {
         const char* id = buf + pos;
         uint32_t sz; memcpy(&sz, buf + pos + 4, 4);
         pos += 8;
+        if (sz == 0 || pos + sz > len + 8) break;  // malformed chunk
         if (!memcmp(id, "fmt ", 4) && pos + 16 <= len) {
             memcpy(&fmt.audio_format, buf + pos, 2);
             memcpy(&fmt.num_channels, buf + pos + 2, 2);
@@ -141,7 +145,7 @@ static inline WavData read_wav_from_memory(const char* buf, size_t len) {
             fmt.data_size = sz; fmt.data_ptr = buf + pos;
             if (pos + sz > len) fmt.data_size = len - pos;
         }
-        pos += sz;
+        pos += (sz + 1) & ~(size_t)1;  // WAV chunks are padded to even byte boundaries
     }
 
     if (!fmt.data_ptr || fmt.num_channels != 1 || (fmt.sample_rate != 16000 && fmt.sample_rate != 24000)) return {};
