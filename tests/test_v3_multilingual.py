@@ -9,18 +9,14 @@ Usage:
 
 import json
 import re
-import signal
-import subprocess
 import sys
-import time
 import unicodedata
 from pathlib import Path
 
-import requests
 from jiwer import wer as compute_wer
 from num2words import num2words
 
-from bench_common import ROOT, DATA_DIR, load_manifest, print_results
+from bench_common import ROOT, DATA_DIR, load_manifest, print_results, server_process
 
 DATASETS_V3 = ["german", "italian", "french"]
 LANG_CODES = {"german": "de", "italian": "it", "french": "fr"}
@@ -82,34 +78,12 @@ def bench_v3_server(binary: Path, port: int = 18090) -> None:
                   file=sys.stderr)
             sys.exit(1)
 
-    server = subprocess.Popen(
-        [str(binary), "--model", "v3", "--server", f":{port}"],
-        stderr=subprocess.PIPE,
-    )
-
-    def transcribe(path: str) -> dict:
-        with open(path, "rb") as f:
-            r = requests.post(f"http://localhost:{port}/transcribe", files={"file": f})
-        r.raise_for_status()
-        return r.json()
-
-    try:
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:
-            if server.poll() is not None:
-                err = server.stderr.read().decode() if server.stderr else ""
-                print(f"Server exited: {err}", file=sys.stderr)
-                sys.exit(1)
-            try:
-                r = requests.get(f"http://localhost:{port}/health", timeout=1)
-                if r.ok:
-                    break
-            except requests.ConnectionError:
-                pass
-            time.sleep(0.1)
-        else:
-            print("Server timeout", file=sys.stderr)
-            sys.exit(1)
+    with server_process([str(binary), "--model", "v3", "--server", f":{port}"], port) as server_url:
+        def transcribe(path: str) -> dict:
+            with open(path, "rb") as f:
+                r = requests.post(f"{server_url}/transcribe", files={"file": f})
+            r.raise_for_status()
+            return r.json()
 
         # Warmup
         manifest = load_manifest(DATASETS_V3[0])
@@ -142,14 +116,6 @@ def bench_v3_server(binary: Path, port: int = 18090) -> None:
             ))
 
         print_results(rows)
-
-    finally:
-        server.send_signal(signal.SIGINT)
-        try:
-            server.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            server.kill()
-            server.wait()
 
 
 if __name__ == "__main__":

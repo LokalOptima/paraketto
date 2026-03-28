@@ -1,10 +1,12 @@
 """Shared utilities for benchmark scripts."""
 
 import json
+import os
 import signal
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import requests
@@ -100,6 +102,49 @@ def ensure_bench_data() -> None:
     print(f"Downloaded {n_wavs} wav files", file=sys.stderr)
 
 
+@contextmanager
+def server_process(cmd: list[str], port: int):
+    """Start a server, wait for /health, yield its URL, then shut down.
+
+    Inherits stderr to avoid pipe-buffer deadlocks during weight downloads.
+    Timeout is controlled by PARAKETTO_BENCH_SERVER_TIMEOUT (default 900s).
+    """
+    timeout = float(os.environ.get("PARAKETTO_BENCH_SERVER_TIMEOUT", "900"))
+    server_url = f"http://localhost:{port}"
+
+    server = subprocess.Popen(cmd, stderr=None)
+    try:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if server.poll() is not None:
+                print(f"Server exited with code {server.returncode}", file=sys.stderr)
+                sys.exit(1)
+            try:
+                r = requests.get(f"{server_url}/health", timeout=1)
+                if r.ok:
+                    break
+            except requests.ConnectionError:
+                pass
+            time.sleep(0.1)
+        else:
+            print(
+                f"Server failed to start (timeout after {timeout:.0f}s). "
+                "First run may need to download weights — run `make download-weights` first. "
+                f"Increase wait: PARAKETTO_BENCH_SERVER_TIMEOUT=1800",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        yield server_url
+    finally:
+        server.send_signal(signal.SIGINT)
+        try:
+            server.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            server.kill()
+            server.wait()
+
+
 def bench_server(binary: Path, binary_name: str, port: int = 18080, use_corrected: bool = False) -> None:
     """Start a server binary, run benchmarks, and print results."""
     if not binary.exists():
@@ -109,40 +154,12 @@ def bench_server(binary: Path, binary_name: str, port: int = 18080, use_correcte
 
     ensure_bench_data()
 
-    server_url = f"http://localhost:{port}"
-
-    def transcribe(path: str) -> dict:
-        with open(path, "rb") as f:
-            r = requests.post(f"{server_url}/transcribe", files={"file": f})
-        r.raise_for_status()
-        return r.json()
-
-    def wait_for_server(timeout: float = 30) -> None:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            ret = server.poll()
-            if ret is not None:
-                err = server.stderr.read().decode() if server.stderr else ""
-                print(f"Server exited with code {ret}", file=sys.stderr)
-                if err:
-                    print(err, file=sys.stderr, end="")
-                sys.exit(1)
-            try:
-                r = requests.get(f"{server_url}/health", timeout=1)
-                if r.ok:
-                    return
-            except requests.ConnectionError:
-                pass
-            time.sleep(0.1)
-        print("Server failed to start (timeout)", file=sys.stderr)
-        sys.exit(1)
-
-    server = subprocess.Popen(
-        [str(binary), "--server", f":{port}"],
-        stderr=subprocess.PIPE,
-    )
-    try:
-        wait_for_server()
+    with server_process([str(binary), "--server", f":{port}"], port) as server_url:
+        def transcribe(path: str) -> dict:
+            with open(path, "rb") as f:
+                r = requests.post(f"{server_url}/transcribe", files={"file": f})
+            r.raise_for_status()
+            return r.json()
 
         # Warmup
         manifest = load_manifest(DATASETS[0])
@@ -175,7 +192,3 @@ def bench_server(binary: Path, binary_name: str, port: int = 18080, use_correcte
             ))
 
         print_results(rows)
-
-    finally:
-        server.send_signal(signal.SIGINT)
-        server.wait(timeout=5)
