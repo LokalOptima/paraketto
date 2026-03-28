@@ -206,83 +206,11 @@ private:
         return splits;
     }
 
-    // Drop long runs of consecutive silent frames from raw audio.
-    // Prevents mel normalization from being skewed by silence, which causes
-    // empty output or hallucinations. Returns empty vector if no trimming needed.
-    std::vector<float> trim_silence(const float* samples, int num_samples) {
-        const float energy_thresh = 1e-3f;  // sum-of-squares per HOP-sized window
-        const int   min_run       = 300;    // 3s of consecutive silence to trigger trim
-        const int   margin        = 15;     // 0.15s kept at each edge of a trimmed run
-
-        int n_windows = num_samples / HOP;
-        if (n_windows < min_run) return {};
-
-        // Single pass: compute energy per window, track silent runs, record trim ranges.
-        // No allocations in the common case (no long silence).
-        std::vector<std::pair<int,int>> trims;  // [from, to) window ranges to remove
-        int run_start = -1;
-
-        for (int i = 0; i <= n_windows; i++) {
-            bool silent = false;
-            if (i < n_windows) {
-                float e = 0;
-                const float* w = samples + i * HOP;
-                for (int j = 0; j < HOP; j++) e += w[j] * w[j];
-                silent = (e < energy_thresh);
-            }
-            if (silent && run_start < 0) {
-                run_start = i;
-            } else if (!silent && run_start >= 0) {
-                if (i - run_start >= min_run) {
-                    int from = run_start + margin;
-                    int to   = i - margin;
-                    if (from < to) trims.push_back({from, to});
-                }
-                run_start = -1;
-            }
-        }
-
-        if (trims.empty()) return {};
-
-        // Compute output size and rebuild with bulk copies
-        int trimmed_windows = 0;
-        for (auto& [a, b] : trims) trimmed_windows += b - a;
-        int kept_samples = (n_windows - trimmed_windows) * HOP;
-        int tail = n_windows * HOP;
-        if (tail < num_samples) kept_samples += num_samples - tail;
-
-        std::vector<float> out;
-        out.reserve(kept_samples);
-
-        int pos = 0;
-        for (auto& [a, b] : trims) {
-            if (a > pos) {
-                const float* start = samples + pos * HOP;
-                out.insert(out.end(), start, start + (a - pos) * HOP);
-            }
-            pos = b;
-        }
-        // Copy from last trim end to end of windowed region
-        if (pos < n_windows) {
-            const float* start = samples + pos * HOP;
-            out.insert(out.end(), start, start + (n_windows - pos) * HOP);
-        }
-        // Append trailing samples beyond last full window
-        if (tail < num_samples)
-            out.insert(out.end(), samples + tail, samples + num_samples);
-
-        return out;
-    }
-
     std::string transcribe_single(const float* samples, int num_samples) {
-        auto t_start = std::chrono::high_resolution_clock::now();
+        // Need at least 10 mel frames (100ms) for a valid encoder pass
+        if (num_samples < HOP * 10) return "";
 
-        // Trim long silent runs before mel to prevent normalization corruption
-        auto trimmed = trim_silence(samples, num_samples);
-        if (!trimmed.empty()) {
-            samples = trimmed.data();
-            num_samples = (int)trimmed.size();
-        }
+        auto t_start = std::chrono::high_resolution_clock::now();
 
         // --- 1. Mel spectrogram (fused GPU pipeline) ---
         int n_frames, n_valid;

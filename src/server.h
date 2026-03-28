@@ -100,8 +100,8 @@ static void run_server(PipelineT& pipeline, const std::string& host, int port) {
   #recbtn:hover { border-color: #3f3f46; background: #1c1c1f; transform: scale(1.05); }
   #recbtn.recording { border-color: #dc2626; background: #1c1017;
                       animation: pulse 1.5s ease-in-out infinite; }
-  #recbtn .mic { width: 28px; height: 28px; fill: #a1a1aa; transition: fill 0.2s; }
-  #recbtn:hover .mic { fill: #d4d4d8; }
+  #recbtn .mic { width: 28px; height: 28px; fill: #a1a1aa; color: #a1a1aa; transition: fill 0.2s, color 0.2s; }
+  #recbtn:hover .mic { fill: #d4d4d8; color: #d4d4d8; }
   #recbtn.recording .mic { fill: #f87171; }
   #recbtn .stop { width: 22px; height: 22px; fill: #f87171; display: none; }
   #recbtn.recording .mic { display: none; }
@@ -109,6 +109,11 @@ static void run_server(PipelineT& pipeline, const std::string& host, int port) {
   @keyframes pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(220,38,38,0.3); }
                      50% { box-shadow: 0 0 0 12px rgba(220,38,38,0); } }
   .rec-hint { font-size: 0.78rem; color: #3f3f46; }
+  #waveform { width: 100%; height: 56px; display: none; margin-top: 12px; border-radius: 8px; }
+  #waveform.visible { display: block; }
+  .rec-time { font-size: 0.82rem; color: #71717a; font-variant-numeric: tabular-nums;
+              display: none; margin-top: 4px; }
+  .rec-time.visible { display: block; }
   .divider { display: flex; align-items: center; gap: 12px; margin: 20px 0;
              color: #27272a; font-size: 0.75rem; }
   .divider::before, .divider::after { content: ''; flex: 1; height: 1px; background: #1c1c1f; }
@@ -121,7 +126,6 @@ static void run_server(PipelineT& pipeline, const std::string& host, int port) {
   .transcript { background: #0f0f11; border: 1px solid #1c1c1f; border-radius: 12px;
                 padding: 20px; font-size: 1.05rem; line-height: 1.7;
                 color: #f4f4f5; min-height: 60px; white-space: pre-wrap; }
-  .transcript.live { color: #71717a; border-style: dashed; }
   .meta { display: flex; gap: 16px; margin-top: 10px; flex-wrap: wrap; }
   .meta span { font-size: 0.75rem; color: #3f3f46; font-variant-numeric: tabular-nums; }
   .meta .val { color: #71717a; }
@@ -142,10 +146,12 @@ static void run_server(PipelineT& pipeline, const std::string& host, int port) {
 
   <div class="rec-area">
     <button id="recbtn" onclick="toggleRecord()">
-      <svg class="mic" viewBox="0 0 24 24"><path d="M12 1a4 4 0 00-4 4v6a4 4 0 008 0V5a4 4 0 00-4-4z"/><path d="M6 11a6 6 0 0012 0" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><line x1="12" y1="17" x2="12" y2="21" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><line x1="9" y1="21" x2="15" y2="21" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+      <svg class="mic" viewBox="0 0 24 24"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><line x1="12" y1="19" x2="12" y2="22" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><line x1="8" y1="22" x2="16" y2="22" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
       <svg class="stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
     </button>
     <div class="rec-hint">click to record</div>
+    <canvas id="waveform"></canvas>
+    <div class="rec-time" id="rectime">0:00</div>
   </div>
 
   <div class="divider">or</div>
@@ -193,8 +199,9 @@ function pcmToWav(chunks) {
   return new Blob([buf], { type: 'audio/wav' });
 }
 
-// --- Microphone: persistent stream via AudioWorklet, toggle recording on/off ---
-let micStream = null, micCtx = null, recording = false, recPcm = [], previewTimer = null, previewSeq = 0;
+// --- Microphone: AudioWorklet capture + waveform visualization, transcribe on stop ---
+let micStream = null, micCtx = null, analyser = null, recording = false, recPcm = [];
+let waveRaf = null, recStart = 0;
 async function initMic() {
   if (micStream) return true;
   try {
@@ -214,53 +221,88 @@ async function initMic() {
     const node = new AudioWorkletNode(micCtx, 'rec');
     node.port.onmessage = e => { if (recording) recPcm.push(e.data); };
     source.connect(node);
-    node.connect(micCtx.destination);
+    // Analyser for waveform visualization
+    analyser = micCtx.createAnalyser();
+    analyser.fftSize = 256;
+    source.connect(analyser);
     return true;
   } catch(e) {
     alert('Microphone access denied');
     return false;
   }
 }
+let rmsBuf = null, rmsHead = 0, rmsLen = 0, lastRmsPush = 0;
+function drawWaveform() {
+  if (!recording) return;
+  const canvas = $('waveform'), ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (canvas.width !== w * dpr || canvas.height !== h * dpr) {
+    canvas.width = w * dpr; canvas.height = h * dpr;
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const barW = 3, gap = 2, step = barW + gap;
+  const maxBars = Math.floor(w / step);
+  // Resize ring buffer if canvas width changed
+  if (!rmsBuf || rmsBuf.length !== maxBars) {
+    rmsBuf = new Float32Array(maxBars);
+    rmsHead = 0; rmsLen = 0;
+  }
+  // Sample RMS at 20Hz
+  const now = Date.now();
+  if (now - lastRmsPush >= 50) {
+    const buf = new Uint8Array(analyser.frequencyBinCount);
+    analyser.getByteTimeDomainData(buf);
+    let sum = 0;
+    for (let i = 0; i < buf.length; i++) { const v = (buf[i] - 128) / 128; sum += v * v; }
+    rmsBuf[rmsHead] = Math.sqrt(sum / buf.length);
+    rmsHead = (rmsHead + 1) % maxBars;
+    if (rmsLen < maxBars) rmsLen++;
+    lastRmsPush = now;
+  }
+  ctx.clearRect(0, 0, w, h);
+  const offset = maxBars - rmsLen;
+  for (let i = 0; i < rmsLen; i++) {
+    const idx = (rmsHead - rmsLen + i + maxBars) % maxBars;
+    const barH = Math.max(2, Math.min(h - 4, rmsBuf[idx] * h * 4));
+    const x = (offset + i) * step;
+    const y = (h - barH) / 2;
+    ctx.fillStyle = '#f87171';
+    ctx.beginPath();
+    ctx.roundRect(x, y, barW, barH, 1.5);
+    ctx.fill();
+  }
+  const elapsed = (now - recStart) / 1000;
+  const m = Math.floor(elapsed / 60), s = Math.floor(elapsed % 60);
+  $('rectime').textContent = m + ':' + String(s).padStart(2, '0');
+  waveRaf = requestAnimationFrame(drawWaveform);
+}
 async function toggleRecord() {
   if (recording) { stopRecord(); return; }
   if (!await initMic()) return;
   recPcm = [];
-  previewSeq = 0;
+  rmsLen = 0; rmsHead = 0; lastRmsPush = 0;
   recording = true;
+  recStart = Date.now();
   $('recbtn').classList.add('recording');
+  $('waveform').classList.add('visible');
+  $('rectime').classList.add('visible');
   $('transcript').textContent = '';
-  $('transcript').classList.add('live');
   $('meta').innerHTML = '';
-  $('result').classList.add('visible');
-  previewTimer = setInterval(sendPreview, 640);
-}
-async function sendPreview() {
-  if (!recPcm.length || !recording) return;
-  const seq = ++previewSeq;
-  const wav = pcmToWav(recPcm);
-  const fd = new FormData();
-  fd.append('file', wav, 'preview.wav');
-  try {
-    const r = await fetch('/transcribe', { method: 'POST', body: fd });
-    // Only update if still recording and no newer preview has been sent
-    if (r.ok && recording && seq >= previewSeq) {
-      const j = await r.json();
-      $('transcript').textContent = j.text || '...';
-    }
-  } catch(e) {}
+  $('result').classList.remove('visible');
+  waveRaf = requestAnimationFrame(drawWaveform);
 }
 function stopRecord() {
   recording = false;
-  clearInterval(previewTimer);
-  previewSeq = Infinity;  // invalidate any in-flight previews
+  if (waveRaf) { cancelAnimationFrame(waveRaf); waveRaf = null; }
   $('recbtn').classList.remove('recording');
-  $('transcript').classList.remove('live');
+  $('waveform').classList.remove('visible');
+  $('rectime').classList.remove('visible');
   if (recPcm.length) sendFile(pcmToWav(recPcm), 'recording.wav');
 }
 // --- Transcribe (file upload or final recording) ---
 async function sendFile(file, name) {
   $('spinner').classList.add('visible');
-  $('transcript').classList.remove('live');
   const fd = new FormData();
   fd.append('file', file, name || file.name);
   try {

@@ -276,6 +276,10 @@ struct MelSpec {
     float* d_mel = nullptr;      // [n_frames, N_MELS]
     size_t frames_cap = 0, mel_cap = 0;
 
+    // CPU buffers (reused across calls, grow-only — avoids per-call heap alloc)
+    std::vector<float> preemph_buf;
+    std::vector<float> frames_buf;
+
     void init() {
         mel_init_filterbank(MEL_FILTERBANK, N_MEL_ENTRIES);
     }
@@ -301,34 +305,105 @@ struct MelSpec {
     }
 
     // Compute mel spectrogram entirely on GPU.
+    // Fuses preemphasis with per-window energy detection to trim long silent runs
+    // (>=3s) that corrupt mel normalization statistics. Skips trimmed frames during
+    // windowing — no intermediate buffer, single pass over audio data.
     // Writes normalized, transposed [128, n_valid] float32 to d_mel_out (GPU).
     void compute(const float* audio, int num_samples,
                  float* d_mel_out, int& n_frames, int& n_valid,
                  cudaStream_t stream) {
-        std::vector<float> preemph(num_samples);
-        preemph[0] = audio[0];
-        for (int i = 1; i < num_samples; i++)
-            preemph[i] = audio[i] - PREEMPH * audio[i - 1];
+        if (num_samples <= 0) { n_frames = 0; n_valid = 0; return; }
+
+        if ((int)preemph_buf.size() < num_samples)
+            preemph_buf.resize(num_samples);
+        preemph_buf[0] = audio[0];
+
+        // Silence trimming: threshold 0.1 covers digital silence and mic noise (~0.02).
+        static constexpr float ENERGY_THRESH = 0.1f;
+        static constexpr int MIN_RUN = 300;  // 3s of silence
+        static constexpr int MARGIN  = 15;   // 0.15s kept at each trim edge
+
+        int n_windows = num_samples / HOP;
+        std::vector<std::pair<int,int>> trims;
+
+        if (n_windows >= MIN_RUN) {
+            // Energy on raw audio (not preemphasized) — stable threshold independent of PREEMPH
+            float win_e = audio[0] * audio[0];
+            int win_pos = 1, cur_win = 0, run_start = -1;
+
+            for (int i = 1; i < num_samples; i++) {
+                preemph_buf[i] = audio[i] - PREEMPH * audio[i - 1];
+                win_e += audio[i] * audio[i];
+                if (++win_pos == HOP) {
+                    if (win_e < ENERGY_THRESH) {
+                        if (run_start < 0) run_start = cur_win;
+                    } else if (run_start >= 0) {
+                        if (cur_win - run_start >= MIN_RUN) {
+                            int from = run_start + MARGIN;
+                            int to = cur_win - MARGIN;
+                            if (from < to) trims.push_back({from, to});
+                        }
+                        run_start = -1;
+                    }
+                    win_e = 0;
+                    win_pos = 0;
+                    cur_win++;
+                }
+            }
+            // Close trailing silent run
+            if (run_start >= 0 && n_windows - run_start >= MIN_RUN) {
+                int from = run_start + MARGIN;
+                int to = n_windows - MARGIN;
+                if (from < to) trims.push_back({from, to});
+            }
+        } else {
+            // Short audio: plain preemphasis, no silence detection needed
+            for (int i = 1; i < num_samples; i++)
+                preemph_buf[i] = audio[i] - PREEMPH * audio[i - 1];
+        }
 
         int pad = N_FFT / 2;
         int padded_len = num_samples + 2 * pad;
-        n_frames = (padded_len - N_FFT) / HOP + 1;
-        n_valid = num_samples / HOP;
+        int total_frames = (padded_len - N_FFT) / HOP + 1;
+        int total_valid = num_samples / HOP;
 
-        std::vector<float> frames(n_frames * N_FFT, 0.0f);
-        for (int f = 0; f < n_frames; f++) {
-            float* row = frames.data() + f * N_FFT;
+        int trimmed_count = 0;
+        for (auto& [a, b] : trims) trimmed_count += b - a;
+
+        n_frames = total_frames - trimmed_count;
+        n_valid = total_valid - trimmed_count;
+
+        size_t frames_needed = (size_t)n_frames * N_FFT;
+        if (frames_buf.size() < frames_needed)
+            frames_buf.resize(frames_needed);
+
+        auto window_frame = [&](int f, float* row) {
+            int base = f * HOP - pad;
             for (int i = 0; i < N_FFT; i++) {
-                int pos = f * HOP + i - pad;
-                float sample = (pos >= 0 && pos < num_samples) ? preemph[pos] : 0.0f;
+                int pos = base + i;
+                float sample = (pos >= 0 && pos < num_samples) ? preemph_buf[pos] : 0.0f;
                 row[i] = sample * HANN_WINDOW[i];
             }
+        };
+
+        if (trims.empty()) {
+            for (int f = 0; f < total_frames; f++)
+                window_frame(f, frames_buf.data() + (size_t)f * N_FFT);
+        } else {
+            // Iterate over keep ranges, skipping trimmed regions
+            int out_f = 0, keep_start = 0;
+            for (auto& [a, b] : trims) {
+                for (int f = keep_start; f < a; f++)
+                    window_frame(f, frames_buf.data() + (size_t)out_f++ * N_FFT);
+                keep_start = b;
+            }
+            for (int f = keep_start; f < total_frames; f++)
+                window_frame(f, frames_buf.data() + (size_t)out_f++ * N_FFT);
         }
 
-        // Upload windowed frames → fused FFT+mel+log → normalize+transpose
         ensure_buffers(n_frames);
-        CUDA_CHECK(cudaMemcpyAsync(d_frames, frames.data(),
-                                    n_frames * N_FFT * sizeof(float),
+        CUDA_CHECK(cudaMemcpyAsync(d_frames, frames_buf.data(),
+                                    (size_t)n_frames * N_FFT * sizeof(float),
                                     cudaMemcpyHostToDevice, stream));
         fft512_mel_log(d_frames, d_mel, n_frames, stream);
         mel_normalize(d_mel, d_mel_out, n_frames, n_valid, stream);
