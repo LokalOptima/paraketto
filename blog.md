@@ -1780,3 +1780,86 @@ chunked: 63 chunks from 6225.5s audio
 ```
 
 1h43m transcribed in 4.3 seconds. Split points land at natural pauses — no mid-word cuts observed. The text concatenation with space separators produces clean, readable output.
+
+---
+
+## Silence Trimming: Fixing Mel Normalization Corruption
+
+### The problem
+
+The mel spectrogram normalization computes per-channel mean and variance over all frames in the audio. When audio contains long stretches of silence (e.g., from the live preview accumulating dead air, or a silence-padded upload), these statistics get dominated by silence frames. The speech features are distorted, and the model produces empty output or hallucinates text that isn't in the audio.
+
+### Discovery
+
+Noticed during live preview testing: the web UI sends the full accumulated recording to `/transcribe` every 640ms. After the user says a short phrase and pauses, the audio grows with trailing silence. The model returns empty strings or unstable text.
+
+Built test WAVs with 1 second of real speech followed by varying amounts of digital silence:
+
+```
+1s speech + 0s silence:  "He hoped"              (correct)
+1s speech + 1s silence:  "He hoped"              (correct)
+1s speech + 4s silence:  ""                       (EMPTY — speech lost)
+1s speech + 9s silence:  "He hoped to be able..." (HALLUCINATION)
+```
+
+The 5s case consistently produces empty output. The 10s case consistently hallucinates — the model invents plausible-sounding text that wasn't in the audio. Both are deterministic (3/3 trials identical).
+
+Tested silence position to isolate the cause:
+
+```
+                          5s total    10s total
+speech then silence:      (empty)     hallucination
+silence then speech:      hallucin.   hallucination
+silence, speech, silence: "He hoped"  "He hoped"
+```
+
+Centered speech works because the normalization statistics happen to be less destructive when silence is symmetric. But the root cause is the same: per-feature normalization over the full utterance, as designed by NeMo's `AudioToMelSpectrogramPreprocessor`, assumes the audio is predominantly speech. When it's not, the statistics are wrong.
+
+### Approaches considered
+
+1. **Normalize only over non-silent frames (masking)** — Compute per-frame energy, create a mask, modify `mel_normalize` to skip silent frames in the statistics. Preserves all frames but adds overhead: extra kernel launch, mask reads, warp divergence on GPU. Doesn't save any compute — all frames still go through FFT, mel, and the encoder.
+
+2. **Trim silence from the raw audio before mel** — Detect long silent runs, remove them, feed shorter audio to the pipeline. Saves work at every stage: CPU preemphasis, windowing, GPU memcpy, FFT, mel, normalization, AND encoder (where attention is O(T^2) in frame count). Simpler, faster, and directly fixes the normalization.
+
+Approach 2 wins on every axis. The only cost is a scan over the raw audio computing per-window energy, which is ~0.1ms for 120s audio — negligible against the 5-15ms mel pipeline.
+
+### Implementation
+
+`trim_silence()` in `Pipeline`, called at the top of `transcribe_single()` before `mel.compute()`:
+
+1. Scan raw audio in HOP-sized windows (160 samples = 10ms, matching mel frame rate)
+2. Compute per-window energy (sum of squares) inline — no separate energy array
+3. Track consecutive silent window runs (energy < 1e-3 threshold)
+4. If a run reaches 300 windows (3 seconds), record it as a trim range, keeping 15 windows (0.15s) of margin at each edge
+5. If any trims found, rebuild audio with bulk copies between trim ranges
+
+Key parameters:
+- **Energy threshold (1e-3):** Noise floor across LibriSpeech and Earnings22 datasets peaks at ~5e-4 per window. Quiet speech p5 starts at ~1e-3. Clear gap — no risk of trimming speech.
+- **Minimum run (300 windows = 3s):** Natural speech pauses are 0.05–2s. A 3s run of silence is dead air, not a pause.
+- **Margin (15 windows = 0.15s):** Mel uses 512-sample windows with 160 hop (~3 windows of overlap). 15 gives comfortable margin for window edges.
+
+Common case (clean speech): single pass over the audio, no allocations, returns empty vector, original buffer used unchanged. The `trims` vector is only allocated when a qualifying run is actually found.
+
+### Results
+
+Before/after on silence-padded test files (FP8 backend):
+
+```
+                    before              after
+1s speech + 4s:     ""                  "He hoped"
+1s speech + 9s:     hallucination       "He hoped"
+clean 10.4s:        correct             correct (identical)
+```
+
+Before/after benchmark (FP8, same session, back-to-back):
+
+```
+              WER old   WER new   Time old   Time new
+librispeech   1.46%     1.46%     769ms      768ms
+earnings22    10.93%    10.93%    240ms      242ms
+long          1.80%     1.78%     4.33s      4.29s
+difficult     16.54%    16.54%    386ms      389ms
+Total                             5.72s      5.69s
+```
+
+WER identical. Timing within noise. The trim doesn't trigger on clean benchmark files — zero overhead on the common path.
