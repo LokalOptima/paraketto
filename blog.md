@@ -1740,3 +1740,43 @@ Total         1372x          1925s  1.40s
 ```
 
 NVIDIA's official FLEURS WER (FP16, full test set): German 5.04%, Italian 3.00%, French 5.15%. Our numbers are higher due to FP8 quantization and a smaller/harder clip selection, but qualitatively the transcriptions are excellent.
+
+---
+
+## Long Audio Chunking
+
+The encoder is allocated for a maximum of `MAX_MEL_FRAMES` (12,000 mel frames = 120 seconds at 16kHz). Audio longer than that previously couldn't be transcribed at all. We now automatically split long audio at silence boundaries and concatenate the results.
+
+### Design decisions
+
+Three approaches were considered:
+
+1. **VAD-based splitting** — detect silence, split there, transcribe independently, concatenate text. Simple, no stitching ambiguity.
+2. **Overlapping windows + text dedup** — fixed chunks with overlap, match suffix/prefix in text to merge. Fails for TDT because the LSTM decoder is stateful: the same encoder frames produce different tokens depending on decoder history, so overlap text diverges.
+3. **Encoder-frame concatenation** — encode chunks separately, concatenate encoder outputs, run one decoder pass. Cleanest merge but memory scales with total audio length (350 MB for 1 hour at fp16).
+
+We went with approach 1. The TDT decoder's LSTM state makes approach 2 unreliable, and approach 3's memory cost is prohibitive for multi-hour files.
+
+### Implementation
+
+`find_silence_splits()` scans for the lowest-energy 50ms window in a ±15s search region around each ~100s boundary. It's a simple sum-of-squares energy metric — no spectral analysis or external VAD model. Since it only compares relative energy (not thresholding), background noise doesn't affect split quality.
+
+Parameters:
+- Target chunk: ~100s (leaves 20s margin under the 120s encoder limit)
+- Search radius: ±15s around each boundary
+- Minimum chunk: 20s (prevents degenerate tiny chunks)
+- Energy window: 800 samples (50ms at 16kHz), 50% overlap for accuracy
+- Fallback: hard cut at 120s if no search room exists
+
+The chunked `transcribe()` calls `transcribe_single()` per chunk and accumulates timing. A `ChunkCallback` allows the CLI to show a progress bar on stderr. Audio under 120s takes the existing fast path unchanged.
+
+### Results
+
+Tested on a 1h43m recording (6225s, 63 chunks):
+
+```
+chunked: 63 chunks from 6225.5s audio
+6225.5s audio, 4261.2ms (mel=342.9 enc=2450.8 dec=1442.7), 1461x RTFx
+```
+
+1h43m transcribed in 4.3 seconds. Split points land at natural pauses — no mid-word cuts observed. The text concatenation with space separators produces clean, readable output.

@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -114,7 +115,94 @@ struct Pipeline {
 
     double last_mel_ms = 0, last_enc_ms = 0, last_dec_ms = 0;
 
-    std::string transcribe(const float* samples, int num_samples) {
+    // on_chunk: called with (chunk_index, n_chunks) after each chunk completes
+    using ChunkCallback = std::function<void(int, int)>;
+
+    std::string transcribe(const float* samples, int num_samples,
+                           ChunkCallback on_chunk = nullptr) {
+        const int max_chunk_samples = MAX_MEL_FRAMES * HOP;
+        if (num_samples <= max_chunk_samples)
+            return transcribe_single(samples, num_samples);
+
+        // Long audio: split at silence boundaries, transcribe each chunk
+        auto splits = find_silence_splits(samples, num_samples);
+
+        std::string result;
+        double mel_ms = 0, enc_ms = 0, dec_ms = 0;
+        int pos = 0;
+        int n_chunks = (int)splits.size() + 1;
+
+        for (int i = 0; i < n_chunks; i++) {
+            int end = (i < (int)splits.size()) ? splits[i] : num_samples;
+            int len = end - pos;
+            if (len <= 0) { pos = end; continue; }
+
+            std::string chunk_text = transcribe_single(samples + pos, len);
+            mel_ms += last_mel_ms;
+            enc_ms += last_enc_ms;
+            dec_ms += last_dec_ms;
+
+            if (!chunk_text.empty()) {
+                if (!result.empty()) result += ' ';
+                result += chunk_text;
+            }
+            if (on_chunk) on_chunk(i, n_chunks);
+            pos = end;
+        }
+
+        last_mel_ms = mel_ms;
+        last_enc_ms = enc_ms;
+        last_dec_ms = dec_ms;
+        fprintf(stderr, "chunked: %d chunks from %.1fs audio\n",
+                n_chunks, (double)num_samples / 16000.0);
+        return result;
+    }
+
+private:
+    // Find split points at silence boundaries for audio exceeding 120s.
+    // Returns sample indices where the audio should be cut.
+    std::vector<int> find_silence_splits(const float* samples, int num_samples) {
+        const int max_chunk    = MAX_MEL_FRAMES * HOP;
+        const int target_chunk = 16000 * 100;   // aim for ~100s
+        const int search_radius = 16000 * 15;   // search ±15s around target
+        const int min_chunk    = 16000 * 20;    // never shorter than 20s
+        const int energy_win   = 800;           // 50ms window for energy
+
+        std::vector<int> splits;
+        int pos = 0;
+
+        while (num_samples - pos > max_chunk) {
+            int target = pos + target_chunk;
+            int lo = std::max(pos + min_chunk, target - search_radius);
+            int hi = std::min(num_samples - min_chunk, target + search_radius);
+            hi = std::min(hi, pos + max_chunk - energy_win);
+
+            if (lo >= hi) {
+                // No room to search — hard cut at max
+                splits.push_back(pos + max_chunk);
+                pos += max_chunk;
+                continue;
+            }
+
+            // Find lowest-energy window in [lo, hi)
+            float min_energy = 1e30f;
+            int best = target;
+            for (int i = lo; i + energy_win <= hi; i += energy_win / 2) {
+                float e = 0;
+                for (int j = 0; j < energy_win; j++)
+                    e += samples[i + j] * samples[i + j];
+                if (e < min_energy) {
+                    min_energy = e;
+                    best = i + energy_win / 2;
+                }
+            }
+            splits.push_back(best);
+            pos = best;
+        }
+        return splits;
+    }
+
+    std::string transcribe_single(const float* samples, int num_samples) {
         auto t_start = std::chrono::high_resolution_clock::now();
 
         // --- 1. Mel spectrogram (fused GPU pipeline) ---
@@ -138,7 +226,6 @@ struct Pipeline {
         return text;
     }
 
-private:
     std::string decode(int enc_len) {
         cuda_model.decoder_reset();
 
@@ -194,6 +281,7 @@ int main(int argc, char** argv) {
             "\n"
             "Speech-to-text using Paraketto (CUDA/cuBLAS backend).\n"
             "Accepts one or more 16kHz or 24kHz mono WAV files (int16 or float32).\n"
+            "Long files (>120s) are automatically chunked at silence boundaries.\n"
             "Weights are auto-downloaded from HuggingFace on first run.\n"
             "\n"
             "Options:\n"
@@ -442,7 +530,15 @@ int main(int argc, char** argv) {
         double audio_dur = (double)wav.samples.size() / wav.sample_rate;
 
         auto t0 = clk::now();
-        std::string text = pipeline.transcribe(wav.samples.data(), wav.samples.size());
+        auto progress = [](int i, int n) {
+            int w = 30;
+            int filled = (i + 1) * w / n;
+            fprintf(stderr, "\r  [");
+            for (int j = 0; j < w; j++) fputc(j < filled ? '#' : '.', stderr);
+            fprintf(stderr, "] %d/%d", i + 1, n);
+            if (i + 1 == n) fputc('\n', stderr);
+        };
+        std::string text = pipeline.transcribe(wav.samples.data(), wav.samples.size(), progress);
         auto t1 = clk::now();
         double elapsed = std::chrono::duration<double>(t1 - t0).count();
 

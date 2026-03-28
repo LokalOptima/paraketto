@@ -196,4 +196,6 @@ bench_ff2: tests/bench_ff2.cu
 	$(NVCC) $(NVFLAGS) -arch=sm_120 $(CUTLASS_INC) tests/bench_ff2.cu -lcublas -lcublasLt -o $@
 
 clean:
-	rm -f paraketto.cuda paraketto.cublas paraketto.fp8 src/kernels.o src/kernels_fp8.o src/cutlass_gemm.o src/cublas_gemm.o src/weights.o src/conformer_fp8.o src/corrector.o
+	rm -f paraketto.cuda paraketto.cublas paraketto.static paraketto.fp8 paraketto.fp8.static paraketto.fp8.baseline
+	rm -f bench_ff2 bench_fp8 bench_gemm bench_splitk bench_tiles
+	rm -f src/*.o

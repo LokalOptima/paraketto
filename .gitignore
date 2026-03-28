@@ -41,6 +41,8 @@ paraketto.fp8
 paraketto.fp8.static
 paraketto.fp8.baseline
 *.o
+*.so
+*.a
 
 # CUTLASS headers (clone from https://github.com/NVIDIA/cutlass)
 third_party/cutlass/
@@ -49,9 +51,9 @@ third_party/cutlass/
 vendor/llama.cpp/build/
 
 # Model weights (generated or quantized)
-paraketto-fp16.bin
-paraketto-fp8.bin
-weights_fp8.bin.*
+*.bin
+*.bin.*
+*.gguf
 
 # Test files
 test.wav
@@ -61,13 +63,14 @@ test.wav
 
 # Benchmark data (download via: make download-data)
 data/
-bench-data.tar.gz
+bench-data*.tar.gz
 
 # CUDA/driver logs
 cufile.log
 
 # Scratch (one-off experiments, working notes)
 scratch/
+plan.md
 
 # Benchmark baselines (generated, machine-specific)
 baseline_*.json
