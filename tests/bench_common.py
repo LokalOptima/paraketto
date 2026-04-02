@@ -112,7 +112,7 @@ def server_process(cmd: list[str], port: int):
     timeout = float(os.environ.get("PARAKETTO_BENCH_SERVER_TIMEOUT", "900"))
     server_url = f"http://localhost:{port}"
 
-    server = subprocess.Popen(cmd, stderr=None)
+    server = subprocess.Popen(cmd, stderr=subprocess.DEVNULL)
     try:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
