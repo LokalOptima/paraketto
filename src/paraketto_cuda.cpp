@@ -269,7 +269,7 @@ private:
             }
 
             if (step > 0) { t += step; emitted = 0; }
-            else if (token == blank_id || emitted >= 10) { t++; emitted = 0; }
+            else if (token == blank_id || emitted >= 2) { t++; emitted = 0; }
         }
 
         const char* const* vocab = (weights.config.version == 3) ? VOCAB_V3 : VOCAB_V2;
