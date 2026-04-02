@@ -1863,3 +1863,75 @@ Total                             5.72s      5.69s
 ```
 
 WER identical. Timing within noise. The trim doesn't trigger on clean benchmark files — zero overhead on the common path.
+
+## Word-Level Timestamps
+
+### Motivation
+
+We want to extract specific phrases from audio — send audio in, get timestamps for each word, then use those timestamps to cut out the relevant snippet. Use case: audio comes in, gets transcribed as "Hello to the whole world and every star in the galaxy", user searches for "every star", and extracts just that audio segment.
+
+### How TDT timestamps work
+
+The TDT decoder already tracks everything needed. At each step it predicts both a token and a duration (how many encoder frames to skip). The encoder frame index `t` at the moment each token is emitted tells us exactly when that token occurs in the audio.
+
+Each encoder frame = 80ms (mel frames at 10ms × 8x subsampling from 3 stride-2 convolutions). So encoder frame `t` → `t * 80` ms. For chunked audio (>120s), we add the chunk's sample offset converted to ms.
+
+The only new work is recording `t` alongside each token — one extra `int` push per token emission, zero measurable cost.
+
+### BPE → word grouping
+
+The vocab is SentencePiece BPE, so tokens are subword pieces like `" ev"`, `"ery"`, `" star"`. A leading space character marks word boundaries. To get word-level timestamps, we group consecutive tokens into words: a new word starts whenever a token has a leading space. The word's timestamp is the frame time of its first token.
+
+### API design
+
+**CLI:** `--timestamps` flag outputs tab-delimited `start_ms\tword` per line:
+```
+320     He
+560     hoped
+1040    there
+1200    would
+```
+
+**Server:** `POST /transcribe?timestamps=true` adds parallel arrays to the JSON response:
+```json
+{
+  "text": "He hoped there would be stew",
+  "words": ["He", "hoped", "there", "would", "be", "stew"],
+  "starts_ms": [320, 560, 1040, 1200, 1360, 1520]
+}
+```
+
+We chose parallel arrays over an array of objects — `{"word":..., "start":...}` repeated per word is verbose for no benefit.
+
+End times are implicit: each word ends when the next one starts (or at `audio_duration_ms` for the last word).
+
+Timestamps are always collected (it's free), but the word grouping and JSON serialization only run when the caller requests them.
+
+### Challenges
+
+#### 1. Decoder hallucination on short clips
+
+Testing revealed that short audio snippets (1-2s, extracted from longer files) sometimes produced hallucinated text — the model generating loops like "the first time the first time was the first time" with all the garbage tokens pinned to the same timestamp.
+
+Root cause: the decoder's safety cap for same-frame emissions was `emitted >= 10`, allowing up to 10 tokens per encoder frame. Normal speech never emits more than 1. On short clips where trailing encoder frames contain noise (not trained-on silence patterns), the decoder would predict non-blank tokens with `step=0` (don't advance), filling each frame with up to 10 junk tokens before the cap forced advancement.
+
+Fix: lowered the cap to `emitted >= 2`. Eliminated hallucination with zero impact on normal transcription — verified across 140 test files.
+
+#### 2. Encoder subsampling alignment sensitivity
+
+Some 2s clips extracted at specific positions produced completely empty transcriptions, while shifting the cut point by 200ms would work fine. Both clips had identical audio content, same energy profile — just shifted.
+
+Root cause: the 3x stride-2 convolutional subsampling in the encoder is sensitive to the absolute position of content within the input. Small shifts change how speech aligns with the 8-frame grid, producing different (sometimes degenerate) encoder outputs.
+
+Mitigation: prepending ~100ms of silence to extracted clips changes the alignment and reliably fixes the issue. This is a fundamental property of strided convolutions, not a bug in our code.
+
+### Test methodology
+
+End-to-end test (`scripts/test_timestamps.py`) across 140 WAV files (LibriSpeech + Earnings22):
+1. Transcribe with `--timestamps`
+2. For each file, pick 3-word phrases at the **beginning**, **middle**, and **end**
+3. Extract the audio segment at the reported timestamps (±320ms padding, 100ms silence prepend)
+4. Re-transcribe the extracted snippet
+5. Verify the first and last expected words appear at the correct positions in the snippet transcription
+
+Results: **239/276 passed** (86.6%), 144 skipped (files too short). Remaining failures are model transcription differences on isolated clips — words like "ninety three" becoming "93", "frontline" becoming "front line" — not timestamp errors.

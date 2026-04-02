@@ -121,3 +121,43 @@ static std::string detokenize(const std::vector<int>& ids,
     size_t start = text.find_first_not_of(' ');
     return (start == std::string::npos) ? "" : text.substr(start);
 }
+
+// Word with start timestamp (ms)
+struct WordTiming {
+    std::string word;
+    int start_ms;
+};
+
+// Group BPE tokens into words using leading-space word boundaries.
+// token_ids[i] and token_ms[i] are parallel arrays.
+static std::vector<WordTiming> words_with_timestamps(
+    const std::vector<int>& token_ids,
+    const std::vector<int>& token_ms,
+    const char* const* vocab_arr, int vocab_size)
+{
+    std::vector<WordTiming> words;
+    std::string current_word;
+    int word_start = 0;
+
+    for (size_t i = 0; i < token_ids.size(); i++) {
+        int id = token_ids[i];
+        if (id < 0 || id >= vocab_size) continue;
+        const char* piece = vocab_arr[id];
+        bool new_word = (piece[0] == ' ');
+
+        if (new_word && !current_word.empty()) {
+            words.push_back({current_word, word_start});
+            current_word.clear();
+        }
+
+        if (current_word.empty())
+            word_start = token_ms[i];
+
+        current_word += new_word ? piece + 1 : piece;
+    }
+
+    if (!current_word.empty())
+        words.push_back({current_word, word_start});
+
+    return words;
+}

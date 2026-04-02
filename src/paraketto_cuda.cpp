@@ -78,6 +78,11 @@ static void ensure_file(const std::string& path, const char* url) {
 // Inference pipeline (CUDA backend)
 // ---------------------------------------------------------------------------
 
+struct DecodeResult {
+    std::vector<int> tokens;
+    std::vector<int> frames;  // encoder frame index per token
+};
+
 struct Pipeline {
     Pipeline() = default;
     Pipeline(const Pipeline&) = delete;
@@ -119,17 +124,35 @@ struct Pipeline {
 
     double last_mel_ms = 0, last_enc_ms = 0, last_dec_ms = 0;
 
+    // Per-token timestamps from last transcribe() call
+    std::vector<int> last_token_ids;
+    std::vector<int> last_token_ms;  // absolute time in ms per token
+
+    // Encoder: 3x stride-2 conv = 8x downsampling → 80ms per encoder frame
+    static constexpr int MS_PER_ENC_FRAME = 80;
+
     // on_chunk: called with (chunk_index, n_chunks) after each chunk completes
     using ChunkCallback = std::function<void(int, int)>;
 
     std::string transcribe(const float* samples, int num_samples,
                            ChunkCallback on_chunk = nullptr) {
+        const char* const* vocab = (weights.config.version == 3) ? VOCAB_V3 : VOCAB_V2;
+        const int vocab_size = weights.config.n_vocab;
         const int max_chunk_samples = MAX_MEL_FRAMES * HOP;
-        if (num_samples <= max_chunk_samples)
-            return transcribe_single(samples, num_samples);
+
+        if (num_samples <= max_chunk_samples) {
+            auto dr = transcribe_chunk(samples, num_samples);
+            last_token_ids = std::move(dr.tokens);
+            last_token_ms.resize(last_token_ids.size());
+            for (size_t i = 0; i < last_token_ids.size(); i++)
+                last_token_ms[i] = dr.frames[i] * MS_PER_ENC_FRAME;
+            return detokenize(last_token_ids, vocab, vocab_size);
+        }
 
         // Long audio: split at silence boundaries, transcribe each chunk
         auto splits = find_silence_splits(samples, num_samples);
+        last_token_ids.clear();
+        last_token_ms.clear();
 
         std::string result;
         double mel_ms = 0, enc_ms = 0, dec_ms = 0;
@@ -141,11 +164,19 @@ struct Pipeline {
             int len = end - pos;
             if (len <= 0) { pos = end; continue; }
 
-            std::string chunk_text = transcribe_single(samples + pos, len);
+            auto dr = transcribe_chunk(samples + pos, len);
             mel_ms += last_mel_ms;
             enc_ms += last_enc_ms;
             dec_ms += last_dec_ms;
 
+            // Accumulate tokens with absolute timestamps
+            int offset_ms = (int)((int64_t)pos * 1000 / 16000);
+            for (size_t j = 0; j < dr.tokens.size(); j++) {
+                last_token_ids.push_back(dr.tokens[j]);
+                last_token_ms.push_back(offset_ms + dr.frames[j] * MS_PER_ENC_FRAME);
+            }
+
+            std::string chunk_text = detokenize(dr.tokens, vocab, vocab_size);
             if (!chunk_text.empty()) {
                 if (!result.empty()) result += ' ';
                 result += chunk_text;
@@ -206,9 +237,9 @@ private:
         return splits;
     }
 
-    std::string transcribe_single(const float* samples, int num_samples) {
+    DecodeResult transcribe_chunk(const float* samples, int num_samples) {
         // Need at least 10 mel frames (100ms) for a valid encoder pass
-        if (num_samples < HOP * 10) return "";
+        if (num_samples < HOP * 10) return {};
 
         auto t_start = std::chrono::high_resolution_clock::now();
 
@@ -224,23 +255,23 @@ private:
         auto t_enc = std::chrono::high_resolution_clock::now();
 
         // --- 3. TDT greedy decode ---
-        auto text = decode(T);
+        auto result = decode(T);
         auto t_dec = std::chrono::high_resolution_clock::now();
 
         last_mel_ms = std::chrono::duration<double, std::milli>(t_mel - t_start).count();
         last_enc_ms = std::chrono::duration<double, std::milli>(t_enc - t_mel).count();
         last_dec_ms = std::chrono::duration<double, std::milli>(t_dec - t_enc).count();
-        return text;
+        return result;
     }
 
-    std::string decode(int enc_len) {
+    DecodeResult decode(int enc_len) {
         cuda_model.decoder_reset();
 
         const int blank_id = weights.config.blank_id;
         const int n_vocab  = weights.config.n_vocab;
         const int d_output = weights.config.d_output;
 
-        std::vector<int> tokens;
+        DecodeResult result;
         int last_token = blank_id;
         int t = 0, emitted = 0;
 
@@ -263,7 +294,8 @@ private:
 
             if (token != blank_id) {
                 cuda_model.decoder_commit();
-                tokens.push_back(token);
+                result.tokens.push_back(token);
+                result.frames.push_back(t);
                 last_token = token;
                 emitted++;
             }
@@ -272,8 +304,7 @@ private:
             else if (token == blank_id || emitted >= 2) { t++; emitted = 0; }
         }
 
-        const char* const* vocab = (weights.config.version == 3) ? VOCAB_V3 : VOCAB_V2;
-        return detokenize(tokens, vocab, weights.config.n_vocab);
+        return result;
     }
 };
 
@@ -294,6 +325,7 @@ int main(int argc, char** argv) {
             "Options:\n"
             "  --model v2|v3              Model version [default: v2 English, v3 multilingual]\n"
             "  --weights FILE             Model weights [default: ~/.cache/paraketto/]\n"
+            "  --timestamps               Output word-level timestamps (tab-delimited)\n"
             "  --server [[host]:port]     Start HTTP server [default: 0.0.0.0:8080]\n"
 #ifdef WITH_CORRECTOR
             "  --correct                  Enable LLM text correction\n"
@@ -311,6 +343,7 @@ int main(int argc, char** argv) {
     std::string weights_path;
     std::vector<std::string> wav_files;
     bool server_mode = false;
+    bool timestamps = false;
     std::string server_host = "0.0.0.0";
     int server_port = 8080;
 #ifdef WITH_CORRECTOR
@@ -336,6 +369,8 @@ int main(int argc, char** argv) {
             llm_model_path = argv[++i];
             enable_correct = true;
 #endif
+        } else if (arg == "--timestamps") {
+            timestamps = true;
         } else if (arg == "--server") {
             server_mode = true;
             if (i + 1 < argc && argv[i + 1][0] != '-') {
@@ -560,7 +595,15 @@ int main(int argc, char** argv) {
         } else
 #endif
         {
-            printf("%s\n", text.c_str());
+            if (timestamps) {
+                const char* const* vocab = (pipeline.weights.config.version == 3) ? VOCAB_V3 : VOCAB_V2;
+                auto words = words_with_timestamps(pipeline.last_token_ids, pipeline.last_token_ms,
+                                                   vocab, pipeline.weights.config.n_vocab);
+                for (auto& w : words)
+                    printf("%d\t%s\n", w.start_ms, w.word.c_str());
+            } else {
+                printf("%s\n", text.c_str());
+            }
             fprintf(stderr, "%.1fs audio, %.1fms (mel=%.1f enc=%.1f dec=%.1f), %.0fx RTFx\n",
                     audio_dur, elapsed * 1000,
                     pipeline.last_mel_ms, pipeline.last_enc_ms, pipeline.last_dec_ms,
