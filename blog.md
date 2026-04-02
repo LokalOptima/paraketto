@@ -1863,3 +1863,27 @@ Total                             5.72s      5.69s
 ```
 
 WER identical. Timing within noise. The trim doesn't trigger on clean benchmark files — zero overhead on the common path.
+
+## Decoder Hallucination Fix: Emission Cap 10 → 2
+
+### The problem
+
+Short audio clips (1-2s, extracted from longer files) sometimes produced hallucinated text — the model generating loops like "the first time the first time was the first time" with all tokens pinned to the same encoder frame.
+
+### Root cause
+
+The TDT decoder predicts a duration (step) alongside each token. When `step=0`, it stays on the same encoder frame and predicts again. A safety cap (`emitted >= 10`) limited same-frame emissions to 10 before forcing advancement.
+
+On short clips, trailing encoder frames (past the end of real speech) contain meaningless activations. The decoder confidently predicted non-blank tokens with `step=0` at these frames, emitting up to 10 garbage tokens per frame before the cap kicked in. Over ~20 trailing frames, that's up to 200 hallucinated tokens.
+
+### Discovery
+
+Observed during timestamp work: extracting a 1.8s clip and transcribing it produced `"On the sixth of April, the first time the first time was the first time"`. The `--timestamps` output showed all hallucinated tokens pinned to frame 1360ms — the decoder was stuck emitting at a single frame.
+
+### Fix
+
+Checked max tokens per frame across normal transcriptions of 140+ files: always exactly 1. Lowered the cap from `emitted >= 10` to `emitted >= 2`. Verified: hallucination eliminated, normal transcription unchanged across all benchmark files.
+
+### Why not beam search?
+
+Beam search wouldn't help here. The model is confidently wrong on trailing frames (high logits for garbage tokens), so multiple beams would just produce multiple garbage hypotheses. The emission cap is a cheaper, more targeted fix.
