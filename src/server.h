@@ -345,20 +345,12 @@ async function sendFile(file, name) {
             return;
         }
 
-        bool want_timestamps = req.has_param("timestamps");
-
         double audio_dur = (double)wav.samples.size() / wav.sample_rate;
         auto t0 = std::chrono::high_resolution_clock::now();
         std::string text;
-        std::vector<WordTiming> words;
         {
             std::lock_guard<std::mutex> lock(mtx);
             text = pipeline.transcribe(wav.samples.data(), wav.samples.size());
-            if (want_timestamps) {
-                const char* const* vocab = (pipeline.weights.config.version == 3) ? VOCAB_V3 : VOCAB_V2;
-                words = words_with_timestamps(pipeline.last_token_ids, pipeline.last_token_ms,
-                                              vocab, pipeline.weights.config.n_vocab);
-            }
         }
         auto t1 = std::chrono::high_resolution_clock::now();
         double elapsed = std::chrono::duration<double>(t1 - t0).count();
@@ -391,21 +383,6 @@ async function sendFile(file, name) {
             ",\"dec_ms\":" + std::to_string(pipeline.last_dec_ms);
         if (correct_ms > 0)
             body += ",\"correct_ms\":" + std::to_string(correct_ms);
-        if (!words.empty()) {
-            body += ",\"words\":[";
-            for (size_t i = 0; i < words.size(); i++) {
-                if (i) body += ',';
-                body += '"';
-                body += json_escape(words[i].word);
-                body += '"';
-            }
-            body += "],\"starts_ms\":[";
-            for (size_t i = 0; i < words.size(); i++) {
-                if (i) body += ',';
-                body += std::to_string(words[i].start_ms);
-            }
-            body += ']';
-        }
         body += "}";
         res.set_content(body, "application/json");
     });
