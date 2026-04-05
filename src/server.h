@@ -77,6 +77,11 @@ static void run_server(PipelineT& pipeline, const std::string& host, int port) {
         res.set_content("{\"status\":\"ok\"}", "application/json");
     });
 
+    svr.Post("/shutdown", [&svr](const httplib::Request&, httplib::Response& res) {
+        res.set_content("{\"status\":\"shutting down\"}", "application/json");
+        svr.stop();
+    });
+
     svr.Get("/", [](const httplib::Request&, httplib::Response& res) {
         res.set_content(R"html(<!DOCTYPE html>
 <html lang="en">

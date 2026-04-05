@@ -169,10 +169,12 @@ Requires the llama.cpp git submodule (`git submodule update --init`).
 - `GET /` — web UI (microphone recording + file upload)
 - `GET /health` — returns `{"status":"ok"}`
 - `POST /transcribe` — multipart `file` upload, returns `{"text":"...","audio_duration_s":...,"inference_time_s":...}`
+- `POST /shutdown` — gracefully stops the server
 
 ```bash
 curl localhost:8080/health
 curl -F file=@audio.wav localhost:8080/transcribe
+curl -X POST localhost:8080/shutdown
 ```
 
 ## Benchmarks
