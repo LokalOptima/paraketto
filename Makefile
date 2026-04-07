@@ -195,7 +195,51 @@ bench_tiles: tests/bench_tiles.cu
 bench_ff2: tests/bench_ff2.cu
 	$(NVCC) $(NVFLAGS) -arch=sm_120 $(CUTLASS_INC) tests/bench_ff2.cu -lcublas -lcublasLt -o $@
 
+# ---------------------------------------------------------------------------
+# Metal backend (macOS ARM64 only — Apple Silicon)
+# ---------------------------------------------------------------------------
+
+METAL_CXX     = clang++
+METAL_CXXFLAGS = -std=c++17 -O3 -fobjc-arc -Isrc -Ithird_party
+METAL_LDFLAGS  = -framework Metal -framework Foundation
+METAL_SHADERS = metal/kernels.metal metal/gemm.metal
+
+# Embed shader source as a C string for runtime compilation
+metal/shaders_embedded.h: metal/kernels.metal
+	@echo "[metal] embedding shader source..."
+	@printf 'static const char METAL_SHADER_SRC[] = R"(\n' > $@
+	@cat metal/kernels.metal >> $@
+	@printf '\n)";\n' >> $@
+
+src/metal_context.o: src/metal_context.mm src/metal_context.h src/common_metal.h
+	$(METAL_CXX) $(METAL_CXXFLAGS) -c $< -o $@
+
+src/metal_kernels.o: src/metal_kernels.mm src/metal_kernels.h src/metal_context.h src/metal_context_impl.h src/common_metal.h
+	$(METAL_CXX) $(METAL_CXXFLAGS) -c $< -o $@
+
+src/metal_gemm.o: src/metal_gemm.mm src/metal_gemm.h src/metal_kernels.h src/metal_context.h src/metal_context_impl.h
+	$(METAL_CXX) $(METAL_CXXFLAGS) -c $< -o $@
+
+src/conformer_metal.o: src/conformer_metal.mm src/conformer_metal.h src/metal_context.h src/metal_context_impl.h src/metal_kernels.h src/metal_gemm.h src/common_metal.h
+	$(METAL_CXX) $(METAL_CXXFLAGS) -c $< -o $@
+
+METAL_OBJS = src/metal_context.o src/metal_kernels.o src/metal_gemm.o src/conformer_metal.o
+
+src/paraketto_metal.o: src/paraketto_metal.mm src/conformer_metal.h src/metal_context.h src/common_metal.h src/mel_data.h src/vocab.h
+	$(METAL_CXX) $(METAL_CXXFLAGS) -c $< -o $@
+
+paraketto.metal: $(METAL_OBJS) src/paraketto_metal.o
+	$(METAL_CXX) $(METAL_LDFLAGS) $^ -o $@
+
+# Metal smoke test (validates shader compilation + basic kernels)
+tests/test_metal_smoke: tests/test_metal_smoke.mm src/metal_context.o
+	$(METAL_CXX) $(METAL_CXXFLAGS) $(METAL_LDFLAGS) $^ -o $@
+
+# Metal GEMM test (validates simdgroup_matrix GEMM correctness + perf)
+tests/test_metal_gemm: tests/test_metal_gemm.mm src/metal_context.o
+	$(METAL_CXX) $(METAL_CXXFLAGS) $(METAL_LDFLAGS) $^ -o $@
+
 clean:
-	rm -f paraketto.cuda paraketto.cublas paraketto.static paraketto.fp8 paraketto.fp8.static paraketto.fp8.baseline
+	rm -f paraketto.cuda paraketto.cublas paraketto.static paraketto.fp8 paraketto.fp8.static paraketto.fp8.baseline paraketto.metal
 	rm -f bench_ff2 bench_fp8 bench_gemm bench_splitk bench_tiles
-	rm -f src/*.o
+	rm -f src/*.o metal/shaders_embedded.h
