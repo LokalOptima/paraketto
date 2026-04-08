@@ -85,12 +85,12 @@ static WavData read_wav(const std::string& path) {
 // CPU Mel spectrogram (uses mel_data.h tables)
 // ---------------------------------------------------------------------------
 
-struct MetalMelSpec {
-    std::vector<float> preemph_buf, frames_buf;
+struct MetalMelPrep {
+    std::vector<float> preemph_buf;
 
-    void compute(const float* audio, int num_samples,
-                 char* pool, size_t mel_fp32_off,
-                 int& n_frames, int& n_valid) {
+    void prepare_frames(const float* audio, int num_samples,
+                        char* pool, size_t frames_fp32_off,
+                        int& n_frames, int& n_valid) {
         if (num_samples <= 0) { n_frames=0; n_valid=0; return; }
 
         if ((int)preemph_buf.size() < num_samples) preemph_buf.resize(num_samples);
@@ -102,61 +102,15 @@ struct MetalMelSpec {
         n_frames = (num_samples + 2*pad - N_FFT) / HOP + 1;
         n_valid  = num_samples / HOP;
 
-        size_t need = (size_t)n_frames * N_FFT;
-        if (frames_buf.size() < need) frames_buf.resize(need);
-
+        // Write windowed frames directly to GPU buffer (unified memory)
+        float* frames = (float*)(pool + frames_fp32_off);
         for (int f=0; f<n_frames; f++) {
-            float* row = frames_buf.data() + (size_t)f*N_FFT;
+            float* row = frames + (size_t)f*N_FFT;
             int base = f*HOP - pad;
             for (int i=0; i<N_FFT; i++) {
                 int pos = base+i;
                 row[i] = (pos>=0 && pos<num_samples ? preemph_buf[pos] : 0.0f) * HANN_WINDOW[i];
             }
-        }
-
-        // CPU FFT + mel filterbank + log
-        std::vector<float> mel_log((size_t)n_frames * N_MELS);
-        for (int fr=0; fr<n_frames; fr++) {
-            const float* in = frames_buf.data() + (size_t)fr*N_FFT;
-            float sr[512], si[512];
-            for (int i=0; i<512; i++) {
-                int j=i, rev=0;
-                for (int b=0; b<9; b++) { rev=(rev<<1)|(j&1); j>>=1; }
-                sr[rev]=in[i]; si[rev]=0;
-            }
-            for (int s=0; s<9; s++) {
-                int sz=1<<(s+1), hs=sz>>1;
-                for (int g=0; g<512/sz; g++)
-                    for (int k=0; k<hs; k++) {
-                        int a=g*sz+k, b=a+hs;
-                        float ang=-6.283185307179586f*k/sz;
-                        float wr=cosf(ang), wi=sinf(ang);
-                        float tr=wr*sr[b]-wi*si[b], ti=wr*si[b]+wi*sr[b];
-                        float ar=sr[a], ai=si[a];
-                        sr[a]=ar+tr; si[a]=ai+ti; sr[b]=ar-tr; si[b]=ai-ti;
-                    }
-            }
-            float mel_acc[128]={};
-            for (int i=0; i<N_MEL_ENTRIES; i++)
-                mel_acc[MEL_FILTERBANK[i].mel] +=
-                    (sr[MEL_FILTERBANK[i].freq]*sr[MEL_FILTERBANK[i].freq]+
-                     si[MEL_FILTERBANK[i].freq]*si[MEL_FILTERBANK[i].freq]) *
-                    MEL_FILTERBANK[i].weight;
-            for (int i=0; i<N_MELS; i++)
-                mel_log[fr*N_MELS+i] = logf(mel_acc[i]+LOG_EPS);
-        }
-
-        // Normalize + transpose → [128, n_valid]
-        float* mel_ptr = (float*)(pool + mel_fp32_off);
-        for (int ch=0; ch<N_MELS; ch++) {
-            float sum=0;
-            for (int i=0; i<n_valid; i++) sum += mel_log[i*N_MELS+ch];
-            float mean = sum/n_valid;
-            float vs=0;
-            for (int i=0; i<n_valid; i++) { float d=mel_log[i*N_MELS+ch]-mean; vs+=d*d; }
-            float inv = 1.0f/(sqrtf(vs/std::max(1,n_valid-1))+1e-5f);
-            for (int i=0; i<n_valid; i++)
-                mel_ptr[ch*n_valid+i] = (mel_log[i*N_MELS+ch]-mean)*inv;
         }
     }
 };
@@ -195,7 +149,7 @@ static void ensure_file(const std::string& path, const char* url) {
 
 struct Pipeline {
     MetalModel model;
-    MetalMelSpec mel;
+    MetalMelPrep mel;
     double last_mel_ms=0, last_enc_ms=0, last_dec_ms=0;
     bool profile=false;
 
@@ -206,7 +160,8 @@ struct Pipeline {
         auto t0=std::chrono::high_resolution_clock::now();
         int nf, nv;
         char* pool=(char*)model.ctx.buffer_contents(model.gpu_pool_handle);
-        mel.compute(s, n, pool, model.mel_fp32_off, nf, nv);
+        mel.prepare_frames(s, n, pool, model.frames_fp32_off, nf, nv);
+        model.compute_mel_gpu(nf, nv);
         auto t1=std::chrono::high_resolution_clock::now();
         int T = profile ? model.encode_gpu_profile(nv) : model.encode_gpu(nv);
         auto t2=std::chrono::high_resolution_clock::now();

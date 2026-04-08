@@ -46,6 +46,10 @@ struct MetalModel {
 
     // --- Buffer offsets (bytes) into gpu_pool ---
 
+    // Mel spectrogram (GPU FFT path)
+    size_t frames_fp32_off = 0;  // windowed frames [n_frames, 512] float32
+    size_t mel_raw_off = 0;      // FFT output [n_frames, 128] float32
+
     // Encoder (subsampling phase — aliased with conformer phase)
     size_t mel_fp32_off = 0;
     size_t mel_fp16_off = 0;
@@ -90,6 +94,7 @@ struct MetalModel {
     void free();
 
     // Inference
+    void compute_mel_gpu(int n_frames, int n_valid);
     int  encode_gpu(int T_mel);
     void decoder_reset();
     int  decode_step(int enc_frame_idx, int prev_token);  // returns token

@@ -12,6 +12,7 @@
 #include "metal_kernels.h"
 #include "metal_gemm.h"
 #include "common_metal.h"
+#include "mel_data.h"
 
 #include <algorithm>
 #include <cmath>
@@ -165,6 +166,8 @@ void MetalModel::init(const char* weights_path, int max_mel_frames) {
     int H3 = (H2 + 2 - 3) / 2 + 1;
     int W3 = (W2 + 2 - 3) / 2 + 1;
     size_t mel_fp32_elems = 128 * max_mel_frames;
+    size_t frames_fp32_elems = (size_t)max_mel_frames * N_FFT;  // [n_frames, 512]
+    size_t mel_raw_elems = (size_t)max_mel_frames * N_MELS;     // [n_frames, 128]
 
     auto rbytes = [](const size_t* s, int n) -> size_t {
         size_t o = 0;
@@ -200,6 +203,8 @@ void MetalModel::init(const char* weights_path, int max_mel_frames) {
 
     size_t act_bytes = aliased + persist + (size_t)N_BLOCKS * qkv_blk
                      + ALIGN + mel_fp32_elems * sizeof(float)
+                     + ALIGN + frames_fp32_elems * sizeof(float)
+                     + ALIGN + mel_raw_elems * sizeof(float)
                      + ALIGN + 2 * sizeof(int);
 
     // Unified pool: [activations | weights]
@@ -252,6 +257,8 @@ void MetalModel::init(const char* weights_path, int max_mel_frames) {
         pc = (pc+ALIGN-1)&~(ALIGN-1); qkv_w_off[b] = pc; pc += qkv_elem*sizeof(half_t);
     }
     pc = (pc+ALIGN-1)&~(ALIGN-1); mel_fp32_off = pc; pc += mel_fp32_elems*sizeof(float);
+    pc = (pc+ALIGN-1)&~(ALIGN-1); frames_fp32_off = pc; pc += frames_fp32_elems*sizeof(float);
+    pc = (pc+ALIGN-1)&~(ALIGN-1); mel_raw_off = pc; pc += mel_raw_elems*sizeof(float);
     pc = (pc+ALIGN-1)&~(ALIGN-1); argmax_out_off = pc;
 
     // Pre-concatenate QKV weights (CPU, unified memory)
@@ -295,11 +302,33 @@ void MetalModel::init(const char* weights_path, int max_mel_frames) {
                                         pos_enc_off, T_max, D_MODEL);
         [e endEncoding]; [cmd commit]; [cmd waitUntilCompleted];
     }
+
+    // Mel filterbank (GPU)
+    metal_mel_init_filterbank(ctx, MEL_FILTERBANK, N_MEL_ENTRIES);
 }
 
 void MetalModel::free() {
     if (gpu_pool_handle) { ctx.free_buffer(gpu_pool_handle); gpu_pool_handle = nullptr; }
     metal_gemm_free();
+}
+
+// ---------------------------------------------------------------------------
+// GPU mel spectrogram: windowed frames → FFT → mel filterbank → normalize
+// ---------------------------------------------------------------------------
+
+void MetalModel::compute_mel_gpu(int n_frames, int n_valid) {
+    void* P = gpu_pool_handle;
+    id<MTLCommandBuffer> cmd = [ctx.impl->queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    void* E = (__bridge void*)enc;
+
+    // FFT + mel filterbank + log: frames[n_frames, 512] → mel_raw[n_frames, 128]
+    metal_fft512_mel_log(ctx, E, P, frames_fp32_off, mel_raw_off, n_frames);
+
+    // Normalize + transpose: mel_raw[n_frames, 128] → mel_fp32[128, n_valid]
+    metal_mel_normalize(ctx, E, P, mel_raw_off, mel_fp32_off, n_frames, n_valid);
+
+    [enc endEncoding]; [cmd commit]; [cmd waitUntilCompleted];
 }
 
 // ---------------------------------------------------------------------------
