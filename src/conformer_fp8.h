@@ -17,6 +17,8 @@
 #include <cublas_v2.h>
 #include <cublasLt.h>
 
+namespace paraketto {
+
 // ---------------------------------------------------------------------------
 // CudaModel — FP8 variant with extra quantization fields
 // ---------------------------------------------------------------------------
@@ -109,5 +111,7 @@ struct CudaModel {
     half* decode_step(int enc_frame_idx, int prev_token);
     void  decoder_commit();
 };
+
+} // namespace paraketto
 
 #endif  // CONFORMER_H_

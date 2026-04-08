@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 
+namespace paraketto {
+
 // ---------------------------------------------------------------------------
 // V2 Vocabulary (1025 BPE tokens, blank=1024)
 // From istupakov/parakeet-tdt-0.6b-v2-onnx on HuggingFace (vocab.txt).
@@ -121,3 +123,5 @@ static std::string detokenize(const std::vector<int>& ids,
     size_t start = text.find_first_not_of(' ');
     return (start == std::string::npos) ? "" : text.substr(start);
 }
+
+} // namespace paraketto

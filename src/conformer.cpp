@@ -14,6 +14,8 @@
 #include <cstdlib>
 #include <cstring>
 
+using namespace paraketto;
+
 void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames) {
     w = &weights;
     stream = s;

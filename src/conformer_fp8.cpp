@@ -19,6 +19,8 @@
 #include <unordered_map>
 #include <vector>
 
+using namespace paraketto;
+
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>

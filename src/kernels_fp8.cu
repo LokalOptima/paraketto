@@ -8,6 +8,8 @@
 #include <cuda_fp8.h>
 #include <cfloat>
 
+namespace paraketto {
+
 static constexpr float FP8_E4M3_MAX = 448.0f;
 
 // ---------------------------------------------------------------------------
@@ -445,3 +447,5 @@ void reshape_chw_to_hcw_fp8(const half* in, half* out, uint8_t* fp8_out,
     reshape_chw_to_hcw_fp8_kernel<<<blocks, threads, 0, stream>>>(
         in, out, fp8_out, fp8_scale, C, H, W);
 }
+
+} // namespace paraketto

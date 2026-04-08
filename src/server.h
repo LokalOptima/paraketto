@@ -14,6 +14,8 @@
 #include "cpp-httplib/httplib.h"
 #include "wav.h"
 
+using namespace paraketto;
+
 #ifdef WITH_CORRECTOR
 #include "corrector.h"
 #endif

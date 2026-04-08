@@ -9,6 +9,8 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
+namespace paraketto {
+
 // ---------------------------------------------------------------------------
 // FP8 E4M3 quantization: multi-block absmax + scale + quantize
 //   in:        [n] FP16 input
@@ -86,3 +88,5 @@ void transpose_0213_fp8(const half* in, half* out, uint8_t* fp8_out,
 void reshape_chw_to_hcw_fp8(const half* in, half* out, uint8_t* fp8_out,
                              const float* fp8_scale,
                              int C, int H, int W, cudaStream_t stream);
+
+} // namespace paraketto

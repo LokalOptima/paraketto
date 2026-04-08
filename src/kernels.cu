@@ -7,6 +7,8 @@
 #include "common.h"
 #include <cfloat>
 
+namespace paraketto {
+
 // ---------------------------------------------------------------------------
 // LayerNorm
 // ---------------------------------------------------------------------------
@@ -1047,3 +1049,5 @@ void mel_normalize(const float* mel_in, float* mel_out,
     mel_normalize_kernel<<<128, threads, 0, stream>>>(mel_in, mel_out, n_frames, n_valid);
 }
 
+
+} // namespace paraketto

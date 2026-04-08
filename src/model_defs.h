@@ -13,6 +13,8 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
+namespace paraketto {
+
 // ---------------------------------------------------------------------------
 // Weight file format
 // ---------------------------------------------------------------------------
@@ -175,5 +177,7 @@ struct Weights {
     /// Free the GPU allocation.
     void free();
 };
+
+} // namespace paraketto
 
 #endif  // MODEL_DEFS_H_

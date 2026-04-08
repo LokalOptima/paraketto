@@ -12,6 +12,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+namespace paraketto {
+
 // Lifecycle
 void gemm_init(cudaStream_t stream);
 void gemm_free();
@@ -56,3 +58,5 @@ void batched_gemm_nt_ex(cudaStream_t stream,
                         const half* B, int ldB, long long strideB,
                         half* C, int ldC, long long strideC,
                         int batch, int m, int n, int k);
+
+} // namespace paraketto

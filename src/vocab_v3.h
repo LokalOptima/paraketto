@@ -1,5 +1,6 @@
 // V3 vocab: 8193 tokens (blank=8192)
 // Generated from istupakov/parakeet-tdt-0.6b-v3-onnx vocab.txt
+// NOTE: This file is included from within namespace paraketto { } in vocab.h
 static const char* const VOCAB_V3[] = {
     "<unk>","<|nospeech|>","<pad>","<|endoftext|>","<|startoftranscript|>","<|pnc|>","<|nopnc|>","<|startofcontext|>",
     "<|itn|>","<|noitn|>","<|timestamp|>","<|notimestamp|>","<|diarize|>","<|nodiarize|>","<|spkchange|>","<|audioseparator|>",

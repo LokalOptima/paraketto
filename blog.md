@@ -1887,3 +1887,30 @@ Checked max tokens per frame across normal transcriptions of 140+ files: always 
 ### Why not beam search?
 
 Beam search wouldn't help here. The model is confidently wrong on trailing frames (high logits for garbage tokens), so multiple beams would just produce multiple garbage hypotheses. The emission cap is a cheaper, more targeted fix.
+
+---
+
+## Library target: `namespace paraketto` + `paraketto.h`
+
+Paraketto needs to be embeddable as a static library in the [orchestrator](../orchestrator/) project, which links both paraketto (STT) and rokoko (TTS) into a single binary. Both projects define `struct Weights`, `CUDA_CHECK`, and other common names — linking them together without namespaces would produce symbol collisions.
+
+### Changes
+
+1. **Namespace wrapping**: Every header (`common.h`, `model_defs.h`, `conformer.h`, `conformer_fp8.h`, `kernels.h`, `kernels_fp8.h`, `gemm.h`, `cutlass_gemm.h`, `wav.h`, `mel.h`, `vocab.h`) now wraps its content in `namespace paraketto { }`. The `CUDA_CHECK` and `CUBLAS_CHECK` macros stay global (macros are namespace-agnostic anyway).
+
+2. **Source files**: All `.cpp` and `.cu` files add either `using namespace paraketto;` (for files with only class member definitions, like `conformer.cpp` and `weights.cpp`) or `namespace paraketto { }` wrapping (for files with free function definitions, like `kernels.cu` and `cutlass_gemm.cu`). The distinction matters because of C++ name lookup rules — `using namespace` lets you *find* names but doesn't place *definitions* into the namespace.
+
+3. **`paraketto.h`**: New public header that includes all necessary internal headers and defines the `Pipeline` struct (previously inline in `paraketto_cuda.cpp`). This is the single include for embedding: `#include "paraketto.h"` gives you `paraketto::Pipeline`, `paraketto::Weights::prefetch()`, `paraketto::read_wav()`, etc.
+
+4. **`server.h`**: Uses `using namespace paraketto;` rather than namespace wrapping, because its template functions need non-dependent name lookup to resolve `read_wav_from_memory()` and `json_escape()` during first-phase template parsing. This is a GCC two-phase lookup constraint.
+
+### Verification
+
+All three build variants (CUTLASS FP16, cuBLAS FP16, FP8) compile and produce identical transcription output. Full benchmark unchanged:
+
+```
+librispeech: WER=1.46%, 1185x RTFx
+earnings22:  WER=10.93%, 1067x RTFx
+long:        WER=1.79%, 1396x RTFx
+difficult:   WER=16.54%, 1305x RTFx
+```

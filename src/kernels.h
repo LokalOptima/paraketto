@@ -9,6 +9,8 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
+namespace paraketto {
+
 // ---------------------------------------------------------------------------
 // LayerNorm: y = gamma * (x - mean) / sqrt(var + eps) + beta
 //   x, y:     [N, D]
@@ -234,3 +236,5 @@ void fft512_mel_log(const float* frames, float* mel_out, int n_frames,
 // ---------------------------------------------------------------------------
 void mel_normalize(const float* mel_in, float* mel_out,
                    int n_frames, int n_valid, cudaStream_t stream);
+
+} // namespace paraketto

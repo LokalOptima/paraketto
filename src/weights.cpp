@@ -18,6 +18,8 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+
+using namespace paraketto;
 #include <unistd.h>
 
 // ---------------------------------------------------------------------------

@@ -11,6 +11,8 @@
 
 #include "model_defs.h"
 
+namespace paraketto {
+
 // ---------------------------------------------------------------------------
 // CudaModel — encoder + decoder forward pass
 // ---------------------------------------------------------------------------
@@ -76,5 +78,7 @@ struct CudaModel {
     half* decode_step(int enc_frame_idx, int prev_token);
     void  decoder_commit();
 };
+
+} // namespace paraketto
 
 #endif  // CONFORMER_H_

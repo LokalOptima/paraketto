@@ -17,6 +17,8 @@
 #include "cutlass/gemm/device/gemm_batched.h"
 #include "cutlass/gemm/device/gemm_splitk_parallel.h"
 
+namespace paraketto {
+
 // =========================================================================
 // CUTLASS kernel type aliases — SM80 FP16 TensorOp
 // =========================================================================
@@ -602,3 +604,5 @@ void batched_gemm_nt_ex(cudaStream_t s,
                         half* C, int ldC, long long sC,
                         int batch, int m, int n, int k)
     { cutlass_batched_gemm_nt_ex(s, A, ldA, sA, B, ldB, sB, C, ldC, sC, batch, m, n, k); }
+
+} // namespace paraketto

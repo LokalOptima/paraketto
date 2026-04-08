@@ -11,6 +11,8 @@
 #include <cublasLt.h>
 #include <unordered_map>
 
+namespace paraketto {
+
 // =========================================================================
 // Static state
 // =========================================================================
@@ -225,3 +227,5 @@ void batched_gemm_nt_ex(cudaStream_t stream,
         A, CUDA_R_16F, ldA, strideA, &beta, C, CUDA_R_16F, ldC, strideC,
         batch, CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 }
+
+} // namespace paraketto

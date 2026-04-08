@@ -5,6 +5,8 @@
 #include "kernels.h"
 #include <vector>
 
+namespace paraketto {
+
 // ---------------------------------------------------------------------------
 // Mel spectrogram (CPU) — matches NeMo nemo128.onnx preprocessor
 // ---------------------------------------------------------------------------
@@ -409,3 +411,5 @@ struct MelSpec {
         mel_normalize(d_mel, d_mel_out, n_frames, n_valid, stream);
     }
 };
+
+} // namespace paraketto

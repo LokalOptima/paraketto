@@ -9,6 +9,8 @@
 #include <string>
 #include <vector>
 
+namespace paraketto {
+
 // Anti-aliasing FIR low-pass filter + linear interpolation resampler (24kHz → 16kHz).
 // 31-tap Hamming-windowed sinc, cutoff 7.5kHz @ 24kHz (-6dB at cutoff, -75dB @ 10kHz).
 static inline void resample_24k_to_16k(std::vector<float>& samples) {
@@ -151,3 +153,5 @@ static inline WavData read_wav_from_memory(const char* buf, size_t len) {
     if (!fmt.data_ptr || fmt.num_channels != 1 || (fmt.sample_rate != 16000 && fmt.sample_rate != 24000)) return {};
     return wav_decode_samples(fmt, fmt.data_ptr);
 }
+
+} // namespace paraketto
