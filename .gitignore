@@ -40,6 +40,10 @@ paraketto.static
 paraketto.fp8
 paraketto.fp8.static
 paraketto.fp8.baseline
+paraketto.metal
+tests/test_metal_smoke
+tests/test_metal_gemm
+tests/bench_metal_gemm
 *.o
 *.so
 *.a

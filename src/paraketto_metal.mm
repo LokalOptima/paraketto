@@ -197,6 +197,7 @@ struct Pipeline {
     MetalModel model;
     MetalMelSpec mel;
     double last_mel_ms=0, last_enc_ms=0, last_dec_ms=0;
+    bool profile=false;
 
     void init(const std::string& wp) { model.init(wp.c_str(), MAX_MEL_FRAMES); }
 
@@ -207,7 +208,7 @@ struct Pipeline {
         char* pool=(char*)model.ctx.buffer_contents(model.gpu_pool_handle);
         mel.compute(s, n, pool, model.mel_fp32_off, nf, nv);
         auto t1=std::chrono::high_resolution_clock::now();
-        int T=model.encode_gpu(nv);
+        int T = profile ? model.encode_gpu_profile(nv) : model.encode_gpu(nv);
         auto t2=std::chrono::high_resolution_clock::now();
         auto text=decode(T);
         auto t3=std::chrono::high_resolution_clock::now();
@@ -249,11 +250,13 @@ int main(int argc, char** argv) {
     std::string dir=cache_dir();
     std::string wp=dir+"/paraketto-fp16.bin";
     std::vector<std::string> wavs;
+    bool profile=false;
 
     for(int i=1;i<argc;i++){
         std::string a=argv[i];
         if(a=="--weights"&&i+1<argc) wp=argv[++i];
-        else if(a=="-h"||a=="--help"){fprintf(stderr,"Usage: %s [--weights F] wav...\n",argv[0]);return 0;}
+        else if(a=="--profile") profile=true;
+        else if(a=="-h"||a=="--help"){fprintf(stderr,"Usage: %s [--weights F] [--profile] wav...\n",argv[0]);return 0;}
         else wavs.push_back(a);
     }
     if(wavs.empty()){fprintf(stderr,"No WAV files.\n");return 1;}
@@ -263,6 +266,7 @@ int main(int argc, char** argv) {
     using clk=std::chrono::high_resolution_clock;
     auto t0=clk::now();
     Pipeline pipe;
+    pipe.profile=profile;
     pipe.init(wp);
     auto t1=clk::now();
     fprintf(stderr,"startup: %.0fms\n",std::chrono::duration<double,std::milli>(t1-t0).count());

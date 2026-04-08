@@ -94,6 +94,9 @@ struct MetalModel {
     void decoder_reset();
     int  decode_step(int enc_frame_idx, int prev_token);  // returns token
     void decoder_commit();
+
+    // Profiling: encode with per-phase GPU timing breakdown
+    int  encode_gpu_profile(int T_mel);
 };
 
 #endif  // CONFORMER_METAL_H_

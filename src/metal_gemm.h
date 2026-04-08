@@ -21,7 +21,12 @@ void metal_gemm_nn(MetalContext& ctx, MetalEncoder enc, MetalBuffer pool,
                    size_t X_off, int m, int k,
                    size_t W_off, int n, size_t Y_off);
 
-// NN + bias: Y[m,n] = X[m,k] @ W[k,n] + bias[n]
+// NN + fused SiLU: Y[m,n] = silu(X[m,k] @ W[k,n])
+void metal_gemm_nn_silu(MetalContext& ctx, MetalEncoder enc, MetalBuffer pool,
+                        size_t X_off, int m, int k,
+                        size_t W_off, int n, size_t Y_off);
+
+// NN + fused bias: Y[m,n] = X[m,k] @ W[k,n] + bias[n]
 void metal_gemm_nn_bias(MetalContext& ctx, MetalEncoder enc, MetalBuffer pool,
                         size_t X_off, int m, int k,
                         size_t W_off, int n,

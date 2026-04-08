@@ -494,4 +494,201 @@ void MetalModel::decoder_commit() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Profiled encode: separate command buffer per phase for GPU timing
+// ---------------------------------------------------------------------------
+
+// Helper: encode a phase in its own command buffer, return GPU time in ms
+struct PhaseTimer {
+    MetalContext& ctx;
+    double gpu_ms = 0;
+
+    explicit PhaseTimer(MetalContext& c) : ctx(c) {}
+
+    id<MTLComputeCommandEncoder> begin() {
+        cmd = [ctx.impl->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        return enc;
+    }
+    void end(id<MTLComputeCommandEncoder> enc) {
+        [enc endEncoding]; [cmd commit]; [cmd waitUntilCompleted];
+        gpu_ms = (cmd.GPUEndTime - cmd.GPUStartTime) * 1000.0;
+    }
+private:
+    id<MTLCommandBuffer> cmd = nil;
+};
+
+int MetalModel::encode_gpu_profile(int T_mel) {
+    void* P = gpu_pool_handle;
+
+    fprintf(stderr, "\n=== Metal Encoder Profile (T_mel=%d) ===\n", T_mel);
+    double total_ms = 0;
+
+    // Phase: Mel cast + transpose
+    {
+        PhaseTimer pt{ctx};
+        auto enc = pt.begin(); void* E = (__bridge void*)enc;
+        metal_cast_fp32_to_fp16(ctx, E, P, mel_fp32_off, mel_fp16_off, 128 * T_mel);
+        metal_transpose_fp16(ctx, E, P, mel_fp16_off, sub_buf_off[0], 128, T_mel);
+        pt.end(enc);
+        fprintf(stderr, "  mel_prep:     %6.2f ms\n", pt.gpu_ms);
+        total_ms += pt.gpu_ms;
+    }
+
+    // Phase: Subsampling convolutions
+    int H = T_mel, W = 128;
+    int H2, W2, T;
+    {
+        PhaseTimer pt{ctx};
+        auto enc = pt.begin(); void* E = (__bridge void*)enc;
+
+        H2 = (H+2-3)/2+1; W2 = (W+2-3)/2+1;
+        metal_conv2d_fp16(ctx, E, P, sub_buf_off[0], WF(sub_conv[0].weight), SIZE_MAX,
+                          sub_buf_off[1], 1, H, W, SUB_CHANNELS, 3, 3, 2, 1, 1);
+        metal_bias_relu_nchw_fp16(ctx, E, P, sub_buf_off[1], WF(sub_conv[0].bias), SUB_CHANNELS, H2*W2);
+        H = H2; W = W2;
+
+        metal_conv2d_fp16(ctx, E, P, sub_buf_off[1], WF(sub_conv[2].weight), WF(sub_conv[2].bias),
+                          sub_buf_off[0], SUB_CHANNELS, H, W, SUB_CHANNELS, 3, 3, 2, 1, SUB_CHANNELS);
+        H = (H+2-3)/2+1; W = (W+2-3)/2+1;
+        metal_gemm_nn(ctx, E, P, WF(sub_conv[3].weight), SUB_CHANNELS, SUB_CHANNELS,
+                      sub_buf_off[0], H*W, sub_buf_off[1]);
+        metal_bias_relu_nchw_fp16(ctx, E, P, sub_buf_off[1], WF(sub_conv[3].bias), SUB_CHANNELS, H*W);
+
+        metal_conv2d_fp16(ctx, E, P, sub_buf_off[1], WF(sub_conv[5].weight), WF(sub_conv[5].bias),
+                          sub_buf_off[0], SUB_CHANNELS, H, W, SUB_CHANNELS, 3, 3, 2, 1, SUB_CHANNELS);
+        H = (H+2-3)/2+1; W = (W+2-3)/2+1;
+        metal_gemm_nn(ctx, E, P, WF(sub_conv[6].weight), SUB_CHANNELS, SUB_CHANNELS,
+                      sub_buf_off[0], H*W, sub_buf_off[1]);
+        metal_bias_relu_nchw_fp16(ctx, E, P, sub_buf_off[1], WF(sub_conv[6].bias), SUB_CHANNELS, H*W);
+
+        T = H;
+        metal_reshape_chw_to_hcw_fp16(ctx, E, P, sub_buf_off[1], sub_buf_off[0], SUB_CHANNELS, T, W);
+        metal_gemm_nn_bias(ctx, E, P, sub_buf_off[0], T, SUB_CHANNELS*W,
+                           WF(sub_out_w), D_MODEL, WF(sub_out_b), x_off);
+
+        pt.end(enc);
+        fprintf(stderr, "  subsampling:  %6.2f ms  (T=%d)\n", pt.gpu_ms, T);
+        total_ms += pt.gpu_ms;
+    }
+
+    size_t pos_enc_T = pos_enc_off + (size_t)(T_max - T) * D_MODEL * sizeof(half_t);
+    int pos_len = 2 * T - 1;
+
+    // Per-block profiling with sub-phase breakdown
+    double block_total = 0;
+    double ff1_total = 0, mhsa_total = 0, conv_total = 0, ff2_total = 0;
+
+    for (int blk = 0; blk < N_BLOCKS; blk++) {
+        auto& b = g_wo.blocks[blk];
+
+        // FF1
+        double ff1_ms, mhsa_ms, conv_ms, ff2_ms;
+        {
+            PhaseTimer pt{ctx};
+            auto enc = pt.begin(); void* E = (__bridge void*)enc;
+            metal_layer_norm_fp16(ctx, E, P, x_off, WF(blocks[blk].ff1_ln_w),
+                                  WF(blocks[blk].ff1_ln_b), ln_out_off, T, D_MODEL, NORM_EPS);
+            metal_gemm_nn(ctx, E, P, ln_out_off, T, D_MODEL, WF(blocks[blk].ff1_w1), D_FF, ff_mid_off);
+            metal_silu_inplace_fp16(ctx, E, P, ff_mid_off, T * D_FF);
+            metal_gemm_nn(ctx, E, P, ff_mid_off, T, D_FF, WF(blocks[blk].ff1_w2), D_MODEL, ff_out_off);
+            metal_residual_add_layer_norm_fp16(ctx, E, P, x_off, ff_out_off, 0.5f,
+                WF(blocks[blk].mhsa_ln_w), WF(blocks[blk].mhsa_ln_b), ln_out_off, T, D_MODEL, NORM_EPS);
+            pt.end(enc);
+            ff1_ms = pt.gpu_ms;
+        }
+
+        // MHSA
+        {
+            PhaseTimer pt{ctx};
+            auto enc = pt.begin(); void* E = (__bridge void*)enc;
+            metal_gemm_nn(ctx, E, P, ln_out_off, T, D_MODEL, qkv_w_off[blk], 3*D_MODEL, qkv_off);
+            metal_split_transpose_qkv_bias_fp16(ctx, E, P, qkv_off,
+                WF(blocks[blk].pos_bias_u), WF(blocks[blk].pos_bias_v),
+                q_u_off, q_v_buf_off, k_off, v_off, T, N_HEADS, HEAD_DIM);
+            metal_gemm_nn(ctx, E, P, pos_enc_T, pos_len, D_MODEL,
+                          WF(blocks[blk].pos_w), D_MODEL, pos_proj_off);
+            metal_batched_gemm_nt_ex(ctx, E, P,
+                q_v_buf_off, HEAD_DIM, (int64_t)T * HEAD_DIM,
+                pos_proj_off, D_MODEL, (int64_t)HEAD_DIM,
+                pos_scores_off, pos_len, (int64_t)T * pos_len,
+                N_HEADS, T, pos_len, HEAD_DIM);
+            float scale = 1.0f / sqrtf((float)HEAD_DIM);
+            metal_batched_gemm_nt(ctx, E, P, q_u_off, k_off, scores_off,
+                N_HEADS, T, T, HEAD_DIM,
+                (int64_t)T*HEAD_DIM, (int64_t)T*HEAD_DIM, (int64_t)T*T);
+            metal_fused_score_softmax_fp16(ctx, E, P, scores_off, pos_scores_off,
+                                            scores_off, N_HEADS, T, scale);
+            metal_batched_gemm_nn(ctx, E, P, scores_off, v_off, attn_out_off,
+                N_HEADS, T, HEAD_DIM, T,
+                (int64_t)T*T, (int64_t)T*HEAD_DIM, (int64_t)T*HEAD_DIM);
+            metal_transpose_0213_fp16(ctx, E, P, attn_out_off, ff_out_off, N_HEADS, T, HEAD_DIM);
+            metal_gemm_nn(ctx, E, P, ff_out_off, T, D_MODEL, WF(blocks[blk].out_w), D_MODEL, mhsa_out_off);
+            metal_residual_add_layer_norm_fp16(ctx, E, P, x_off, mhsa_out_off, 1.0f,
+                WF(blocks[blk].conv_ln_w), WF(blocks[blk].conv_ln_b), ln_out_off, T, D_MODEL, NORM_EPS);
+            pt.end(enc);
+            mhsa_ms = pt.gpu_ms;
+        }
+
+        // Conv module
+        {
+            PhaseTimer pt{ctx};
+            auto enc = pt.begin(); void* E = (__bridge void*)enc;
+            metal_gemm_nt(ctx, E, P, ln_out_off, T, D_MODEL, WF(blocks[blk].conv_pw1_w), D_CONV_PW, conv_mid_off);
+            metal_glu_fp16(ctx, E, P, conv_mid_off, conv_glu_off, T, D_MODEL);
+            metal_depthwise_conv1d_k9_silu_fp16(ctx, E, P, conv_glu_off,
+                WF(blocks[blk].conv_dw_w), WF(blocks[blk].conv_dw_b), conv_dw_off, T, D_MODEL);
+            metal_gemm_nt(ctx, E, P, conv_dw_off, T, D_MODEL, WF(blocks[blk].conv_pw2_w), D_MODEL, mhsa_out_off);
+            metal_residual_add_layer_norm_fp16(ctx, E, P, x_off, mhsa_out_off, 1.0f,
+                WF(blocks[blk].ff2_ln_w), WF(blocks[blk].ff2_ln_b), ln_out_off, T, D_MODEL, NORM_EPS);
+            pt.end(enc);
+            conv_ms = pt.gpu_ms;
+        }
+
+        // FF2
+        {
+            PhaseTimer pt{ctx};
+            auto enc = pt.begin(); void* E = (__bridge void*)enc;
+            metal_gemm_nn(ctx, E, P, ln_out_off, T, D_MODEL, WF(blocks[blk].ff2_w1), D_FF, ff_mid_off);
+            metal_silu_inplace_fp16(ctx, E, P, ff_mid_off, T * D_FF);
+            metal_gemm_nn(ctx, E, P, ff_mid_off, T, D_FF, WF(blocks[blk].ff2_w2), D_MODEL, ff_out_off);
+            metal_residual_add_layer_norm_fp16(ctx, E, P, x_off, ff_out_off, 0.5f,
+                WF(blocks[blk].final_ln_w), WF(blocks[blk].final_ln_b), x_off, T, D_MODEL, NORM_EPS);
+            pt.end(enc);
+            ff2_ms = pt.gpu_ms;
+        }
+
+        double blk_ms = ff1_ms + mhsa_ms + conv_ms + ff2_ms;
+        if (blk < 3 || blk == N_BLOCKS-1) {
+            fprintf(stderr, "  block[%2d]:    %6.2f ms  (ff1=%.2f mhsa=%.2f conv=%.2f ff2=%.2f)\n",
+                    blk, blk_ms, ff1_ms, mhsa_ms, conv_ms, ff2_ms);
+        } else if (blk == 3) {
+            fprintf(stderr, "  ... (blocks 3-%d similar) ...\n", N_BLOCKS-2);
+        }
+        block_total += blk_ms;
+        ff1_total += ff1_ms; mhsa_total += mhsa_ms;
+        conv_total += conv_ms; ff2_total += ff2_ms;
+    }
+    fprintf(stderr, "  blocks avg:   %6.2f ms  (ff1=%.2f mhsa=%.2f conv=%.2f ff2=%.2f)\n",
+            block_total/N_BLOCKS, ff1_total/N_BLOCKS, mhsa_total/N_BLOCKS,
+            conv_total/N_BLOCKS, ff2_total/N_BLOCKS);
+    total_ms += block_total;
+
+    // Encoder projection
+    {
+        PhaseTimer pt{ctx};
+        auto enc = pt.begin(); void* E = (__bridge void*)enc;
+        metal_gemm_nn_bias(ctx, E, P, x_off, T, D_MODEL,
+                           WF(enc_proj_w), D_JOINT, WF(enc_proj_b), enc_proj_all_off);
+        pt.end(enc);
+        fprintf(stderr, "  enc_proj:     %6.2f ms\n", pt.gpu_ms);
+        total_ms += pt.gpu_ms;
+    }
+
+    fprintf(stderr, "  ─────────────────────\n");
+    fprintf(stderr, "  TOTAL GPU:    %6.2f ms\n\n", total_ms);
+
+    return T;
+}
+
 #undef WF
