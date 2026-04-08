@@ -9,7 +9,11 @@
 
 #pragma once
 
-#include "conformer.h"  // CudaModel, Weights, model constants
+#ifdef PARAKETTO_FP8
+#include "conformer_fp8.h"  // CudaModel (FP8 variant), Weights, model constants
+#else
+#include "conformer.h"      // CudaModel, Weights, model constants
+#endif
 #include "common.h"      // CUDA_CHECK, mel constants
 #include "wav.h"         // read_wav, WavData
 #include "mel.h"         // MelSpec
