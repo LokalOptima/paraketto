@@ -62,6 +62,7 @@ int main(int argc, char** argv) {
     std::string weights_path;
     std::vector<std::string> wav_files;
     bool server_mode = false;
+    bool warmup = false;
     std::string server_host = "0.0.0.0";
     int server_port = 8080;
 #ifdef WITH_CORRECTOR
@@ -87,6 +88,8 @@ int main(int argc, char** argv) {
             llm_model_path = argv[++i];
             enable_correct = true;
 #endif
+        } else if (arg == "--warmup") {
+            warmup = true;
         } else if (arg == "--server") {
             server_mode = true;
             if (i + 1 < argc && argv[i + 1][0] != '-') {
@@ -229,10 +232,18 @@ int main(int argc, char** argv) {
     }
 #endif
 
-    if (server_mode) {
-        // Warmup with 1s of silence
+    // Warmup: trigger cublasLt lazy init before timed inference
+    {
         std::vector<float> silence(16000, 0.0f);
         pipeline.transcribe(silence.data(), silence.size());
+    }
+
+    if (warmup && !server_mode) {
+        WavData warmup_wav = read_wav(wav_files[0]);
+        pipeline.transcribe(warmup_wav.samples.data(), warmup_wav.samples.size());
+    }
+
+    if (server_mode) {
         auto t_warmup_done = clk::now();
 
         auto ms = [](auto a, auto b) { return std::chrono::duration<double,std::milli>(b-a).count(); };

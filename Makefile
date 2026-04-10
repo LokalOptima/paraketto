@@ -195,6 +195,9 @@ bench_tiles: tests/bench_tiles.cu
 bench_ff2: tests/bench_ff2.cu
 	$(NVCC) $(NVFLAGS) -arch=sm_120 $(CUTLASS_INC) tests/bench_ff2.cu -lcublas -lcublasLt -o $@
 
+bench_fp8_cutlass: tests/bench_fp8_cutlass.cu
+	$(NVCC) $(NVFLAGS) -arch=sm_120a $(CUTLASS_INC) -Ithird_party/cutlass/examples/common tests/bench_fp8_cutlass.cu -lcublas -lcublasLt -o $@
+
 clean:
 	rm -f paraketto.cuda paraketto.cublas paraketto.static paraketto.fp8 paraketto.fp8.static paraketto.fp8.baseline
 	rm -f bench_ff2 bench_fp8 bench_gemm bench_splitk bench_tiles
