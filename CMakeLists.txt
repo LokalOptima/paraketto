@@ -22,7 +22,7 @@ set(LIB_SOURCES
 )
 
 if(PARAKETTO_FP8)
-    list(APPEND LIB_SOURCES src/conformer_fp8.cpp src/kernels_fp8.cu)
+    list(APPEND LIB_SOURCES src/conformer_fp8.cpp src/kernels_fp8.cu src/cutlass_gemm.cu src/cutlass_gemm_fp8.cu)
 elseif(PARAKETTO_USE_CUBLAS)
     list(APPEND LIB_SOURCES src/conformer.cpp src/cublas_gemm.cu)
 else()
