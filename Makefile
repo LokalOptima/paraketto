@@ -60,12 +60,12 @@ check-weights: $(WEIGHTS)
 		exit 1; \
 	fi
 
-# Verify paraketto-fp8.bin is the expected format (PRKTFP8 v1)
+# Verify paraketto-fp8.bin is the expected format (PRKTFP8 v2)
 check-weights-fp8: $(WEIGHTS_FP8)
 	@m=$$(od -An -tx1 -N7 $(WEIGHTS_FP8) | tr -d ' '); \
 	v=$$(od -An -td4 -N4 -j8 $(WEIGHTS_FP8) | tr -d ' '); \
-	if [ "$$m" != "50524b54465038" ] || [ "$$v" != "1" ]; then \
-		echo "ERROR: paraketto-fp8.bin has invalid header (magic=$$m, version=$$v). Re-run to regenerate."; \
+	if [ "$$m" != "50524b54465038" ] || [ "$$v" != "2" ]; then \
+		echo "ERROR: paraketto-fp8.bin has invalid header (magic=$$m, version=$$v). Delete and re-run to regenerate."; \
 		exit 1; \
 	fi
 
@@ -180,7 +180,9 @@ src/conformer_fp8.o: src/conformer_fp8.cpp src/conformer_fp8.h src/model_defs.h 
 paraketto.fp8: src/paraketto_cuda.cpp src/conformer_fp8.h src/model_defs.h src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o src/cutlass_gemm.o src/cutlass_gemm_fp8.o $(SHARED_HEADERS) $(CORRECTOR_OBJ)
 	$(CXX) $(CUDA_CXXFLAGS) $(CORRECTOR_CFLAGS) -include src/conformer_fp8.h src/paraketto_cuda.cpp src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o src/cutlass_gemm.o src/cutlass_gemm_fp8.o $(CORRECTOR_OBJ) $(CUDA_LDFLAGS) $(CORRECTOR_LDFLAGS) -o $@
 
-# (paraketto-fp8.bin generation removed — paraketto.fp8 auto-downloads from HF)
+# Generate paraketto-fp8.bin from paraketto-fp16.bin (offline quantization)
+generate-fp8: $(WEIGHTS)
+	uv run python scripts/generate_fp8_weights.py $(WEIGHTS) $(WEIGHTS_FP8)
 
 # Convert existing weight files to current format (run once after updating)
 repack: $(WEIGHTS)

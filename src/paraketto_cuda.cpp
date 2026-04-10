@@ -206,6 +206,29 @@ int main(int argc, char** argv) {
     }
 
     if (prefetch_thread.joinable()) prefetch_thread.join();
+
+#ifdef PARAKETTO_FP8
+    // Validate fp8 weights — fail hard if corrupt/stale
+    if (fp8_prefetch_ptr) {
+        bool valid = false;
+        if (fp8_prefetch_size >= FP8_WEIGHTS_HEADER) {
+            auto base = (const uint8_t*)fp8_prefetch_ptr;
+            if (memcmp(base, "PRKTFP8", 7) == 0) {
+                uint32_t ver; memcpy(&ver, base + 8, 4);
+                uint32_t mver; memcpy(&mver, base + 12, 4);
+                valid = (ver == FP8_WEIGHTS_VERSION) && (mver == 2 || mver == 3);
+            }
+        }
+        if (!valid) {
+            munmap(fp8_prefetch_ptr, fp8_prefetch_size);
+            fprintf(stderr, "error: %s is corrupt or has wrong version.\n"
+                            "       Delete it and re-download: rm '%s' && make weights-fp8\n",
+                    weights_path.c_str(), weights_path.c_str());
+            return 1;
+        }
+    }
+#endif
+
     auto t_prefetch = clk::now();
 
     Pipeline pipeline;
