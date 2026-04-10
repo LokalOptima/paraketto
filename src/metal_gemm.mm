@@ -41,6 +41,13 @@ static constexpr size_t SHMEM_SIZE = (NR * NK + NC * NK) * sizeof(__fp16);
 static constexpr size_t SHMEM_STORE = 4 * 32 * 16 * sizeof(float);  // 4 simdgroups × 32×16 floats each
 static constexpr size_t SHMEM_TOTAL = (SHMEM_SIZE > SHMEM_STORE) ? SHMEM_SIZE : SHMEM_STORE;
 
+// V2 tile (64×64×16) — used when N is wide enough
+static constexpr uint BM = 64;
+static constexpr uint BN_V2 = 64;
+static constexpr uint BK = 16;
+static constexpr size_t SHMEM_V2 = 16384;  // max(load=5376, store=16384)
+static constexpr uint V2_N_THRESHOLD = 2048;  // use v2 when N >= this
+
 void metal_gemm_init(MetalContext& ctx) {
     // No persistent workspace needed (unlike CUTLASS split-K)
 }
@@ -71,20 +78,36 @@ void metal_gemm_nn(MetalContext& ctx, MetalEncoder encoder, MetalBuffer pool,
         return;
     }
 
-    auto pso = ctx.impl->get_pipeline("gemm_nn_f16");
-    [e setComputePipelineState:pso];
-    [e setBuffer:buf(pool) offset:X_off atIndex:0];
-    [e setBuffer:buf(pool) offset:W_off atIndex:1];
-    [e setBuffer:buf(pool) offset:Y_off atIndex:2];
     GemmParams p = {(uint32_t)m, (uint32_t)n, (uint32_t)k,
                     (uint32_t)k, (uint32_t)n, (uint32_t)n};
-    [e setBytes:&p length:sizeof(p) atIndex:3];
-    [e setThreadgroupMemoryLength:SHMEM_TOTAL atIndex:0];
 
-    uint grid_x = (n + NC - 1) / NC;
-    uint grid_y = (m + NR - 1) / NR;
-    [e dispatchThreadgroups:MTLSizeMake(grid_x, grid_y, 1)
-        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    if ((uint)n >= V2_N_THRESHOLD && (uint)m >= BM) {
+        // V2 path: 64×64 tile for wide N and tall M
+        auto pso = ctx.impl->get_pipeline("gemm_nn_v2_f16");
+        [e setComputePipelineState:pso];
+        [e setBuffer:buf(pool) offset:X_off atIndex:0];
+        [e setBuffer:buf(pool) offset:W_off atIndex:1];
+        [e setBuffer:buf(pool) offset:Y_off atIndex:2];
+        [e setBytes:&p length:sizeof(p) atIndex:3];
+        [e setThreadgroupMemoryLength:SHMEM_V2 atIndex:0];
+        uint grid_x = (n + BN_V2 - 1) / BN_V2;
+        uint grid_y = (m + BM - 1) / BM;
+        [e dispatchThreadgroups:MTLSizeMake(grid_x, grid_y, 1)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    } else {
+        // V1 path: 64×32 tile for narrow N
+        auto pso = ctx.impl->get_pipeline("gemm_nn_f16");
+        [e setComputePipelineState:pso];
+        [e setBuffer:buf(pool) offset:X_off atIndex:0];
+        [e setBuffer:buf(pool) offset:W_off atIndex:1];
+        [e setBuffer:buf(pool) offset:Y_off atIndex:2];
+        [e setBytes:&p length:sizeof(p) atIndex:3];
+        [e setThreadgroupMemoryLength:SHMEM_TOTAL atIndex:0];
+        uint grid_x = (n + NC - 1) / NC;
+        uint grid_y = (m + NR - 1) / NR;
+        [e dispatchThreadgroups:MTLSizeMake(grid_x, grid_y, 1)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    }
 }
 
 void metal_gemm_nn_silu(MetalContext& ctx, MetalEncoder encoder, MetalBuffer pool,
@@ -144,21 +167,34 @@ void metal_gemm_nt(MetalContext& ctx, MetalEncoder encoder, MetalBuffer pool,
                    size_t W_off, int n, size_t Y_off) {
     auto e = enc(encoder);
 
-    // No GEMV special case for NT (decoder uses NN)
-    auto pso = ctx.impl->get_pipeline("gemm_nt_f16");
-    [e setComputePipelineState:pso];
-    [e setBuffer:buf(pool) offset:X_off atIndex:0];
-    [e setBuffer:buf(pool) offset:W_off atIndex:1];
-    [e setBuffer:buf(pool) offset:Y_off atIndex:2];
     GemmParams p = {(uint32_t)m, (uint32_t)n, (uint32_t)k,
                     (uint32_t)k, (uint32_t)k, (uint32_t)n};
-    [e setBytes:&p length:sizeof(p) atIndex:3];
-    [e setThreadgroupMemoryLength:SHMEM_TOTAL atIndex:0];
 
-    uint grid_x = (n + NC - 1) / NC;
-    uint grid_y = (m + NR - 1) / NR;
-    [e dispatchThreadgroups:MTLSizeMake(grid_x, grid_y, 1)
-        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    if ((uint)n >= V2_N_THRESHOLD && (uint)m >= BM) {
+        auto pso = ctx.impl->get_pipeline("gemm_nt_v2_f16");
+        [e setComputePipelineState:pso];
+        [e setBuffer:buf(pool) offset:X_off atIndex:0];
+        [e setBuffer:buf(pool) offset:W_off atIndex:1];
+        [e setBuffer:buf(pool) offset:Y_off atIndex:2];
+        [e setBytes:&p length:sizeof(p) atIndex:3];
+        [e setThreadgroupMemoryLength:SHMEM_V2 atIndex:0];
+        uint grid_x = (n + BN_V2 - 1) / BN_V2;
+        uint grid_y = (m + BM - 1) / BM;
+        [e dispatchThreadgroups:MTLSizeMake(grid_x, grid_y, 1)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    } else {
+        auto pso = ctx.impl->get_pipeline("gemm_nt_f16");
+        [e setComputePipelineState:pso];
+        [e setBuffer:buf(pool) offset:X_off atIndex:0];
+        [e setBuffer:buf(pool) offset:W_off atIndex:1];
+        [e setBuffer:buf(pool) offset:Y_off atIndex:2];
+        [e setBytes:&p length:sizeof(p) atIndex:3];
+        [e setThreadgroupMemoryLength:SHMEM_TOTAL atIndex:0];
+        uint grid_x = (n + NC - 1) / NC;
+        uint grid_y = (m + NR - 1) / NR;
+        [e dispatchThreadgroups:MTLSizeMake(grid_x, grid_y, 1)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    }
 }
 
 void metal_gemm_nt_bias(MetalContext& ctx, MetalEncoder encoder, MetalBuffer pool,

@@ -143,6 +143,8 @@ void MetalModel::init(const char* weights_path, int max_mel_frames) {
     std::string src = read_file("metal/kernels.metal");
     src += "\n";
     src += read_file("metal/gemm.metal");
+    src += "\n";
+    src += read_file("metal/gemm_v2.metal");
     ctx.load_shaders(src.c_str(), "paraketto");
     metal_gemm_init(ctx);
 
