@@ -48,6 +48,12 @@ static constexpr uint BK = 16;
 static constexpr size_t SHMEM_V2 = 16384;  // max(load=5376, store=16384)
 static constexpr uint V2_N_THRESHOLD = 2048;  // use v2 when N >= this
 
+// V3 tile (32×64×16) — used for small M to increase threadgroup count
+static constexpr uint BM3 = 32;
+static constexpr uint BN_V3 = 64;
+static constexpr size_t SHMEM_V3 = 8192;   // max(load=3840, store=8192)
+static constexpr uint V3_M_THRESHOLD = 192; // use v3 when M < this
+
 void metal_gemm_init(MetalContext& ctx) {
     // No persistent workspace needed (unlike CUTLASS split-K)
 }
@@ -81,7 +87,20 @@ void metal_gemm_nn(MetalContext& ctx, MetalEncoder encoder, MetalBuffer pool,
     GemmParams p = {(uint32_t)m, (uint32_t)n, (uint32_t)k,
                     (uint32_t)k, (uint32_t)n, (uint32_t)n};
 
-    if ((uint)n >= V2_N_THRESHOLD && (uint)m >= BM) {
+    if ((uint)n >= V2_N_THRESHOLD && (uint)m < V3_M_THRESHOLD) {
+        // V3 path: 32×64 tile for small M — more threadgroups for occupancy
+        auto pso = ctx.impl->get_pipeline("gemm_nn_v3_f16");
+        [e setComputePipelineState:pso];
+        [e setBuffer:buf(pool) offset:X_off atIndex:0];
+        [e setBuffer:buf(pool) offset:W_off atIndex:1];
+        [e setBuffer:buf(pool) offset:Y_off atIndex:2];
+        [e setBytes:&p length:sizeof(p) atIndex:3];
+        [e setThreadgroupMemoryLength:SHMEM_V3 atIndex:0];
+        uint grid_x = (n + BN_V3 - 1) / BN_V3;
+        uint grid_y = (m + BM3 - 1) / BM3;
+        [e dispatchThreadgroups:MTLSizeMake(grid_x, grid_y, 1)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    } else if ((uint)n >= V2_N_THRESHOLD && (uint)m >= BM) {
         // V2 path: 64×64 tile for wide N and tall M
         auto pso = ctx.impl->get_pipeline("gemm_nn_v2_f16");
         [e setComputePipelineState:pso];
@@ -170,7 +189,19 @@ void metal_gemm_nt(MetalContext& ctx, MetalEncoder encoder, MetalBuffer pool,
     GemmParams p = {(uint32_t)m, (uint32_t)n, (uint32_t)k,
                     (uint32_t)k, (uint32_t)k, (uint32_t)n};
 
-    if ((uint)n >= V2_N_THRESHOLD && (uint)m >= BM) {
+    if ((uint)n >= V2_N_THRESHOLD && (uint)m < V3_M_THRESHOLD) {
+        auto pso = ctx.impl->get_pipeline("gemm_nt_v3_f16");
+        [e setComputePipelineState:pso];
+        [e setBuffer:buf(pool) offset:X_off atIndex:0];
+        [e setBuffer:buf(pool) offset:W_off atIndex:1];
+        [e setBuffer:buf(pool) offset:Y_off atIndex:2];
+        [e setBytes:&p length:sizeof(p) atIndex:3];
+        [e setThreadgroupMemoryLength:SHMEM_V3 atIndex:0];
+        uint grid_x = (n + BN_V3 - 1) / BN_V3;
+        uint grid_y = (m + BM3 - 1) / BM3;
+        [e dispatchThreadgroups:MTLSizeMake(grid_x, grid_y, 1)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    } else if ((uint)n >= V2_N_THRESHOLD && (uint)m >= BM) {
         auto pso = ctx.impl->get_pipeline("gemm_nt_v2_f16");
         [e setComputePipelineState:pso];
         [e setBuffer:buf(pool) offset:X_off atIndex:0];
