@@ -171,11 +171,14 @@ paraketto.cublas: $(CONFORMER_DEPS) src/weights.o src/kernels.o src/cublas_gemm.
 src/kernels_fp8.o: src/kernels_fp8.cu src/kernels_fp8.h
 	$(NVCC) $(NVFLAGS) -arch=sm_120a -c $< -o $@
 
-src/conformer_fp8.o: src/conformer_fp8.cpp src/conformer_fp8.h src/model_defs.h src/conformer.h src/kernels.h src/kernels_fp8.h
+src/cutlass_gemm_fp8.o: src/cutlass_gemm_fp8.cu src/cutlass_gemm_fp8.h src/common.h
+	$(NVCC) $(NVFLAGS) -arch=sm_120 $(CUTLASS_INC) -c $< -o $@
+
+src/conformer_fp8.o: src/conformer_fp8.cpp src/conformer_fp8.h src/model_defs.h src/conformer.h src/kernels.h src/kernels_fp8.h src/cutlass_gemm_fp8.h src/cutlass_gemm.h
 	$(CXX) $(CUDA_CXXFLAGS) -I$(CUDA_HOME)/include -c $< -o $@
 
-paraketto.fp8: src/paraketto_cuda.cpp src/conformer_fp8.h src/model_defs.h src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o $(SHARED_HEADERS) $(CORRECTOR_OBJ)
-	$(CXX) $(CUDA_CXXFLAGS) $(CORRECTOR_CFLAGS) -include src/conformer_fp8.h src/paraketto_cuda.cpp src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o $(CORRECTOR_OBJ) $(CUDA_LDFLAGS) -lcublas -lcublasLt $(CORRECTOR_LDFLAGS) -o $@
+paraketto.fp8: src/paraketto_cuda.cpp src/conformer_fp8.h src/model_defs.h src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o src/cutlass_gemm.o src/cutlass_gemm_fp8.o $(SHARED_HEADERS) $(CORRECTOR_OBJ)
+	$(CXX) $(CUDA_CXXFLAGS) $(CORRECTOR_CFLAGS) -include src/conformer_fp8.h src/paraketto_cuda.cpp src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o src/cutlass_gemm.o src/cutlass_gemm_fp8.o $(CORRECTOR_OBJ) $(CUDA_LDFLAGS) $(CORRECTOR_LDFLAGS) -o $@
 
 # (paraketto-fp8.bin generation removed — paraketto.fp8 auto-downloads from HF)
 
@@ -197,6 +200,9 @@ bench_ff2: tests/bench_ff2.cu
 
 bench_fp8_cutlass: tests/bench_fp8_cutlass.cu
 	$(NVCC) $(NVFLAGS) -arch=sm_120a $(CUTLASS_INC) -Ithird_party/cutlass/examples/common tests/bench_fp8_cutlass.cu -lcublas -lcublasLt -o $@
+
+bench_fp8_tiles: tests/bench_fp8_tiles.cu
+	$(NVCC) $(NVFLAGS) -arch=sm_120 $(CUTLASS_INC) tests/bench_fp8_tiles.cu -lcublas -lcublasLt -o $@
 
 clean:
 	rm -f paraketto.cuda paraketto.cublas paraketto.static paraketto.fp8 paraketto.fp8.static paraketto.fp8.baseline

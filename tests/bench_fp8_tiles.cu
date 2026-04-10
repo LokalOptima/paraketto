@@ -40,18 +40,6 @@ using G_64x64_64_s6 = cutlass::gemm::device::Gemm<
     cutlass::gemm::GemmShape<64,64,64>, cutlass::gemm::GemmShape<32,32,64>,
     cutlass::gemm::GemmShape<16,8,32>, Epi<8>, Sw, 6, 16, 16>;
 
-using G_64x64_32_s10 = cutlass::gemm::device::Gemm<
-    E8, RA, E8, CB, EOut, RO, float,
-    cutlass::arch::OpClassTensorOp, cutlass::arch::Sm89,
-    cutlass::gemm::GemmShape<64,64,32>, cutlass::gemm::GemmShape<32,32,32>,
-    cutlass::gemm::GemmShape<16,8,32>, Epi<8>, Sw, 10, 16, 16>;
-
-using G_64x64_32_s6 = cutlass::gemm::device::Gemm<
-    E8, RA, E8, CB, EOut, RO, float,
-    cutlass::arch::OpClassTensorOp, cutlass::arch::Sm89,
-    cutlass::gemm::GemmShape<64,64,32>, cutlass::gemm::GemmShape<32,32,32>,
-    cutlass::gemm::GemmShape<16,8,32>, Epi<8>, Sw, 6, 16, 16>;
-
 using G_64x64_128_s3 = cutlass::gemm::device::Gemm<
     E8, RA, E8, CB, EOut, RO, float,
     cutlass::arch::OpClassTensorOp, cutlass::arch::Sm89,
@@ -64,12 +52,6 @@ using G_128x64_64_s6 = cutlass::gemm::device::Gemm<
     cutlass::arch::OpClassTensorOp, cutlass::arch::Sm89,
     cutlass::gemm::GemmShape<128,64,64>, cutlass::gemm::GemmShape<64,32,64>,
     cutlass::gemm::GemmShape<16,8,32>, Epi<8>, Sw, 6, 16, 16>;
-
-using G_128x64_32_s5 = cutlass::gemm::device::Gemm<
-    E8, RA, E8, CB, EOut, RO, float,
-    cutlass::arch::OpClassTensorOp, cutlass::arch::Sm89,
-    cutlass::gemm::GemmShape<128,64,32>, cutlass::gemm::GemmShape<64,32,32>,
-    cutlass::gemm::GemmShape<16,8,32>, Epi<8>, Sw, 5, 16, 16>;
 
 // 64x128 tile
 using G_64x128_64_s6 = cutlass::gemm::device::Gemm<
@@ -272,11 +254,8 @@ int main() {
             }
 
             TRY(G_64x64_64_s6, "64x64_64s6");
-            TRY(G_64x64_32_s10, "64x64_32s10");
-            TRY(G_64x64_32_s6, "64x64_32s6");
             TRY(G_64x64_128_s3, "64x64_128s3");
             TRY(G_128x64_64_s6, "128x64_64s6");
-            TRY(G_128x64_32_s5, "128x64_32s5");
             TRY(G_64x128_64_s6, "64x128_64s6");
             TRY(G_128x128_64_s3, "128x128_64s3");
             TRY_SK(SK_64x64_64_s6, 2, "sk2_64x64");

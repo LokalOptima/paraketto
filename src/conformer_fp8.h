@@ -14,9 +14,6 @@
 
 #include "model_defs.h"
 
-#include <cublas_v2.h>
-#include <cublasLt.h>
-
 namespace paraketto {
 
 // ---------------------------------------------------------------------------
@@ -90,14 +87,10 @@ struct CudaModel {
     uint8_t* fp8_out_proj_w           = nullptr;
     float*   fp8_scales               = nullptr;  // [N_FP8_SCALES]
     float*   fp8_act_site_scales      = nullptr;  // [N_FP8_ACT_SITES]
+    float*   fp8_alpha_products       = nullptr;  // [N_FP8_ACT_SITES] pre-computed w_scale * act_scale
     uint8_t* fp8_act_buf              = nullptr;
     int*     fp8_amax_buf             = nullptr;
     bool     fp8_calibrated           = false;
-
-    cublasHandle_t   cublas            = nullptr;
-    cublasLtHandle_t cublaslt          = nullptr;
-    void*            lt_workspace      = nullptr;
-    size_t           lt_workspace_size = 0;
 
     /// fp8_path: path to paraketto-fp8.bin (load if exists, save after quantization).
     /// fp8_prefetch: pre-populated mmap of paraketto-fp8.bin (from background prefetch thread).
