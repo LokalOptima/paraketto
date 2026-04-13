@@ -9,7 +9,7 @@ Speech-to-text inference for NVIDIA's [Parakeet TDT 0.6B](https://huggingface.co
 - **V2** (English) and **V3** (25 EU languages, auto-detect) — `--model v3`
 - Batch 1, 1200x–1400x real-time — fast on a single WAV
 - Custom CUDA/CUTLASS kernels — only `libcudart.so`
-- Optional FP8 quantization — half the weight size, ~35% less VRAM
+- Optional FP8 quantization (CUTLASS E4M3) — half the weight size, ~35% less VRAM
 - Long audio support — files >120s auto-split at silence boundaries
 - Low VRAM: 1.8 GB (FP16), 1.2 GB (FP8)
 - ~240ms warm startup (FP16), ~180ms (FP8)
@@ -21,38 +21,38 @@ WAV (16kHz/24kHz mono) → mel spectrogram → conformer encoder → TDT greedy 
 
 ## Performance
 
-RTX 5070 Ti, batch size 1. Two FP16 GEMM backends: **CUTLASS** (zero dependencies beyond `libcudart.so`) and **cuBLAS** (requires `libcublas.so`). Plus an **FP8** backend using cublasLt E4M3 quantized weights. Everything else — FFT, mel filterbank, LayerNorm, convolutions, SiLU, GLU, LSTM, greedy decoding — runs on custom CUDA kernels in all backends.
+RTX 5070 Ti, batch size 1. Two FP16 GEMM backends: **CUTLASS** (zero dependencies beyond `libcudart.so`) and **cuBLAS** (requires `libcublas.so`). Plus an **FP8** backend using CUTLASS E4M3 quantized weights. Everything else — FFT, mel filterbank, LayerNorm, convolutions, SiLU, GLU, LSTM, greedy decoding — runs on custom CUDA kernels in all backends.
 
 ```
                  CUTLASS (cudart only)          cuBLAS (+ libcublas)
               ────────────────────────────   ────────────────────────────
                RTFx    WER    Audio  Time     RTFx    WER    Audio  Time
-librispeech   1069x   1.38%   896s  838ms    1047x   1.38%   896s  856ms
-earnings22     955x  11.37%   253s  265ms     994x  11.37%   253s  255ms
-long          1307x   1.62%  5578s  4.27s    1302x   1.61%  5578s  4.28s
-difficult     1211x  20.99%   509s  421ms    1248x  20.99%   509s  408ms
+librispeech   1109x   1.38%   896s  808ms    1048x   1.38%   896s  854ms
+earnings22     957x  11.37%   253s  264ms     973x  11.37%   253s  260ms
+long          1355x   1.64%  5578s  4.12s    1356x   1.63%  5578s  4.11s
+difficult     1189x  20.99%   509s  428ms    1223x  21.07%   509s  416ms
               ────────────────────────────   ────────────────────────────
-Total         1249x          7236s  5.79s    1247x          7236s  5.80s
+Total         1288x          7236s  5.62s    1282x          7236s  5.64s
 ```
 
 FP8 backend with fused quantization (requires Blackwell GPU):
 
 ```
-                 FP8 (cublasLt E4M3 + fused quantize)
+                 FP8 (CUTLASS E4M3 + fused quantize)
               ────────────────────────────
                RTFx    WER    Audio  Time
-librispeech   1147x   1.42%   896s  781ms
-earnings22    1013x  10.93%   253s  250ms
-long          1325x   1.79%  5578s  4.21s
-difficult     1350x  16.62%   509s  377ms
+librispeech   1043x   1.42%   896s  859ms
+earnings22     979x  11.82%   253s  259ms
+long          1387x   1.81%  5578s  4.02s
+difficult     1210x  16.46%   509s  421ms
               ────────────────────────────
-Total         1288x          7236s  5.62s
+Total         1301x          7236s  5.56s
 ```
 
 V3 multilingual (FP8, FLEURS test clips, 50 per language):
 
 ```
-                 V3 FP8 multilingual (cublasLt E4M3)
+                 V3 FP8 multilingual (CUTLASS E4M3)
               ────────────────────────────
                RTFx    WER    Audio  Time
 german        1290x   9.18%   695s  539ms
@@ -96,7 +96,7 @@ Three CUDA backends, same driver and weight loader. All support both V2 (English
 |--------|-------------|---------|-------|
 | `paraketto.cuda` | CUTLASS FP16 (custom-tuned) | `paraketto-fp16.bin` (1.2 GB) | default, no cuBLAS dep |
 | `paraketto.cublas` | cuBLAS/cublasLt FP16 | `paraketto-fp16.bin` (1.2 GB) | |
-| `paraketto.fp8` | cublasLt FP8 E4M3 | `paraketto-fp8.bin` (604 MB) | Blackwell only |
+| `paraketto.fp8` | CUTLASS FP8 E4M3 | `paraketto-fp8.bin` (604 MB) | Blackwell only |
 
 V3 weights: `paraketto-v3-fp16.bin` (1.2 GB) / `paraketto-v3-fp8.bin` (627 MB). Auto-downloaded on first `--model v3` run.
 
@@ -192,12 +192,12 @@ make bench-v3      # WER + RTFx (V3 multilingual: de/it/fr)
 ┌─────────────┬──────────┬─────────┬────────┬─────────┬──────────┐
 │ Dataset     │      WER │    RTFx │   Utts │   Audio │     Time │
 ├─────────────┼──────────┼─────────┼────────┼─────────┼──────────┤
-│ librispeech │    1.38% │   1069x │    100 │    896s │    838ms │
-│ earnings22  │   11.37% │    955x │     40 │    253s │    265ms │
-│ long        │    1.62% │   1307x │     50 │   5578s │    4.27s │
-│ difficult   │   20.99% │   1211x │     50 │    509s │    421ms │
+│ librispeech │    1.38% │   1109x │    100 │    896s │    808ms │
+│ earnings22  │   11.37% │    957x │     40 │    253s │    264ms │
+│ long        │    1.64% │   1355x │     50 │   5578s │    4.12s │
+│ difficult   │   20.99% │   1189x │     50 │    509s │    428ms │
 ├─────────────┼──────────┼─────────┼────────┼─────────┼──────────┤
-│ Total       │          │   1249x │    240 │   7236s │    5.79s │
+│ Total       │          │   1288x │    240 │   7236s │    5.62s │
 └─────────────┴──────────┴─────────┴────────┴─────────┴──────────┘
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -206,26 +206,26 @@ make bench-v3      # WER + RTFx (V3 multilingual: de/it/fr)
 ┌─────────────┬──────────┬─────────┬────────┬─────────┬──────────┐
 │ Dataset     │      WER │    RTFx │   Utts │   Audio │     Time │
 ├─────────────┼──────────┼─────────┼────────┼─────────┼──────────┤
-│ librispeech │    1.38% │   1047x │    100 │    896s │    856ms │
-│ earnings22  │   11.37% │    994x │     40 │    253s │    255ms │
-│ long        │    1.61% │   1302x │     50 │   5578s │    4.28s │
-│ difficult   │   20.99% │   1248x │     50 │    509s │    408ms │
+│ librispeech │    1.38% │   1048x │    100 │    896s │    854ms │
+│ earnings22  │   11.37% │    973x │     40 │    253s │    260ms │
+│ long        │    1.63% │   1356x │     50 │   5578s │    4.11s │
+│ difficult   │   21.07% │   1223x │     50 │    509s │    416ms │
 ├─────────────┼──────────┼─────────┼────────┼─────────┼──────────┤
-│ Total       │          │   1247x │    240 │   7236s │    5.80s │
+│ Total       │          │   1282x │    240 │   7236s │    5.64s │
 └─────────────┴──────────┴─────────┴────────┴─────────┴──────────┘
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  C++ FP8  · paraketto_cuda.cpp + cublasLt FP8
+  C++ FP8  · paraketto_cuda.cpp + CUTLASS FP8
 
 ┌─────────────┬──────────┬─────────┬────────┬─────────┬──────────┐
 │ Dataset     │      WER │    RTFx │   Utts │   Audio │     Time │
 ├─────────────┼──────────┼─────────┼────────┼─────────┼──────────┤
-│ librispeech │    1.42% │   1147x │    100 │    896s │    781ms │
-│ earnings22  │   10.93% │   1013x │     40 │    253s │    250ms │
-│ long        │    1.79% │   1325x │     50 │   5578s │    4.21s │
-│ difficult   │   16.62% │   1350x │     50 │    509s │    377ms │
+│ librispeech │    1.42% │   1043x │    100 │    896s │    859ms │
+│ earnings22  │   11.82% │    979x │     40 │    253s │    259ms │
+│ long        │    1.81% │   1387x │     50 │   5578s │    4.02s │
+│ difficult   │   16.46% │   1210x │     50 │    509s │    421ms │
 ├─────────────┼──────────┼─────────┼────────┼─────────┼──────────┤
-│ Total       │          │   1288x │    240 │   7236s │    5.62s │
+│ Total       │          │   1301x │    240 │   7236s │    5.56s │
 └─────────────┴──────────┴─────────┴────────┴─────────┴──────────┘
 ```
 
@@ -237,10 +237,11 @@ src/model_defs.h          # Shared model constants, config, Weights struct
 src/conformer.h           # FP16 CudaModel definition
 src/conformer.cpp         # FP16 CudaModel (CUTLASS or cuBLAS via gemm.h)
 src/conformer_fp8.h       # FP8 CudaModel (adds fp8_pool, scales, cublasLt handles)
-src/conformer_fp8.cpp     # FP8 CudaModel (cublasLt E4M3, per-tensor scaling)
+src/conformer_fp8.cpp     # FP8 CudaModel (CUTLASS E4M3, per-tensor scaling)
 src/weights.cpp           # Weight loading (shared by all backends)
 src/gemm.h                # Unified GEMM interface (backend selected at link time)
 src/cutlass_gemm.cu       # CUTLASS FP16 backend
+src/cutlass_gemm_fp8.cu   # CUTLASS FP8 E4M3 backend
 src/cublas_gemm.cu        # cuBLAS FP16 backend
 src/kernels.cu            # Custom kernels: FFT, LayerNorm, SiLU, GLU, conv, LSTM, ...
 src/kernels_fp8.cu        # FP8 kernels: absmax quantize, static quantize, fused FP8 output
@@ -254,7 +255,7 @@ scripts/export_weights.py # NeMo → paraketto-fp16.bin converter
 ## Acknowledgments
 
 - **[Parakeet TDT 0.6B](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2)** by NVIDIA — the original ASR model ([V2](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) English, [V3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) multilingual). This project is a from-scratch C++/CUDA reimplementation of the inference pipeline. Model weights are used under CC-BY-4.0, Copyright NVIDIA Corporation.
-- **[CUTLASS](https://github.com/NVIDIA/cutlass)** by NVIDIA — CUDA Templates for Linear Algebra Subroutines, used as a git submodule for FP16 GEMMs (BSD-3-Clause License, Copyright 2017-2026 NVIDIA Corporation & Affiliates)
+- **[CUTLASS](https://github.com/NVIDIA/cutlass)** by NVIDIA — CUDA Templates for Linear Algebra Subroutines, used as a git submodule for FP16 and FP8 GEMMs (BSD-3-Clause License, Copyright 2017-2026 NVIDIA Corporation & Affiliates)
 - **[llama.cpp](https://github.com/ggml-org/llama.cpp)** — optional LLM text correction via git submodule (MIT License, Copyright 2023-2026 The ggml authors)
 - **[cpp-httplib](https://github.com/yhirose/cpp-httplib)** by yhirose — HTTP server (MIT License)
 
