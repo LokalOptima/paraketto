@@ -920,6 +920,25 @@ void mel_init_filterbank(const MelFBEntry* entries, int count) {
     CUDA_CHECK(cudaMemcpyToSymbol(c_mel_offsets, offsets, sizeof(offsets)));
 }
 
+// Bank-conflict-free shared memory indexing via XOR permutation.
+//
+// Shared memory has 32 banks. Index i maps to bank i%32, so the FFT
+// butterfly — which accesses a and b=a+half_size — produces conflicts
+// whenever half_size is a multiple of 32 (stages 5-8). Without this,
+// ncu reports 3.0-way average store conflicts (66% excess wavefronts).
+//
+// bx(i) = i ^ (i >> 5) is a bijection that remaps bank assignments:
+// for any power-of-2 stride >= 32, bx(a) and bx(a+stride) land on
+// different banks. Costs 2 instructions (SHR + XOR) per access, same
+// as the padding alternative but without inflating the shared arrays.
+//
+// ncu results (101 frames, sm_120):
+//   before: 79,588 excess wavefronts (54%), 19,255 cycles
+//   after:  27,977 excess wavefronts (29%), 18,955 cycles
+// Remaining conflicts are from the mel gather's data-dependent
+// sr[bx(e.freq)] reads — unavoidable without restructuring the filterbank.
+__device__ __forceinline__ int bx(int i) { return i ^ (i >> 5); }
+
 __global__ void fft512_mel_log_kernel(const float* __restrict__ frames,
                                        float* __restrict__ mel_out,
                                        int n_frames) {
@@ -929,16 +948,16 @@ __global__ void fft512_mel_log_kernel(const float* __restrict__ frames,
     __shared__ float sr[512], si[512];
     int tid = threadIdx.x;  // 0..255
 
-    // 1. Bit-reversal load (identical to fft512_power_kernel)
+    // 1. Bit-reversal load
     const float* in = frames + frame * 512;
     int i0 = tid, i1 = tid + 256;
     int br0 = __brev(i0) >> 23;  // 9-bit reversal
     int br1 = __brev(i1) >> 23;
-    sr[br0] = in[i0];  si[br0] = 0.0f;
-    sr[br1] = in[i1];  si[br1] = 0.0f;
+    sr[bx(br0)] = in[i0];  si[bx(br0)] = 0.0f;
+    sr[bx(br1)] = in[i1];  si[bx(br1)] = 0.0f;
     __syncthreads();
 
-    // 2. 9 butterfly stages (identical to fft512_power_kernel)
+    // 2. 9 butterfly stages
     for (int s = 0; s < 9; s++) {
         int size = 1 << (s + 1);
         int half_size = size >> 1;
@@ -946,48 +965,48 @@ __global__ void fft512_mel_log_kernel(const float* __restrict__ frames,
         int k = tid % half_size;
         int a = group * size + k;
         int b = a + half_size;
+        int ba = bx(a), bb = bx(b);
 
         float angle = -6.283185307179586f * k / size;
         float wr, wi;
         __sincosf(angle, &wi, &wr);
 
-        float tr = wr * sr[b] - wi * si[b];
-        float ti = wr * si[b] + wi * sr[b];
-        float ar = sr[a], ai = si[a];
+        float tr = wr * sr[bb] - wi * si[bb];
+        float ti = wr * si[bb] + wi * sr[bb];
+        float ar = sr[ba], ai = si[ba];
 
-        sr[a] = ar + tr;  si[a] = ai + ti;
-        sr[b] = ar - tr;  si[b] = ai - ti;
+        sr[ba] = ar + tr;  si[ba] = ai + ti;
+        sr[bb] = ar - tr;  si[bb] = ai - ti;
         __syncthreads();
     }
 
     // 3. Power spectrum → sr[0..256]
-    float power_tid = sr[tid] * sr[tid] + si[tid] * si[tid];
+    int bt = bx(tid);
+    float power_tid = sr[bt] * sr[bt] + si[bt] * si[bt];
     float power_256 = 0.0f;
-    if (tid == 0) power_256 = sr[256] * sr[256] + si[256] * si[256];
+    if (tid == 0) { int b256 = bx(256); power_256 = sr[b256] * sr[b256] + si[b256] * si[b256]; }
     __syncthreads();
 
-    sr[tid] = power_tid;
-    if (tid == 0) sr[256] = power_256;
+    sr[bt] = power_tid;
+    if (tid == 0) sr[bx(256)] = power_256;
     __syncthreads();
 
     // 4. Mel filterbank: deterministic gather, 2 threads per mel bin.
-    // Thread tid and tid+128 split the entries for mel bin tid%128 into
-    // contiguous halves, then reduce. Accumulation within each half is
-    // sequential (same order as single-thread gather), so the only FP32
-    // rounding difference vs 1-thread is the final cross-half addition.
+    // Mel step doesn't use bx() for si[] writes/reads (tid and tid+128
+    // are already in different banks), only for sr[] power spectrum reads.
     {
         int mel = tid & 127;
-        int half = tid >> 7;           // 0 = first half, 1 = second half
+        int half = tid >> 7;
         int start = c_mel_offsets[mel];
         int end   = c_mel_offsets[mel + 1];
         int n     = end - start;
-        int mid   = start + (n >> 1);  // split point
+        int mid   = start + (n >> 1);
         int lo = half == 0 ? start : mid;
         int hi = half == 0 ? mid   : end;
         float acc = 0.0f;
         for (int i = lo; i < hi; i++) {
             MelGatherEntry e = c_mel_gather[i];
-            acc += sr[e.freq] * e.weight;
+            acc += sr[bx(e.freq)] * e.weight;
         }
         si[tid] = acc;
     }

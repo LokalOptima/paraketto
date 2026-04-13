@@ -1991,8 +1991,30 @@ With deterministic mel, WER is now perfectly reproducible across runs:
 
 FP8 is better on earnings22 (-0.59pp) and dramatically better on difficult (-4.54pp). The "regression" we were chasing was noise from the non-deterministic mel kernel. FP8 quantization actually helps on noisy/accented audio — likely because it acts as a regularizer, dampening outlier activations that cause errors in FP16.
 
+### Optimizations
+
+**2 threads per mel bin.** The initial gather used 128 of 256 threads (one per mel bin), leaving half idle. Splitting each bin's entries across 2 threads (contiguous halves, then a single reduce-add) uses all 256 threads and recovered the mel throughput lost by the determinism fix — mel is now 2x faster than the original atomicAdd version on long audio (20ms vs 44ms).
+
+**Dead field elimination.** The device-side constant memory array previously stored the full `MelFBEntry {freq, mel, weight}` (8 bytes), but the gather kernel never reads `mel` — the thread ID already encodes which bin it's accumulating. Introduced `MelGatherEntry {freq, weight}` (6 bytes, padded to 8) for the GPU, keeping the original struct for the host-side API.
+
+**XOR bank-conflict-free shared memory.** The 512-point FFT butterfly writes to indices `a` and `b = a + half_size`. When `half_size >= 32` (stages 5-8), both indices land on the same shared memory bank, causing 3-way average store conflicts. ncu measured 79,588 excess wavefronts — 54% of all shared memory traffic was wasted on conflict replays.
+
+Attempted fix #1: padding (`sr[528]` with `i + (i >> 5)` indexing). Eliminated store conflicts but the extra shared memory and per-access ADD instruction overhead canceled the gains — net wall-clock improvement was zero.
+
+Attempted fix #2: XOR permutation (`i ^ (i >> 5)`). Same conflict elimination as padding but no extra storage — the XOR is a bijection on [0,512), so the array stays at 512 elements. Same instruction cost (SHR+XOR vs SHR+ADD) but without inflating shared memory. Excess wavefronts dropped from 79,588 (54%) to 27,977 (29%). The remaining conflicts are from the mel filterbank's data-dependent `sr[freq]` reads — adjacent mel bins share overlapping frequency ranges, causing unavoidable bank conflicts regardless of index remapping.
+
+ncu profiling summary:
+
+| Metric | Original | XOR |
+|--------|----------|-----|
+| Excess wavefronts | 79,588 (54%) | 27,977 (29%) |
+| Cycles/launch (101 frames) | 19,255 | 18,955 |
+| Store conflicts (avg n-way) | 3.0 | 1.5 |
+| Load conflicts (avg n-way) | 1.5 | 1.4 |
+
 ### Lessons
 
 1. Always verify your build arch matches your GPU. Silent fallbacks in template-heavy libraries (CUTLASS) can produce garbage without any error.
 2. Non-determinism in GPU code almost always comes from reduction order in parallel operations (atomicAdd, parallel reductions). If your code is non-deterministic, grep for `atomicAdd` first.
 3. The CMake `native` arch detection didn't work because it defaulted to SM75 instead of SM120. Hardcode the arch in CI/build scripts.
+4. "Single-digit nanoseconds" is not a measurement. Profile before dismissing — the bank conflicts turned out to be 54% of shared memory traffic, not negligible.
