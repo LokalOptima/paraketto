@@ -13,6 +13,7 @@ import sys
 import unicodedata
 from pathlib import Path
 
+import requests
 from jiwer import wer as compute_wer
 from num2words import num2words
 

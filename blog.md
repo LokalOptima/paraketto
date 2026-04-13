@@ -2018,3 +2018,53 @@ ncu profiling summary:
 2. Non-determinism in GPU code almost always comes from reduction order in parallel operations (atomicAdd, parallel reductions). If your code is non-deterministic, grep for `atomicAdd` first.
 3. The CMake `native` arch detection didn't work because it defaulted to SM75 instead of SM120. Hardcode the arch in CI/build scripts.
 4. "Single-digit nanoseconds" is not a measurement. Profile before dismissing — the bank conflicts turned out to be 54% of shared memory traffic, not negligible.
+
+## V3 FP8 calibration and the silence trimmer bug
+
+### The problem
+
+V3 multilingual FP8 inference produced catastrophically bad output: german WER 22% (vs 9% expected), french 32% (vs 6% expected). Some French clips were truncated to single words ("Poussé." instead of two full sentences). The same clips worked correctly on older builds.
+
+### Two bugs, one symptom
+
+**Bug 1: Wrong FP8 activation scales.** The FP8 path uses per-tensor static quantization with 218 baked activation scales — one per GEMM site in the conformer. These scales were calibrated on V2 (English-only) weights using a LibriSpeech reference utterance. V3 (multilingual, 25 EU languages) has fundamentally different weight distributions: the subsampling layer produces activations ~100x larger than V2 (absmax ~700 vs ~4). Using V2 scales for V3 caused severe quantization clipping throughout the encoder.
+
+**Bug 2: Silence trimmer eating quiet speech.** The mel pipeline trims runs of 3+ seconds of consecutive "silent" frames to prevent mel normalization corruption on silence-padded audio. The energy threshold was set to 0.1 per window (sum of squared samples over 160 samples at 16kHz). FLEURS test clips are recorded at low volume — french-0002 has median per-window energy of 0.0006, 150x below the threshold. The trimmer classified 99% of windows as "silent" and removed 5-7 seconds of actual speech from 8-second clips. This affected all backends (FP16 and FP8) and explained why the same clips worked on pre-trimmer builds.
+
+### Investigation
+
+The initial assumption was that the FP8 weights or scales were broken. After calibrating V3-specific scales (temporarily replacing `quantize_fp8_static` with `quantize_absmax_fp16_to_fp8` at all 218 sites, running 16 multilingual utterances, taking element-wise max), german WER improved from 22% to 15% — but french stayed at 32%.
+
+Building the FP16 CUTLASS binary to get a baseline revealed french was also 32% on FP16. This eliminated FP8 quantization as the cause and pointed to a shared code path. Git bisect identified the regression window: commit `9473856` ("Add long audio chunking") through `b48aba0` ("Fuse silence trimming into mel pipeline"). The silence trimmer was the culprit.
+
+Energy analysis of the broken clips confirmed the root cause:
+
+```
+french-0002: 822 windows, 816 below threshold 0.1 (99%)
+             Silent run: start=102 len=546 (5.5s of 8.2s trimmed)
+french-0004: 756 windows, 753 below threshold 0.1 (99%)
+             Silent runs: 4.1s + 3.4s trimmed (7.5s of 7.6s)
+```
+
+### The fixes
+
+**Silence threshold: 0.1 → 1e-4.** The threshold now only catches near-digital-silence (zero-padding, dead mic). Quiet speech (RMS ~0.01-0.05) is never touched. Verified that the original use case (1s speech + 9s digital silence) still triggers trimming correctly at the new threshold.
+
+**V3 activation scales: multi-utterance calibration.** Calibrated on 16 utterances (1 English + 5 German + 5 Italian + 5 French) with the fixed mel pipeline. For each utterance, temporarily used `quantize_absmax_fp16_to_fp8` (which computes absmax and derives the scale) instead of `quantize_fp8_static` (which reads a pre-baked scale). Took element-wise max across all utterances to ensure no clip causes saturation. Added `FP8_BAKED_ACT_SCALES_V3[218]` alongside the existing V2 array, selected at init based on `w->config.version`.
+
+### Results
+
+| | German | Italian | French |
+|---|---|---|---|
+| FP16 CUTLASS | 7.81% | 3.81% | 4.19% |
+| FP8 CUTLASS (V3 scales) | 8.17% | 3.81% | 4.77% |
+| Previous (broken) | 22.31% | 4.83% | 32.25% |
+
+FP8 within 0.6% of FP16 across all languages. Both better than the old README numbers (9.18%, 4.83%, 6.29%).
+
+### Lessons
+
+1. When FP8 WER is bad, check FP16 first. If both are bad, the problem isn't quantization.
+2. Energy-based silence detection needs a threshold relative to the signal, not an absolute constant. A threshold that works for studio recordings will destroy quiet field recordings.
+3. Multi-utterance calibration with element-wise max is essential for multilingual models — single-utterance calibration misses activation ranges that other languages exercise.
+4. Bugs compound: the wrong FP8 scales would have been caught earlier if the silence trimmer hadn't been independently corrupting the same test clips.

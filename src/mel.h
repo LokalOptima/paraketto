@@ -320,8 +320,10 @@ struct MelSpec {
             preemph_buf.resize(num_samples);
         preemph_buf[0] = audio[0];
 
-        // Silence trimming: threshold 0.1 covers digital silence and mic noise (~0.02).
-        static constexpr float ENERGY_THRESH = 0.1f;
+        // Silence trimming: only trim near-zero energy (digital silence / zero-padding).
+        // Previous threshold of 0.1 was too aggressive — it trimmed quiet speech
+        // (FLEURS clips have p90 energy ~0.013, well below 0.1).
+        static constexpr float ENERGY_THRESH = 1e-4f;
         static constexpr int MIN_RUN = 300;  // 3s of silence
         static constexpr int MARGIN  = 15;   // 0.15s kept at each trim edge
 

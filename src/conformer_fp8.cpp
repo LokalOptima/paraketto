@@ -74,6 +74,49 @@ static const float FP8_BAKED_ACT_SCALES[218] = {
     9.88769531e-03f, 5.34602557e-04f                                                                        // sub_out, enc_proj
 };
 
+// V3 (multilingual) activation scales — calibrated on 16 utterances (en/de/it/fr),
+// element-wise max across all calibration runs. V3 has ~100x larger subsampling
+// activations than V2 due to different weight distributions.
+static const float FP8_BAKED_ACT_SCALES_V3[218] = {
+    1.98102687e-02f, 1.25976562e-01f, 3.76892090e-03f, 2.23214296e-03f, 4.52357717e-02f, 1.04544507e-02f,  // blk 0
+    2.48883933e-01f, 3.33077572e-02f, 2.47209817e-01f, 2.71170475e-02f, 2.42571142e-02f, 2.08500447e-03f,
+    2.23214296e-03f, 3.78199993e-03f, 8.70186929e-03f, 1.39421737e-02f, 7.32857827e-03f, 1.83279850e-02f,  // blk 1
+    1.55639648e-02f, 2.44663786e-02f, 1.93459645e-03f, 2.23214296e-03f, 5.06155845e-03f, 7.56835938e-03f,  // blk 2
+    2.64020655e-02f, 7.09751667e-03f, 2.61579249e-02f, 1.36893140e-02f, 2.55998876e-02f, 1.61852152e-03f,
+    2.23214296e-03f, 4.89589153e-03f, 6.67463010e-03f, 8.24497789e-02f, 9.94873047e-03f, 2.43617464e-02f,  // blk 3
+    1.67933870e-02f, 5.28738834e-02f, 1.48773193e-03f, 2.23214296e-03f, 4.85665444e-03f, 6.91005168e-03f,  // blk 4
+    6.23256154e-02f, 9.04192217e-03f, 2.01416016e-02f, 1.53547013e-02f, 4.92117740e-02f, 1.58364431e-03f,
+    2.23214296e-03f, 5.35801472e-03f, 6.66155154e-03f, 7.63811395e-02f, 7.29806069e-03f, 5.07114939e-02f,  // blk 5
+    8.49696528e-03f, 5.05371094e-02f, 1.27846852e-03f, 2.23214296e-03f, 5.38853230e-03f, 6.06427854e-03f,  // blk 6
+    5.92215396e-02f, 4.15257039e-03f, 2.52511166e-02f, 1.51192797e-02f, 6.21861033e-02f, 1.16729736e-03f,
+    2.23214296e-03f, 3.88663146e-03f, 7.00160442e-03f, 5.96749447e-02f, 5.55419922e-03f, 3.05350162e-02f,  // blk 7
+    2.44838167e-02f, 2.99421046e-02f, 1.52587891e-03f, 2.23214296e-03f, 6.24302449e-03f, 6.27790159e-03f,  // blk 8
+    3.36739682e-02f, 8.84137861e-03f, 2.51813624e-02f, 9.69587080e-03f, 4.49218750e-02f, 1.02179393e-03f,
+    2.23214296e-03f, 5.27518149e-03f, 5.26646199e-03f, 1.72293529e-01f, 4.32041707e-03f, 3.20870541e-02f,  // blk 9
+    7.08879763e-03f, 5.49316406e-02f, 1.07574463e-03f, 2.23214296e-03f, 5.43648843e-03f, 4.44466714e-03f,  // blk 10
+    4.96651791e-02f, 5.10515505e-03f, 3.13371941e-02f, 8.06971919e-03f, 1.20675221e-01f, 1.08664378e-03f,
+    2.23214296e-03f, 8.28334223e-03f, 4.50352253e-03f, 4.24804688e-02f, 4.84357541e-03f, 3.11104916e-02f,  // blk 11
+    1.09514510e-02f, 8.52399543e-02f, 1.12806051e-03f, 2.23214296e-03f, 8.58415850e-03f, 4.17872844e-03f,  // blk 12
+    3.73883918e-02f, 3.01252096e-03f, 3.19998600e-02f, 8.15691240e-03f, 6.39299676e-02f, 1.30789622e-03f,
+    2.23214296e-03f, 9.22502764e-03f, 5.20978635e-03f, 3.80510613e-02f, 4.75638267e-03f, 2.66462062e-02f,  // blk 13
+    8.98960698e-03f, 4.39104363e-02f, 9.37325589e-04f, 2.23214296e-03f, 6.53948123e-03f, 4.93948814e-03f,  // blk 14
+    2.93143131e-02f, 3.85611388e-03f, 2.70472933e-02f, 6.44792849e-03f, 4.20619436e-02f, 9.37325589e-04f,
+    2.23214296e-03f, 5.13131265e-03f, 5.75038372e-03f, 3.70047428e-02f, 5.24030393e-03f, 2.80761719e-02f,  // blk 15
+    6.69642864e-03f, 4.95256707e-02f, 1.66756765e-03f, 2.23214296e-03f, 8.18742998e-03f, 6.75746379e-03f,  // blk 16
+    3.29066701e-02f, 7.32421875e-03f, 2.50941683e-02f, 1.20675219e-02f, 4.64215949e-02f, 1.35803223e-03f,
+    2.23214296e-03f, 6.32585818e-03f, 6.36073528e-03f, 3.19126658e-02f, 5.38417278e-03f, 2.62974333e-02f,  // blk 17
+    9.93129145e-03f, 2.97328401e-02f, 8.89914401e-04f, 2.23214296e-03f, 5.39289182e-03f, 6.20378787e-03f,  // blk 18
+    4.44335938e-02f, 7.83429854e-03f, 3.05698942e-02f, 4.99180378e-03f, 5.29785156e-02f, 1.02887838e-03f,
+    2.23214296e-03f, 7.71658774e-03f, 5.87245403e-03f, 3.54875848e-02f, 1.01318359e-02f, 2.87214015e-02f,  // blk 19
+    1.58255436e-02f, 4.08761166e-02f, 1.10244751e-03f, 2.23214296e-03f, 5.41469036e-03f, 3.61633301e-03f,  // blk 20
+    4.43638377e-02f, 1.41775953e-02f, 3.46679688e-02f, 1.40991211e-02f, 3.84347104e-02f, 1.36566162e-03f,
+    2.23214296e-03f, 9.11167730e-03f, 3.08445515e-03f, 3.74581479e-02f, 1.10473633e-02f, 3.28194760e-02f,  // blk 21
+    5.68934856e-03f, 3.90625000e-02f, 1.26102997e-03f, 2.23214296e-03f, 7.03648152e-03f, 3.17164836e-03f,  // blk 22
+    7.44280145e-02f, 1.11955917e-02f, 7.89620504e-02f, 1.03846956e-02f, 3.16336490e-02f, 2.71388469e-03f,
+    2.23214296e-03f, 8.97216797e-03f, 4.97000571e-03f, 3.55747752e-02f, 9.59995855e-03f, 4.79561947e-02f,  // blk 23
+    1.76674104e+00f, 6.35964505e-04f                                                                        // sub_out, enc_proj
+};
+
 // =========================================================================
 // CudaModel — encoder + decoder forward pass
 // =========================================================================
@@ -335,6 +378,7 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames,
         fp8_alpha_products = (float*)fp8p;
         fp8p += N_FP8_ACT_SITES * sizeof(float);
 
+
         // ---------------------------------------------------------------------------
         // FP8 weight cache — paraketto-fp8.bin format:
         //   char[8]  magic   = "PRKTFP8\0"
@@ -475,10 +519,12 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames,
             cudaFree(transpose_tmp);
         }
 
-        // Load baked activation scales and pre-compute alpha products
-        static_assert(sizeof(FP8_BAKED_ACT_SCALES) / sizeof(float) == N_FP8_ACT_SITES,
-                      "baked scale count mismatch");
-        CUDA_CHECK(cudaMemcpyAsync(fp8_act_site_scales, FP8_BAKED_ACT_SCALES,
+        // Load baked activation scales (V2 or V3) and pre-compute alpha products
+        static_assert(sizeof(FP8_BAKED_ACT_SCALES)    / sizeof(float) == N_FP8_ACT_SITES, "V2 scale count mismatch");
+        static_assert(sizeof(FP8_BAKED_ACT_SCALES_V3) / sizeof(float) == N_FP8_ACT_SITES, "V3 scale count mismatch");
+        const float* baked = (w->config.version == 3) ? FP8_BAKED_ACT_SCALES_V3
+                                                      : FP8_BAKED_ACT_SCALES;
+        CUDA_CHECK(cudaMemcpyAsync(fp8_act_site_scales, baked,
                                    N_FP8_ACT_SITES * sizeof(float),
                                    cudaMemcpyHostToDevice, stream));
         fp8_compute_all_alphas(fp8_alpha_products, fp8_scales, fp8_act_site_scales,
@@ -520,11 +566,8 @@ static void fp8_gemm_impl(cudaStream_t stream,
                            uint8_t* act_buf, float* act_scale,
                            float* alpha_buf,
                            bool prequantized) {
-    // 1. Quantize activation FP16 → FP8 (skip if fused kernel already did it)
     if (!prequantized)
         quantize_fp8_static(X_fp16, act_buf, act_scale, m * k, stream);
-
-    // 2. CUTLASS FP8 GEMM: Y[m,n] = alpha * X_fp8[m,k] @ W_fp8[n,k]^T
     cutlass_fp8_gemm(stream, act_buf, m, k, W_fp8, n, alpha_buf, Y);
 }
 
