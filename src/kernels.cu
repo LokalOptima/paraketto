@@ -892,9 +892,9 @@ void split_transpose_qkv_bias_fp16(const half* in,
 static constexpr int N_MEL_FB_ENTRIES = 504;
 
 // Mel filterbank sorted by mel bin for deterministic gather (no atomicAdd).
-// c_mel_fb_by_mel[c_mel_offsets[m] .. c_mel_offsets[m+1]) are the entries for bin m.
-__constant__ MelFBEntry c_mel_fb_by_mel[N_MEL_FB_ENTRIES];
-__constant__ uint16_t   c_mel_offsets[N_MELS + 1];
+// c_mel_gather[c_mel_offsets[m] .. c_mel_offsets[m+1]) are the entries for bin m.
+__constant__ MelGatherEntry c_mel_gather[N_MEL_FB_ENTRIES];
+__constant__ uint16_t       c_mel_offsets[N_MELS + 1];
 
 void mel_init_filterbank(const MelFBEntry* entries, int count) {
     assert(count <= N_MEL_FB_ENTRIES);
@@ -903,16 +903,20 @@ void mel_init_filterbank(const MelFBEntry* entries, int count) {
         return std::tie(a.mel, a.freq) < std::tie(b.mel, b.freq);
     });
 
-    // Build offsets: mel_offsets[m] = first index for bin m
+    // Build offsets and strip mel field for device
     uint16_t offsets[N_MELS + 1];
+    MelGatherEntry gather[N_MEL_FB_ENTRIES];
     int idx = 0;
     for (int m = 0; m < N_MELS; m++) {
         offsets[m] = (uint16_t)idx;
-        while (idx < count && sorted[idx].mel == m) idx++;
+        while (idx < count && sorted[idx].mel == m) {
+            gather[idx] = {sorted[idx].freq, sorted[idx].weight};
+            idx++;
+        }
     }
     offsets[N_MELS] = (uint16_t)count;
 
-    CUDA_CHECK(cudaMemcpyToSymbol(c_mel_fb_by_mel, sorted.data(), count * sizeof(MelFBEntry)));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_mel_gather, gather, count * sizeof(MelGatherEntry)));
     CUDA_CHECK(cudaMemcpyToSymbol(c_mel_offsets, offsets, sizeof(offsets)));
 }
 
@@ -966,23 +970,32 @@ __global__ void fft512_mel_log_kernel(const float* __restrict__ frames,
     if (tid == 0) sr[256] = power_256;
     __syncthreads();
 
-    // 4. Mel filterbank: deterministic gather (one thread per mel bin)
-    // Each of the first 128 threads sums its mel bin's entries in fixed order.
-    if (tid < N_MELS) {
+    // 4. Mel filterbank: deterministic gather, 2 threads per mel bin.
+    // Thread tid and tid+128 split the entries for mel bin tid%128 into
+    // contiguous halves, then reduce. Accumulation within each half is
+    // sequential (same order as single-thread gather), so the only FP32
+    // rounding difference vs 1-thread is the final cross-half addition.
+    {
+        int mel = tid & 127;
+        int half = tid >> 7;           // 0 = first half, 1 = second half
+        int start = c_mel_offsets[mel];
+        int end   = c_mel_offsets[mel + 1];
+        int n     = end - start;
+        int mid   = start + (n >> 1);  // split point
+        int lo = half == 0 ? start : mid;
+        int hi = half == 0 ? mid   : end;
         float acc = 0.0f;
-        int start = c_mel_offsets[tid];
-        int end   = c_mel_offsets[tid + 1];
-        for (int i = start; i < end; i++) {
-            MelFBEntry e = c_mel_fb_by_mel[i];
+        for (int i = lo; i < hi; i++) {
+            MelGatherEntry e = c_mel_gather[i];
             acc += sr[e.freq] * e.weight;
         }
         si[tid] = acc;
     }
     __syncthreads();
 
-    // 5. Log + write output
+    // 5. Reduce pairs + log + write output
     if (tid < N_MELS) {
-        mel_out[frame * N_MELS + tid] = logf(si[tid] + LOG_EPS);
+        mel_out[frame * N_MELS + tid] = logf(si[tid] + si[tid + N_MELS] + LOG_EPS);
     }
 }
 

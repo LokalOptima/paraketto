@@ -211,6 +211,12 @@ struct MelFBEntry {
     float weight;
 };
 
+// Device-side gather entry: mel field stripped (thread ID implies the bin).
+struct MelGatherEntry {
+    uint16_t freq;
+    float    weight;
+};
+
 // ---------------------------------------------------------------------------
 // Initialize mel filterbank data in GPU constant memory.
 // Must be called once before fft512_mel_log.
