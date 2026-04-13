@@ -6,6 +6,10 @@
 #include "kernels.h"
 #include "common.h"
 #include <cfloat>
+#include <algorithm>
+#include <cassert>
+#include <tuple>
+#include <vector>
 
 namespace paraketto {
 
@@ -887,10 +891,29 @@ void split_transpose_qkv_bias_fp16(const half* in,
 
 static constexpr int N_MEL_FB_ENTRIES = 504;
 
-__constant__ MelFBEntry c_mel_fb[N_MEL_FB_ENTRIES];
+// Mel filterbank sorted by mel bin for deterministic gather (no atomicAdd).
+// c_mel_fb_by_mel[c_mel_offsets[m] .. c_mel_offsets[m+1]) are the entries for bin m.
+__constant__ MelFBEntry c_mel_fb_by_mel[N_MEL_FB_ENTRIES];
+__constant__ uint16_t   c_mel_offsets[N_MELS + 1];
 
 void mel_init_filterbank(const MelFBEntry* entries, int count) {
-    CUDA_CHECK(cudaMemcpyToSymbol(c_mel_fb, entries, count * sizeof(MelFBEntry)));
+    assert(count <= N_MEL_FB_ENTRIES);
+    std::vector<MelFBEntry> sorted(entries, entries + count);
+    std::sort(sorted.begin(), sorted.end(), [](const MelFBEntry& a, const MelFBEntry& b) {
+        return std::tie(a.mel, a.freq) < std::tie(b.mel, b.freq);
+    });
+
+    // Build offsets: mel_offsets[m] = first index for bin m
+    uint16_t offsets[N_MELS + 1];
+    int idx = 0;
+    for (int m = 0; m < N_MELS; m++) {
+        offsets[m] = (uint16_t)idx;
+        while (idx < count && sorted[idx].mel == m) idx++;
+    }
+    offsets[N_MELS] = (uint16_t)count;
+
+    CUDA_CHECK(cudaMemcpyToSymbol(c_mel_fb_by_mel, sorted.data(), count * sizeof(MelFBEntry)));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_mel_offsets, offsets, sizeof(offsets)));
 }
 
 __global__ void fft512_mel_log_kernel(const float* __restrict__ frames,
@@ -943,17 +966,17 @@ __global__ void fft512_mel_log_kernel(const float* __restrict__ frames,
     if (tid == 0) sr[256] = power_256;
     __syncthreads();
 
-    // 4. Mel filterbank: scatter with atomicAdd in shared memory
-    // Reuse si[0..127] as mel accumulators
-    if (tid < N_MELS) si[tid] = 0.0f;
-    __syncthreads();
-
-    // Each thread handles ~2 filterbank entries (504 / 256 ≈ 2)
-    int fb_start = tid * N_MEL_FB_ENTRIES / 256;
-    int fb_end = (tid + 1) * N_MEL_FB_ENTRIES / 256;
-    for (int i = fb_start; i < fb_end; i++) {
-        MelFBEntry e = c_mel_fb[i];
-        atomicAdd(&si[e.mel], sr[e.freq] * e.weight);
+    // 4. Mel filterbank: deterministic gather (one thread per mel bin)
+    // Each of the first 128 threads sums its mel bin's entries in fixed order.
+    if (tid < N_MELS) {
+        float acc = 0.0f;
+        int start = c_mel_offsets[tid];
+        int end   = c_mel_offsets[tid + 1];
+        for (int i = start; i < end; i++) {
+            MelFBEntry e = c_mel_fb_by_mel[i];
+            acc += sr[e.freq] * e.weight;
+        }
+        si[tid] = acc;
     }
     __syncthreads();
 

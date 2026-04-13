@@ -1914,3 +1914,85 @@ earnings22:  WER=10.93%, 1067x RTFx
 long:        WER=1.79%, 1396x RTFx
 difficult:   WER=16.54%, 1305x RTFx
 ```
+
+---
+
+## Deterministic mel filterbank: fixing run-to-run non-determinism
+
+### The problem
+
+WER benchmarks showed ~30/240 utterances producing different transcriptions between consecutive runs on the same server process. This made it impossible to reliably measure the FP8 CUTLASS vs cublasLt WER gap — the ±0.3pp noise band was larger than the differences we were trying to measure.
+
+### Investigation
+
+Initial hypothesis was stale buffer contamination in server mode: different-length requests leave residual data in aliased GPU buffers, and some kernel reads beyond `T` into stale data from a prior request. Zeroing the aliased scratch region at the start of `encode_gpu()` fixed 5/34 diffs, but 29 remained.
+
+The breakthrough was discovering that the CMake build had `CMAKE_CUDA_ARCHITECTURES=75` (Turing) instead of 120 (Blackwell). CUTLASS SM80 MMA templates compiled for SM75 have no tensor core specialization — they fall through to a "not implemented" host-side stub. The FP16 CUTLASS GEMMs were silently producing garbage. Previous determinism tests on this binary were meaningless.
+
+After fixing the CMake arch to SM120 and rebuilding, even a **single file run in CLI mode** was non-deterministic — 4 different hashes out of 5 runs. This ruled out cross-request buffer contamination entirely.
+
+### Root cause
+
+The mel spectrogram kernel (`fft512_mel_log_kernel`) accumulates 504 filterbank entries into 128 mel bins using `atomicAdd` in shared memory:
+
+```cuda
+// Old: scatter with atomicAdd — non-deterministic
+int fb_start = tid * N_MEL_FB_ENTRIES / 256;
+int fb_end = (tid + 1) * N_MEL_FB_ENTRIES / 256;
+for (int i = fb_start; i < fb_end; i++) {
+    MelFBEntry e = c_mel_fb[i];
+    atomicAdd(&si[e.mel], sr[e.freq] * e.weight);
+}
+```
+
+Multiple threads (from different warps in the same block) atomicAdd to the same `si[mel]` location. Warp scheduling varies between runs, so the floating-point additions accumulate in different orders. Since FP32 addition is non-associative, different orderings produce different results. A 1 ULP difference in one mel bin cascades through 24 conformer blocks into different transcriptions.
+
+### Fix
+
+Replaced the scatter+atomicAdd with a deterministic gather pattern. At init time, the filterbank entries are sorted by mel bin into a CSR-style layout (offset table + sorted entries). In the kernel, each of the first 128 threads gathers its mel bin's entries in fixed order:
+
+```cuda
+// New: deterministic gather — one thread per mel bin
+if (tid < N_MELS) {
+    float acc = 0.0f;
+    int start = c_mel_offsets[tid];
+    int end   = c_mel_offsets[tid + 1];
+    for (int i = start; i < end; i++) {
+        MelFBEntry e = c_mel_fb_by_mel[i];
+        acc += sr[e.freq] * e.weight;
+    }
+    si[tid] = acc;
+}
+```
+
+Each mel bin has 1-12 entries (avg 3.9), so the per-thread loop is short. No atomics, no ordering dependency, fully deterministic.
+
+### Performance impact
+
+Mel kernel: +1.8ms on short audio (9s), +3ms on long audio (119s). The gather uses 128 of 256 threads (vs all 256 in the scatter), but mel is a small fraction of total latency:
+
+| Audio   | Before (mel) | After (mel)  | Total before | Total after |
+|---------|-------------|-------------|-------------|------------|
+| 9s      | 3.4ms       | 5.2ms       | 10.0ms      | 12.3ms     |
+| 119s    | 44.0ms      | 47.0ms      | 88.9ms      | 92.4ms     |
+
+Full benchmark RTFx unchanged (1277x → 1273x).
+
+### WER results — now reliable
+
+With deterministic mel, WER is now perfectly reproducible across runs:
+
+| Dataset     | FP16 CUTLASS | FP8 CUTLASS | Delta   |
+|-------------|-------------|-------------|---------|
+| librispeech | 1.38%       | 1.51%       | +0.13pp |
+| earnings22  | 11.37%      | 10.78%      | -0.59pp |
+| long        | 1.63%       | 1.82%       | +0.19pp |
+| difficult   | 20.91%      | 16.37%      | -4.54pp |
+
+FP8 is better on earnings22 (-0.59pp) and dramatically better on difficult (-4.54pp). The "regression" we were chasing was noise from the non-deterministic mel kernel. FP8 quantization actually helps on noisy/accented audio — likely because it acts as a regularizer, dampening outlier activations that cause errors in FP16.
+
+### Lessons
+
+1. Always verify your build arch matches your GPU. Silent fallbacks in template-heavy libraries (CUTLASS) can produce garbage without any error.
+2. Non-determinism in GPU code almost always comes from reduction order in parallel operations (atomicAdd, parallel reductions). If your code is non-deterministic, grep for `atomicAdd` first.
+3. The CMake `native` arch detection didn't work because it defaulted to SM75 instead of SM120. Hardcode the arch in CI/build scripts.
