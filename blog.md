@@ -2068,3 +2068,64 @@ FP8 within 0.6% of FP16 across all languages. Both better than the old README nu
 2. Energy-based silence detection needs a threshold relative to the signal, not an absolute constant. A threshold that works for studio recordings will destroy quiet field recordings.
 3. Multi-utterance calibration with element-wise max is essential for multilingual models — single-utterance calibration misses activation ranges that other languages exercise.
 4. Bugs compound: the wrong FP8 scales would have been caught earlier if the silence trimmer hadn't been independently corrupting the same test clips.
+
+## V3 FP8 empty transcriptions from scale saturation
+
+### The problem
+
+The previous entry declared V3 FP8 fixed: german 8.17%, italian 3.81%, french 4.77%. Those numbers were not reproducible. The committed README, built from the same code, records 9.18% / 4.83% / 6.29% — a 1 to 1.5 point disagreement for one binary and one set of scales. That disagreement was the unfixed bug, not measurement noise.
+
+On real audio the symptom was blunt. Running V3 FP8 over Common Voice, about a fifth of German and French clips returned an empty string. The clips were ordinary speech — a 6.1-second German clip at rms 0.065 returned nothing. FP16 transcribed every one of them correctly, several to an exact match.
+
+### Ruling things out
+
+The recent work on the silence trimmer made it the first suspect, but it was the wrong one. FP16 runs the same trimmer and scores 2.4% on the same clips; the failing clips are high-energy speech, not silence. So the trimmer was not eating them.
+
+The next several hypotheses failed too, and each failure narrowed the space:
+
+- **Short utterances.** Plausible, since the empties skewed short. But short English clips transcribe fine on V3 FP8, and concatenating six failing German clips into one 27-second file still returned empty. Length was not the variable.
+- **Language.** English Common Voice clips also emptied — one outright, one truncated mid-sentence — so it was not specific to German and French.
+- **Audio level.** The failing German clips were loud (rms 0.07) and the failing English clips were quiet (rms 0.03); librispeech is as loud as the loud failures and never fails. No level threshold explained it.
+
+What did reproduce cleanly: FP16 and cuBLAS transcribed every failing clip correctly, and only the FP8 build collapsed. The bug lived in the FP8 path.
+
+### The bug moved when observed
+
+Instrumenting the FP8 encoder made the bug disappear. Adding a per-site readback — a `cudaStreamSynchronize` and a device-to-host copy at each activation site — turned the empty clips correct. So did `CUDA_LAUNCH_BLOCKING=1` with no code change. So did a plain rebuild: after the instrumented binary was reverted and recompiled, the normal build also transcribed the previously-empty clips, until the source was reverted and rebuilt once more, at which point the empties returned. The full Common Voice sample went from 40% German WER with six empties to 1.82% with zero, from a recompile alone.
+
+`compute-sanitizer` found nothing: `initcheck`, `synccheck`, and `racecheck` all reported zero errors, and running under any of them also masked the bug. That rules out uninitialized global memory, barrier misuse, and shared-memory races. A fault that survives none of those tools and shifts with any change to instruction scheduling is not a race — it is sensitivity to floating-point accumulation order, which is legal and invisible to the sanitizers.
+
+### Measuring an invariant instead
+
+Because the empty output self-masked under observation, the fix came from measuring a stable quantity rather than catching the collapse in the act. Each FP8 GEMM quantizes its input activation against a baked per-site scale, where `scale = calibrated_amax / 448` and 448 is the E4M3 maximum. If a live activation exceeds `scale × 448`, it clamps to the FP8 ceiling. Instrumenting the pre-quant activation at all 218 sites, before the added syncs masked the run, showed 31 sites saturating on a failing clip — `sat = amax / (scale × 448)` up to 2.5 — against 9 on a passing clip.
+
+Comparing the baked V3 scales against the element-wise max over a broad audio set made the cause concrete: 179 of 218 sites had scales below the real-audio amax, and the two early convolution sites were the worst — `b1.conv_dw` was 6.7x too small, `b2.conv_dw` 5.1x. Those scales trace back to the previous entry's calibration: 16 clean utterances, later narrowed toward a single reference in commit 18156a5, which never exercised the activation ranges field recordings hit.
+
+That is the whole mechanism. The scales were tight enough that ordinary audio pushed sites to the edge of the FP8 range; nondeterministic accumulation order — the same class of effect fixed earlier in the mel kernel, commit 8c38706 — tipped borderline sites over on some builds and clips; the corruption cascaded through the residual stream until the TDT decoder emitted only blanks, which detokenizes to an empty string. Any change to timing reshuffled the rounding and hid it.
+
+### The fix
+
+Restore the calibration pass and give it headroom. Commit 4a3acb7 had removed the runtime scale emission and baked the numbers into source, so the first step was to add a `PARAKETTO_CALIB`-gated mode back to `encode_gpu` that records per-site activation amax and prints a `SCALES:` line. It is a single branch when disabled, and the per-clip host copy runs only during calibration; an A/B on the English benchmark showed no measurable change (±0.5%, run-to-run noise).
+
+`calibrate_v3_scales.py` then calibrates over 162 clips spanning Common Voice (the distribution that triggered the bug), FLEURS, librispeech, and the difficult set, takes the element-wise max, and multiplies by a 1.5x headroom factor. The headroom is the point: with a bare max, the worst clip sits at `sat = 1.0` and rounding can still tip it; at 1.5x the worst real-audio site sits near 0.67.
+
+### Validation
+
+The fix was checked at scale, because the bug had hidden on small sets — FLEURS, 50 studio clips per language, showed 9% German rather than 40% and never surfaced the empties. Streaming the full clean Common Voice test set through the fixed FP8 build:
+
+| Language | Clips | Empties |
+|---|---|---|
+| German | 13,543 | 0 |
+| Italian | 12,298 | 0 |
+| French | 13,077 | 7 |
+| Total | 38,918 | 7 (0.018%) |
+
+The seven French empties are empty on FP16 as well: three are digital silence (rms 0.0000, a reference text with no audio), the rest near-silent or a clip both engines reject. None are the scales bug. FLEURS improved to 7.90 / 3.90 / 4.84 and now matches FP16 within 0.3 point. English V2 is byte-identical — its scales were untouched — and unchanged in speed.
+
+### What to know next time
+
+1. "Fixed" means reproducible. The previous entry's 8.17 / 3.81 / 4.77 disagreed with the README's 9.18 / 4.83 / 6.29 for the same code. Two numbers for one binary is not a rounding difference; it is a bug not yet found.
+2. A fault that vanishes under `CUDA_LAUNCH_BLOCKING`, a recompile, and every `compute-sanitizer` tool is sensitivity to accumulation order, not a race. Stop trying to catch it live and measure the invariant it perturbs — here, activation amax against the quantization scale.
+3. FP8 calibration needs headroom and a calibration set that matches deployment. Element-wise max over 16 clean clips left 82% of sites under-scaled; the max is the floor, not the target.
+4. Small evaluation sets hide tail bugs. The empties were invisible on 50-clip FLEURS and obvious on 13k-clip Common Voice. Validate rare failures at a scale where "rare" still produces counts.
+5. Two claims raised while chasing this did not survive measurement: FP8 is only ~2-3% faster than FP16 at batch-1 (the decoder and mel front-end run the same precision in both builds), and FP8 does not hallucinate more than FP16 — measured insertion rates are equal on clean audio and lower on hard audio. FP8's real advantage here is footprint, ~1.16 GB against ~1.85 GB.

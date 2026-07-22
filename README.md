@@ -55,14 +55,14 @@ V3 multilingual (FP8, FLEURS test clips, 50 per language):
                  V3 FP8 multilingual (CUTLASS E4M3)
               ────────────────────────────
                RTFx    WER    Audio  Time
-german        1290x   9.18%   695s  539ms
-italian       1590x   4.83%   732s  461ms
-french        1232x   6.29%   498s  405ms
+german        1256x   7.90%   695s  553ms
+italian       1490x   3.90%   732s  491ms
+french        1158x   4.84%   498s  431ms
               ────────────────────────────
-Total         1372x          1925s  1.40s
+Total         1305x          1925s  1.47s
 ```
 
-WER uses the [HF Open ASR Leaderboard](https://github.com/huggingface/open_asr_leaderboard) multilingual normalizer (lowercase + strip diacritics + remove punctuation) with `num2words` number expansion. Note: WER is inflated by normalizer artifacts (parenthesized reference text being stripped, compound word boundary differences) — qualitative review shows ~2-4% genuine transcription errors.
+WER uses the [HF Open ASR Leaderboard](https://github.com/huggingface/open_asr_leaderboard) multilingual normalizer (lowercase + strip diacritics + remove punctuation) with `num2words` number expansion. The FP8 activation scales are calibrated with 1.5× headroom over a broad audio set (`scripts/calibrate_v3_scales.py`); these numbers match the FP16 backend within 0.3 point and produce no scale-induced empty transcriptions — 0 across the full Common Voice test set (38,918 clips de/it/fr).
 
 ### Startup time
 

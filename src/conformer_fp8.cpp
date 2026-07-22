@@ -74,47 +74,50 @@ static const float FP8_BAKED_ACT_SCALES[218] = {
     9.88769531e-03f, 5.34602557e-04f                                                                        // sub_out, enc_proj
 };
 
-// V3 (multilingual) activation scales — calibrated on 16 utterances (en/de/it/fr),
-// element-wise max across all calibration runs. V3 has ~100x larger subsampling
-// activations than V2 due to different weight distributions.
+// V3 (multilingual) activation scales — element-wise max over 162 utterances
+// spanning Common Voice (de/it/fr/en), FLEURS, librispeech and difficult, times
+// a 1.5x headroom factor. The previous single-reference calibration left 179/218
+// sites below the real-audio amax (early-block conv_dw up to 6.7x too small), so
+// Common Voice audio saturated the E4M3 range and collapsed the TDT decoder to
+// all-blank. Regenerate with scripts/calibrate_v3_scales.py.
 static const float FP8_BAKED_ACT_SCALES_V3[218] = {
-    1.98102687e-02f, 1.25976562e-01f, 3.76892090e-03f, 2.23214296e-03f, 4.52357717e-02f, 1.04544507e-02f,  // blk 0
-    2.48883933e-01f, 3.33077572e-02f, 2.47209817e-01f, 2.71170475e-02f, 2.42571142e-02f, 2.08500447e-03f,
-    2.23214296e-03f, 3.78199993e-03f, 8.70186929e-03f, 1.39421737e-02f, 7.32857827e-03f, 1.83279850e-02f,  // blk 1
-    1.55639648e-02f, 2.44663786e-02f, 1.93459645e-03f, 2.23214296e-03f, 5.06155845e-03f, 7.56835938e-03f,  // blk 2
-    2.64020655e-02f, 7.09751667e-03f, 2.61579249e-02f, 1.36893140e-02f, 2.55998876e-02f, 1.61852152e-03f,
-    2.23214296e-03f, 4.89589153e-03f, 6.67463010e-03f, 8.24497789e-02f, 9.94873047e-03f, 2.43617464e-02f,  // blk 3
-    1.67933870e-02f, 5.28738834e-02f, 1.48773193e-03f, 2.23214296e-03f, 4.85665444e-03f, 6.91005168e-03f,  // blk 4
-    6.23256154e-02f, 9.04192217e-03f, 2.01416016e-02f, 1.53547013e-02f, 4.92117740e-02f, 1.58364431e-03f,
-    2.23214296e-03f, 5.35801472e-03f, 6.66155154e-03f, 7.63811395e-02f, 7.29806069e-03f, 5.07114939e-02f,  // blk 5
-    8.49696528e-03f, 5.05371094e-02f, 1.27846852e-03f, 2.23214296e-03f, 5.38853230e-03f, 6.06427854e-03f,  // blk 6
-    5.92215396e-02f, 4.15257039e-03f, 2.52511166e-02f, 1.51192797e-02f, 6.21861033e-02f, 1.16729736e-03f,
-    2.23214296e-03f, 3.88663146e-03f, 7.00160442e-03f, 5.96749447e-02f, 5.55419922e-03f, 3.05350162e-02f,  // blk 7
-    2.44838167e-02f, 2.99421046e-02f, 1.52587891e-03f, 2.23214296e-03f, 6.24302449e-03f, 6.27790159e-03f,  // blk 8
-    3.36739682e-02f, 8.84137861e-03f, 2.51813624e-02f, 9.69587080e-03f, 4.49218750e-02f, 1.02179393e-03f,
-    2.23214296e-03f, 5.27518149e-03f, 5.26646199e-03f, 1.72293529e-01f, 4.32041707e-03f, 3.20870541e-02f,  // blk 9
-    7.08879763e-03f, 5.49316406e-02f, 1.07574463e-03f, 2.23214296e-03f, 5.43648843e-03f, 4.44466714e-03f,  // blk 10
-    4.96651791e-02f, 5.10515505e-03f, 3.13371941e-02f, 8.06971919e-03f, 1.20675221e-01f, 1.08664378e-03f,
-    2.23214296e-03f, 8.28334223e-03f, 4.50352253e-03f, 4.24804688e-02f, 4.84357541e-03f, 3.11104916e-02f,  // blk 11
-    1.09514510e-02f, 8.52399543e-02f, 1.12806051e-03f, 2.23214296e-03f, 8.58415850e-03f, 4.17872844e-03f,  // blk 12
-    3.73883918e-02f, 3.01252096e-03f, 3.19998600e-02f, 8.15691240e-03f, 6.39299676e-02f, 1.30789622e-03f,
-    2.23214296e-03f, 9.22502764e-03f, 5.20978635e-03f, 3.80510613e-02f, 4.75638267e-03f, 2.66462062e-02f,  // blk 13
-    8.98960698e-03f, 4.39104363e-02f, 9.37325589e-04f, 2.23214296e-03f, 6.53948123e-03f, 4.93948814e-03f,  // blk 14
-    2.93143131e-02f, 3.85611388e-03f, 2.70472933e-02f, 6.44792849e-03f, 4.20619436e-02f, 9.37325589e-04f,
-    2.23214296e-03f, 5.13131265e-03f, 5.75038372e-03f, 3.70047428e-02f, 5.24030393e-03f, 2.80761719e-02f,  // blk 15
-    6.69642864e-03f, 4.95256707e-02f, 1.66756765e-03f, 2.23214296e-03f, 8.18742998e-03f, 6.75746379e-03f,  // blk 16
-    3.29066701e-02f, 7.32421875e-03f, 2.50941683e-02f, 1.20675219e-02f, 4.64215949e-02f, 1.35803223e-03f,
-    2.23214296e-03f, 6.32585818e-03f, 6.36073528e-03f, 3.19126658e-02f, 5.38417278e-03f, 2.62974333e-02f,  // blk 17
-    9.93129145e-03f, 2.97328401e-02f, 8.89914401e-04f, 2.23214296e-03f, 5.39289182e-03f, 6.20378787e-03f,  // blk 18
-    4.44335938e-02f, 7.83429854e-03f, 3.05698942e-02f, 4.99180378e-03f, 5.29785156e-02f, 1.02887838e-03f,
-    2.23214296e-03f, 7.71658774e-03f, 5.87245403e-03f, 3.54875848e-02f, 1.01318359e-02f, 2.87214015e-02f,  // blk 19
-    1.58255436e-02f, 4.08761166e-02f, 1.10244751e-03f, 2.23214296e-03f, 5.41469036e-03f, 3.61633301e-03f,  // blk 20
-    4.43638377e-02f, 1.41775953e-02f, 3.46679688e-02f, 1.40991211e-02f, 3.84347104e-02f, 1.36566162e-03f,
-    2.23214296e-03f, 9.11167730e-03f, 3.08445515e-03f, 3.74581479e-02f, 1.10473633e-02f, 3.28194760e-02f,  // blk 21
-    5.68934856e-03f, 3.90625000e-02f, 1.26102997e-03f, 2.23214296e-03f, 7.03648152e-03f, 3.17164836e-03f,  // blk 22
-    7.44280145e-02f, 1.11955917e-02f, 7.89620504e-02f, 1.03846956e-02f, 3.16336490e-02f, 2.71388469e-03f,
-    2.23214296e-03f, 8.97216797e-03f, 4.97000571e-03f, 3.55747752e-02f, 9.59995855e-03f, 4.79561947e-02f,  // blk 23
-    1.76674104e+00f, 6.35964505e-04f                                                                        // sub_out, enc_proj
+    2.97938743e-02f, 2.18889511e-01f, 6.17327029e-03f, 3.34821444e-03f, 8.63211471e-02f, 1.59694128e-02f,  // blk 0
+    3.67885038e-01f, 5.50885890e-02f, 3.91322538e-01f, 4.10940992e-02f, 4.56194188e-02f, 3.28608917e-03f,
+    3.34821444e-03f, 6.77490234e-03f, 1.38898571e-02f, 1.39787950e-01f, 1.14702496e-02f, 2.93230321e-02f,
+    2.36990796e-02f, 4.25851001e-02f, 3.01470060e-03f, 3.34821444e-03f, 8.99178651e-03f, 1.20784216e-02f,  // blk 2
+    2.00788223e-01f, 1.09143939e-02f, 4.02570461e-02f, 2.14625769e-02f, 4.16957298e-02f, 2.53731857e-03f,
+    3.34821444e-03f, 9.14219418e-03f, 1.06135779e-02f, 1.54541016e-01f, 1.50015699e-02f, 5.31005859e-02f,
+    2.80412938e-02f, 9.08726268e-02f, 2.38200591e-03f, 3.34821444e-03f, 7.93239078e-03f, 1.09013147e-02f,  // blk 4
+    1.00498740e-01f, 1.47661488e-02f, 3.76935694e-02f, 2.54255031e-02f, 7.36607127e-02f, 2.50625610e-03f,
+    3.34821444e-03f, 9.28606326e-03f, 1.02800641e-02f, 1.30266465e-01f, 1.14048547e-02f, 7.85260890e-02f,
+    1.31574352e-02f, 7.60149267e-02f, 1.99454180e-03f, 3.34821444e-03f, 9.32529965e-03f, 9.82230041e-03f,  // blk 6
+    9.47440043e-02f, 6.72912597e-03f, 3.91845703e-02f, 2.40129735e-02f, 9.24944189e-02f, 1.88990997e-03f,
+    3.34821444e-03f, 7.95200864e-03f, 1.05939594e-02f, 9.55810546e-02f, 8.33783811e-03f, 4.80782668e-02f,
+    3.90276219e-02f, 5.97970168e-02f, 2.29045319e-03f, 3.34821444e-03f, 1.20457239e-02f, 9.52148438e-03f,  // blk 8
+    7.60672408e-02f, 1.33013050e-02f, 4.32652077e-02f, 1.62179125e-02f, 6.05817531e-02f, 1.69045576e-03f,
+    3.34821444e-03f, 1.40991211e-02f, 8.01086425e-03f, 2.32073106e-01f, 6.86645508e-03f, 5.12956884e-02f,
+    1.12871442e-02f, 9.19189454e-02f, 1.62587844e-03f, 3.34821444e-03f, 1.09078546e-02f, 6.69642886e-03f,  // blk 10
+    8.86753611e-02f, 7.95854861e-03f, 4.92553712e-02f, 1.25100268e-02f, 2.22656250e-01f, 1.70516968e-03f,
+    3.34821444e-03f, 1.22680664e-02f, 6.66700071e-03f, 7.07833451e-02f, 7.35037658e-03f, 6.14711232e-02f,
+    1.73557824e-02f, 1.40938897e-01f, 1.89481461e-03f, 3.34821444e-03f, 1.32162916e-02f, 6.38253358e-03f,  // blk 12
+    6.66503907e-02f, 4.78036073e-03f, 5.96923829e-02f, 1.25950403e-02f, 1.24930244e-01f, 1.96184433e-03f,
+    3.34821444e-03f, 1.39160156e-02f, 7.81467952e-03f, 5.91169094e-02f, 7.28498166e-03f, 6.19942826e-02f,
+    1.36151989e-02f, 8.16650391e-02f, 1.72642304e-03f, 3.34821444e-03f, 1.35759632e-02f, 7.50732421e-03f,  // blk 14
+    5.44607957e-02f, 5.89861209e-03f, 4.97262160e-02f, 9.57380002e-03f, 1.02539062e-01f, 1.41661506e-03f,
+    3.34821444e-03f, 8.73674685e-03f, 8.71712830e-03f, 7.12018702e-02f, 8.37053592e-03f, 4.90199514e-02f,
+    1.02735248e-02f, 8.27636718e-02f, 2.55039765e-03f, 3.34821444e-03f, 1.47399902e-02f, 1.03258404e-02f,  // blk 16
+    5.09817917e-02f, 1.17906849e-02f, 4.34744703e-02f, 1.81666785e-02f, 7.13064987e-02f, 2.06320634e-03f,
+    3.34821444e-03f, 9.75690549e-03f, 9.68497130e-03f, 6.19942826e-02f, 8.44247010e-03f, 4.19311524e-02f,
+    1.49230957e-02f, 5.10341115e-02f, 1.36675156e-03f, 3.34821444e-03f, 1.05089459e-02f, 9.29914182e-03f,  // blk 18
+    6.63364939e-02f, 1.20718824e-02f, 4.62210523e-02f, 7.87353516e-03f, 8.29729344e-02f, 1.75421586e-03f,
+    3.34821444e-03f, 1.19607104e-02f, 8.93293089e-03f, 5.41469045e-02f, 1.57470703e-02f, 4.27682055e-02f,
+    2.42091576e-02f, 6.13664892e-02f, 1.96674897e-03f, 3.34821444e-03f, 9.01794433e-03f, 6.04248046e-03f,  // blk 20
+    7.88922999e-02f, 2.16718395e-02f, 5.80182765e-02f, 2.12533129e-02f, 6.51855468e-02f, 2.36075272e-03f,
+    3.34821444e-03f, 1.64533336e-02f, 5.29697968e-03f, 5.60825877e-02f, 1.69764930e-02f, 5.58210108e-02f,
+    8.84137815e-03f, 1.02643691e-01f, 1.92097260e-03f, 3.34821444e-03f, 1.12740656e-02f, 5.03867002e-03f,  // blk 22
+    1.45961221e-01f, 1.74996508e-02f, 1.26813613e-01f, 1.55770434e-02f, 4.87845261e-02f, 4.32586670e-03f,
+    3.34821444e-03f, 1.71857556e-02f, 7.84737733e-03f, 5.71289062e-02f, 1.56555176e-02f, 7.38176610e-02f,
+    2.82924109e+00f, 9.65390849e-04f  // sub_out, enc_proj
 };
 
 // =========================================================================
@@ -573,7 +576,32 @@ static void fp8_gemm_impl(cudaStream_t stream,
 
 // Position encoding generation moved to GPU kernel (generate_pos_encoding_gpu)
 
+// --- FP8 activation-scale calibration (env PARAKETTO_CALIB) -----------------
+// When enabled, records per-site activation amax over the forward pass and
+// emits a "SCALES:" line (scale = amax / 448) consumed by
+// scripts/calibrate_v3_scales.py. Restores the runtime calibration pass that
+// was baked out in commit 4a3acb7. Zero overhead when disabled.
+static bool  g_fp8_calib = false;
+static float g_calib_amax[CudaModel::N_FP8_ACT_SITES];
+static void calib_record(cudaStream_t stream, int site, const half* dbuf, int n) {
+    if (!g_fp8_calib) return;
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    static std::vector<half> h;
+    if ((int)h.size() < n) h.resize(n);
+    CUDA_CHECK(cudaMemcpy(h.data(), dbuf, (size_t)n * sizeof(half),
+                          cudaMemcpyDeviceToHost));
+    float mx = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float v = fabsf(__half2float(h[i]));
+        if (v > mx) mx = v;
+    }
+    if (mx > g_calib_amax[site]) g_calib_amax[site] = mx;
+}
+
 int CudaModel::encode_gpu(int T_mel) {
+    g_fp8_calib = getenv("PARAKETTO_CALIB") != nullptr;
+    if (g_fp8_calib)
+        for (int i = 0; i < N_FP8_ACT_SITES; i++) g_calib_amax[i] = 0.0f;
     // FP16 GEMM helper (sub-conv pointwise convolutions)
     auto gnn = [&](const half* X, int m, int k, const half* W, int n, half* Y) {
         cutlass_gemm_nn(stream, X, m, k, W, n, Y);
@@ -641,6 +669,7 @@ int CudaModel::encode_gpu(int T_mel) {
     reshape_chw_to_hcw_fp8(sub_buf[1], sub_buf[0], fp8_act_buf,
                             &fp8_act_site_scales[sub_out_si],
                             SUB_CHANNELS, T, W, stream);
+    calib_record(stream, sub_out_si, sub_buf[0], T * SUB_CHANNELS * W);
     // sub_out projection: FP8 (activation site: N_BLOCKS*9 + 0)
     const float* sub_out_scale = &fp8_scales[N_BLOCKS * 9 + 0];
     if (w->sub_out_b)
@@ -660,17 +689,20 @@ int CudaModel::encode_gpu(int T_mel) {
         // layer_norm + fused FP8 quantize → asite(blk, 0) feeds ff1_w1
         layer_norm_fp8(x, b.ff1_ln_w, b.ff1_ln_b, ln_out, fp8_act_buf,
                        &fp8_act_site_scales[asite(blk, 0)], T, D_MODEL, NORM_EPS, stream);
+        calib_record(stream, asite(blk, 0), ln_out, T * D_MODEL);
 
         gnn8(ln_out, T, D_MODEL, fp8_ff1_w1[blk], D_FF, bscale(blk, 1), asite(blk, 0), ff_mid, true);
         // silu + fused FP8 quantize → asite(blk, 1) feeds ff1_w2
         silu_inplace_fp8(ff_mid, fp8_act_buf,
                          &fp8_act_site_scales[asite(blk, 1)], T * D_FF, stream);
+        calib_record(stream, asite(blk, 1), ff_mid, T * D_FF);
 
         gnn8(ff_mid, T, D_FF, fp8_ff1_w2[blk], D_MODEL, bscale(blk, 2), asite(blk, 1), ff_out, true);
         // residual_add_layer_norm + fused FP8 quantize → asite(blk, 2) feeds qkv
         residual_add_layer_norm_fp8(x, ff_out, 0.5f,
             b.mhsa_ln_w, b.mhsa_ln_b, ln_out, fp8_act_buf,
             &fp8_act_site_scales[asite(blk, 2)], T, D_MODEL, NORM_EPS, stream);
+        calib_record(stream, asite(blk, 2), ln_out, T * D_MODEL);
 
         {
             // Fused QKV projection: FP8
@@ -684,6 +716,7 @@ int CudaModel::encode_gpu(int T_mel) {
 
             // Position encoding projection: FP8 (NOT fused — precomputed data, per-block scales)
             half* pos_temp = pos_proj;
+            calib_record(stream, asite(blk, 3), pos_enc_T, pos_len * D_MODEL);
             gnn8(pos_enc_T, pos_len, D_MODEL, fp8_pos_w[blk], D_MODEL, bscale(blk, 5), asite(blk, 3), pos_temp, false);
 
             // Batched GEMMs stay FP16 (dynamic activations, not weight matrices)
@@ -707,6 +740,7 @@ int CudaModel::encode_gpu(int T_mel) {
             transpose_0213_fp8(attn_out, ff_out, fp8_act_buf,
                                 &fp8_act_site_scales[asite(blk, 4)],
                                 N_HEADS, T, HEAD_DIM, stream);
+            calib_record(stream, asite(blk, 4), ff_out, T * D_MODEL);
 
             // Output projection: FP8
             gnn8(ff_out, T, D_MODEL, fp8_out_w[blk], D_MODEL, bscale(blk, 6), asite(blk, 4), mhsa_out, true);
@@ -716,6 +750,7 @@ int CudaModel::encode_gpu(int T_mel) {
         residual_add_layer_norm_fp8(x, mhsa_out, 1.0f,
             b.conv_ln_w, b.conv_ln_b, ln_out, fp8_act_buf,
             &fp8_act_site_scales[asite(blk, 5)], T, D_MODEL, NORM_EPS, stream);
+        calib_record(stream, asite(blk, 5), ln_out, T * D_MODEL);
 
         // Pointwise conv1 + GLU: FP8
         gnt8(ln_out, T, D_MODEL, fp8_conv_pw1_w[blk], D_CONV_PW, bscale(blk, 7), asite(blk, 5), conv_mid, true);
@@ -726,6 +761,7 @@ int CudaModel::encode_gpu(int T_mel) {
                                       conv_dw, fp8_act_buf,
                                       &fp8_act_site_scales[asite(blk, 6)],
                                       T, D_MODEL, stream);
+        calib_record(stream, asite(blk, 6), conv_dw, T * D_MODEL);
 
         // Pointwise conv2: FP8
         gnt8(conv_dw, T, D_MODEL, fp8_conv_pw2_w[blk], D_MODEL, bscale(blk, 8), asite(blk, 6), mhsa_out, true);
@@ -734,12 +770,14 @@ int CudaModel::encode_gpu(int T_mel) {
         residual_add_layer_norm_fp8(x, mhsa_out, 1.0f,
             b.ff2_ln_w, b.ff2_ln_b, ln_out, fp8_act_buf,
             &fp8_act_site_scales[asite(blk, 7)], T, D_MODEL, NORM_EPS, stream);
+        calib_record(stream, asite(blk, 7), ln_out, T * D_MODEL);
 
         // FF2: FP8
         gnn8(ln_out, T, D_MODEL, fp8_ff2_w1[blk], D_FF, bscale(blk, 3), asite(blk, 7), ff_mid, true);
         // silu + fused FP8 quantize → asite(blk, 8) feeds ff2_w2
         silu_inplace_fp8(ff_mid, fp8_act_buf,
                          &fp8_act_site_scales[asite(blk, 8)], T * D_FF, stream);
+        calib_record(stream, asite(blk, 8), ff_mid, T * D_FF);
 
         gnn8(ff_mid, T, D_FF, fp8_ff2_w2[blk], D_MODEL, bscale(blk, 4), asite(blk, 8), ff_out, true);
         // Final LN: last block fuses FP8 for enc_proj (site 217 = N_BLOCKS*9 + 1)
@@ -757,7 +795,15 @@ int CudaModel::encode_gpu(int T_mel) {
     {
         const float* enc_proj_scale = &fp8_scales[N_BLOCKS * 9 + 1];
         int epi = N_BLOCKS * 9 + 1;
+        calib_record(stream, epi, x, T * D_MODEL);
         gnn8_bias(x, T, D_MODEL, fp8_enc_proj_w, D_JOINT, enc_proj_scale, epi, w->enc_proj_b, enc_proj_all, true);
+    }
+
+    if (g_fp8_calib) {
+        fprintf(stderr, "SCALES:");
+        for (int i = 0; i < N_FP8_ACT_SITES; i++)
+            fprintf(stderr, " %.8e", g_calib_amax[i] / 448.0f);
+        fprintf(stderr, "\n");
     }
 
     return T;

@@ -1,104 +1,97 @@
 #!/usr/bin/env python3
-"""Calibrate FP8 activation scales for V3 by running multiple utterances.
+"""Calibrate FP8 activation scales for V3 over a broad, diverse audio set.
 
-Each binary invocation produces 2 SCALES lines: one from silence warmup
-(skip) and one from actual audio (keep). Takes element-wise max, but also
-reports per-utterance scales for site 216 (sub_out) to identify outliers.
+Each binary invocation (with PARAKETTO_CALIB=1) emits 2 "SCALES:" lines: one
+from the silence warmup (skipped) and one from the real audio (kept). We take
+the element-wise max across all calibration utterances, then multiply by a
+HEADROOM factor so real-world audio that exceeds the calibration set does not
+saturate the E4M3 range (the cause of the V3-FP8 empty-output collapse).
 
-Usage: uv run python scripts/calibrate_v3_scales.py
+Diversity matters: the previous calibration used a single reference utterance
+(commit 18156a5), leaving many sites with zero headroom — Common Voice audio
+drove activations up to 2.5x past the calibrated amax, saturating FP8 and
+collapsing the TDT decoder to all-blank. Here we include Common Voice (the
+triggering distribution), FLEURS, librispeech, and the difficult/earnings sets.
+
+Usage: uv run python scripts/calibrate_v3_scales.py [HEADROOM]   (default 1.5)
 """
 
-import subprocess
 import json
-import numpy as np
+import subprocess
+import sys
 from pathlib import Path
 
+import numpy as np
+
 ROOT = Path(__file__).resolve().parent.parent
-BINARY = ROOT / "build" / "paraketto"
+BINARY = ROOT / "paraketto.fp8"
 N_SITES = 218
+HEADROOM = float(sys.argv[1]) if len(sys.argv) > 1 else 1.5
 
-# Calibration utterances: mix of languages
-CALIBRATION_WAVS = []
+# Calibration corpus: broad coverage of recording conditions and languages.
+# (dir, n_clips) — Common Voice first (the distribution that triggered the bug).
+SOURCES = [
+    ("cv_de", 25), ("cv_it", 25), ("cv_fr", 25), ("cv_en", 25),
+    ("german", 10), ("italian", 10), ("french", 10),
+    ("librispeech", 12), ("difficult", 12), ("earnings22", 8),
+]
 
-# Add English reference utterance (same as V2 calibration)
-en_wav = ROOT / "data" / "librispeech" / "1089-134686-0000.wav"
-if en_wav.exists():
-    CALIBRATION_WAVS.append(str(en_wav))
+wavs = []
+for name, n in SOURCES:
+    manifest = ROOT / "data" / name / "manifest.json"
+    if not manifest.exists():
+        continue
+    for entry in json.load(open(manifest))[:n]:
+        p = ROOT / "data" / name / entry["audio_path"]
+        if p.exists():
+            wavs.append((name, str(p)))
 
-# Add first 5 clips from each language
-for lang in ["german", "italian", "french"]:
-    manifest_path = ROOT / "data" / lang / "manifest.json"
-    if manifest_path.exists():
-        manifest = json.load(open(manifest_path))
-        for entry in manifest[:5]:
-            wav_path = ROOT / "data" / lang / entry["audio_path"]
-            if wav_path.exists():
-                CALIBRATION_WAVS.append(str(wav_path))
-
-print(f"Calibrating on {len(CALIBRATION_WAVS)} utterances...")
+print(f"Calibrating on {len(wavs)} utterances from "
+      f"{len({n for n, _ in wavs})} datasets, headroom={HEADROOM}x")
 
 all_scales = []
-wav_labels = []
-for i, wav in enumerate(CALIBRATION_WAVS):
-    result = subprocess.run(
-        [str(BINARY), "--model", "v3", wav],
-        capture_output=True, text=True, timeout=60
-    )
-    scales_lines = []
-    for line in result.stderr.split("\n"):
-        if line.startswith("SCALES:"):
-            vals = [float(x) for x in line.split()[1:]]
-            assert len(vals) == N_SITES, f"Expected {N_SITES} scales, got {len(vals)}"
-            scales_lines.append(vals)
-    # Skip first (silence warmup), keep rest
-    for s in scales_lines[1:]:
-        all_scales.append(s)
-        wav_labels.append(f"{Path(wav).parent.name}/{Path(wav).stem}")
-    lang = Path(wav).parent.name
-    name = Path(wav).stem
-    print(f"  [{i+1}/{len(CALIBRATION_WAVS)}] {lang}/{name}")
+for i, (name, wav) in enumerate(wavs):
+    r = subprocess.run([str(BINARY), "--model", "v3", wav],
+                       capture_output=True, text=True, timeout=120,
+                       env={**__import__("os").environ, "PARAKETTO_CALIB": "1"})
+    lines = [l for l in r.stderr.split("\n") if l.startswith("SCALES:")]
+    if len(lines) < 2:
+        print(f"  WARN {name}: got {len(lines)} SCALES lines, skipping")
+        continue
+    # keep the audio pass (2nd line); skip the silence warmup (1st)
+    all_scales.append([float(x) for x in lines[-1].split()[1:]])
+    if (i + 1) % 25 == 0:
+        print(f"  [{i+1}/{len(wavs)}]")
 
-print(f"\nCollected {len(all_scales)} scale sets")
 arr = np.array(all_scales)
+assert arr.shape[1] == N_SITES, f"expected {N_SITES} sites, got {arr.shape[1]}"
+print(f"Collected {arr.shape[0]} scale sets")
 
-# Show per-utterance value at outlier sites
-print("\nSite 216 (sub_out) per utterance:")
-for j in range(len(all_scales)):
-    print(f"  {wav_labels[j]:30s}  {arr[j, 216]:.6e}")
+scales_max = arr.max(axis=0)
+scales = scales_max * HEADROOM
 
-print("\nSite 217 (enc_proj) per utterance:")
-for j in range(len(all_scales)):
-    print(f"  {wav_labels[j]:30s}  {arr[j, 217]:.6e}")
+# Report how tight the OLD single-ref calibration was vs the new max.
+# sat = observed_max / old_scale; sat>1 means the old scale saturated.
+print(f"\nPer-site max sat vs pre-headroom max: sites needing >1.0 headroom "
+      f"are those the old calibration would clamp.")
+print(f"  max scale (pre-headroom): {scales_max.max():.4e} at site {scales_max.argmax()}")
+print(f"  applying uniform {HEADROOM}x headroom -> worst-case sat ~= {1.0/HEADROOM:.2f}")
 
-# Strategy: element-wise max, but cap outliers using percentile
-scales_max = np.max(arr, axis=0)
-scales_p95 = np.percentile(arr, 95, axis=0)
-scales_p99 = np.percentile(arr, 99, axis=0)
-
-print(f"\n--- Element-wise max ---")
-print(f"  site 216: {scales_max[216]:.6e}")
-print(f"  site 217: {scales_max[217]:.6e}")
-print(f"--- 95th percentile ---")
-print(f"  site 216: {scales_p95[216]:.6e}")
-print(f"  site 217: {scales_p95[217]:.6e}")
-
-# Use max for the final output (conservative, prevents clipping)
-scales = scales_max
-
-print(f"\nstatic const float FP8_BAKED_ACT_SCALES_V3[{N_SITES}] = {{")
-for i in range(0, N_SITES, 6):
-    chunk = scales[i:i+6]
-    parts = []
-    for j, v in enumerate(chunk):
-        idx = i + j
-        suffix = "f," if idx < N_SITES - 1 else "f"
-        parts.append(f"{v:.8e}{suffix}")
-    line = "    " + " ".join(parts)
-    blk = i // 9
-    off = i % 9
-    if off == 0 and blk < 24:
-        line += f"  // blk {blk}"
-    elif i >= 216:
-        line += "  // sub_out, enc_proj"
-    print(line)
-print("};")
+out = ROOT / "scripts" / "v3_scales_new.txt"
+with open(out, "w") as f:
+    f.write(f"static const float FP8_BAKED_ACT_SCALES_V3[{N_SITES}] = {{\n")
+    for i in range(0, N_SITES, 6):
+        parts = []
+        for j, v in enumerate(scales[i:i + 6]):
+            idx = i + j
+            suffix = "f," if idx < N_SITES - 1 else "f"
+            parts.append(f"{v:.8e}{suffix}")
+        line = "    " + " ".join(parts)
+        blk, off = i // 9, i % 9
+        if off == 0 and blk < 24:
+            line += f"  // blk {blk}"
+        elif i >= 216:
+            line += "  // sub_out, enc_proj"
+        f.write(line + "\n")
+    f.write("};\n")
+print(f"\nWrote new array to {out}")
