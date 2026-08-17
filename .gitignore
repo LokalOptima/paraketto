@@ -44,9 +44,6 @@ paraketto.fp8.baseline
 *.so
 *.a
 
-# CUTLASS headers (clone from https://github.com/NVIDIA/cutlass)
-third_party/cutlass/
-
 # llama.cpp build artifacts (submodule source is tracked, build is not)
 vendor/llama.cpp/build/
 

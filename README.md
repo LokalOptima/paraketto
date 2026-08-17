@@ -104,7 +104,7 @@ V3 weights: `paraketto-v3-fp16.bin` (1.2 GB) / `paraketto-v3-fp8.bin` (627 MB). 
 
 ### Prerequisites
 
-- Linux, NVIDIA GPU (Ampere or newer), CUDA toolkit 12+
+- Linux, NVIDIA GPU (Ampere or newer; FP8 backend needs Blackwell), CUDA toolkit 12+
 - `curl` (for auto-downloading weights at runtime)
 - `wget` (for Makefile benchmark data downloads)
 - Python 3.10+ with [uv](https://docs.astral.sh/uv/) (for benchmarks only — not needed at runtime)
@@ -112,9 +112,13 @@ V3 weights: `paraketto-v3-fp16.bin` (1.2 GB) / `paraketto-v3-fp8.bin` (627 MB). 
 ### Build & run
 
 ```bash
+git clone --recurse-submodules https://github.com/LokalOptima/paraketto
+# or, in an existing clone: git submodule update --init third_party/cutlass
 make paraketto.cuda              # CUTLASS backend (cudart only)
 ./paraketto.cuda audio.wav       # auto-downloads weights on first run (~1.2 GB)
 ```
+
+The FP16/FP8 GEMMs come from the [CUTLASS](https://github.com/NVIDIA/cutlass) submodule at `third_party/cutlass` (header-only — nothing to build). The GPU architecture is auto-detected via `nvidia-smi`; override with `make ARCH=sm_XX` if cross-compiling. The optional LLM corrector additionally needs the `vendor/llama.cpp` submodule.
 
 Weights are downloaded from [HuggingFace](https://huggingface.co/localoptima/paraketto) to `~/.cache/paraketto/` on first run. Use `--weights FILE` to override with a local file.
 
@@ -163,6 +167,10 @@ make paraketto.fp8 WITH_CORRECTOR=1    # build with llama.cpp integration
 ```
 
 Requires the llama.cpp git submodule (`git submodule update --init`).
+
+### Embedding as a library (CMake)
+
+The Makefile is the canonical build for the standalone binaries. A separate CMake build produces a static library (`paraketto_lib`) for embedding the engine in other projects — see the header comment in `CMakeLists.txt` for options (`PARAKETTO_FP8`, `PARAKETTO_USE_CUBLAS`, `PARAKETTO_BUILD_LIB_ONLY`). The public API is `paraketto::Pipeline` in `src/paraketto.h`. The CMake build does not support the LLM corrector.
 
 ## HTTP API
 
@@ -236,9 +244,11 @@ make bench-v3      # WER + RTFx (V3 multilingual: de/it/fr)
 ```
 src/paraketto_cuda.cpp    # CUDA backend main (mel, server, greedy decode)
 src/model_defs.h          # Shared model constants, config, Weights struct
+src/conformer_base.h      # CudaModelBase: buffers + TDT decoder shared by FP16/FP8
+src/conformer_base.cpp    # Shared buffer pool carving + decoder (LSTM, joint network)
 src/conformer.h           # FP16 CudaModel definition
-src/conformer.cpp         # FP16 CudaModel (CUTLASS or cuBLAS via gemm.h)
-src/conformer_fp8.h       # FP8 CudaModel (adds fp8_pool, scales, cublasLt handles)
+src/conformer.cpp         # FP16 encoder (CUTLASS or cuBLAS via gemm.h)
+src/conformer_fp8.h       # FP8 CudaModel (adds fp8_pool, quantized weights, scales)
 src/conformer_fp8.cpp     # FP8 CudaModel (CUTLASS E4M3, per-tensor scaling)
 src/weights.cpp           # Weight loading (shared by all backends)
 src/gemm.h                # Unified GEMM interface (backend selected at link time)

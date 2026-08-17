@@ -8,7 +8,7 @@
 // The layout defined here IS the file format. No separate index or header.
 // Changing this layout requires regenerating paraketto-fp16.bin (run repack_weights.py).
 
-#include "conformer.h"
+#include "model_defs.h"
 #include "common.h"
 
 #include <cstdio>

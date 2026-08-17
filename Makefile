@@ -1,4 +1,14 @@
-CUDA_HOME      ?= /usr/local/cuda-13.1
+# CUDA toolkit: newest /usr/local/cuda-* install, else nvcc from PATH.
+# Override with CUDA_HOME=/path/to/cuda.
+CUDA_LATEST  := $(lastword $(sort $(wildcard /usr/local/cuda-*)))
+NVCC_IN_PATH := $(shell command -v nvcc 2>/dev/null)
+CUDA_HOME    ?= $(or $(CUDA_LATEST),$(patsubst %/bin/nvcc,%,$(NVCC_IN_PATH)),/usr/local/cuda)
+
+# GPU arch: auto-detected from the installed GPU (e.g. 12.0 -> sm_120).
+# Override with ARCH=sm_XX. The FP8 backend needs Blackwell (sm_120a).
+GPU_CC   := $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '.')
+ARCH     ?= $(if $(GPU_CC),sm_$(GPU_CC),sm_120)
+ARCH_FP8 ?= sm_120a
 
 CXX      = g++
 NVCC     = $(CUDA_HOME)/bin/nvcc
@@ -111,7 +121,7 @@ bench-all: paraketto.cuda paraketto.cublas paraketto.fp8 data/librispeech/manife
 	@uv run python tests/bench_native.py paraketto.cuda
 	$(call BENCH_SEP,C++ cuBLAS · paraketto_cuda.cpp + cuBLAS FP16)
 	@uv run python tests/bench_native.py paraketto.cublas
-	$(call BENCH_SEP,C++ FP8  · paraketto_cuda.cpp + cublasLt FP8)
+	$(call BENCH_SEP,C++ FP8  · paraketto_cuda.cpp + CUTLASS FP8)
 	@uv run python tests/bench_native.py paraketto.fp8
 
 bench-cuda: paraketto.cuda data/librispeech/manifest.json $(WEIGHTS) check-weights
@@ -135,7 +145,7 @@ weights-export: scripts/export_weights.py
 
 # C++ / CUDA build
 src/kernels.o: src/kernels.cu src/kernels.h
-	$(NVCC) $(NVFLAGS) -arch=sm_120 -c $< -o $@
+	$(NVCC) $(NVFLAGS) -arch=$(ARCH) -c $< -o $@
 
 SHARED_HEADERS = src/common.h src/wav.h src/mel.h src/vocab.h src/server.h
 
@@ -143,7 +153,11 @@ SHARED_HEADERS = src/common.h src/wav.h src/mel.h src/vocab.h src/server.h
 CUDA_CXXFLAGS = -std=c++17 -O3 -march=native -flto=auto -Wno-deprecated-declarations -I$(CUDA_HOME)/include -Ithird_party -Isrc
 CUDA_LDFLAGS  = -flto=auto -L$(CUDA_HOME)/lib64 -lcudart -lpthread
 CUTLASS_INC   = -Ithird_party/cutlass/include -Ithird_party/cutlass/tools/util/include
-src/weights.o: src/weights.cpp src/conformer.h src/model_defs.h src/common.h
+
+# Friendly error when the CUTLASS submodule hasn't been initialized
+third_party/cutlass/include:
+	@echo "ERROR: CUTLASS submodule missing. Run: git submodule update --init third_party/cutlass"; exit 1
+src/weights.o: src/weights.cpp src/model_defs.h src/common.h
 	$(CXX) $(CUDA_CXXFLAGS) -I$(CUDA_HOME)/include -c $< -o $@
 
 ifdef WITH_CORRECTOR
@@ -151,34 +165,34 @@ src/corrector.o: src/corrector.cpp src/corrector.h $(CORRECTOR_DEP)
 	$(CXX) $(CUDA_CXXFLAGS) $(CORRECTOR_CFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 endif
 
-CONFORMER_DEPS = src/paraketto_cuda.cpp src/conformer.cpp src/conformer.h src/model_defs.h src/kernels.h src/gemm.h $(SHARED_HEADERS)
+CONFORMER_DEPS = src/paraketto_cuda.cpp src/conformer.cpp src/conformer.h src/conformer_base.cpp src/conformer_base.h src/model_defs.h src/kernels.h src/gemm.h $(SHARED_HEADERS)
 
 # CUTLASS GEMM backend (default — no cuBLAS dependency, cudart only)
-src/cutlass_gemm.o: src/cutlass_gemm.cu src/cutlass_gemm.h src/gemm.h src/kernels.h
-	$(NVCC) $(NVFLAGS) -arch=sm_120 $(CUTLASS_INC) -c $< -o $@
+src/cutlass_gemm.o: src/cutlass_gemm.cu src/cutlass_gemm.h src/gemm.h src/kernels.h | third_party/cutlass/include
+	$(NVCC) $(NVFLAGS) -arch=$(ARCH) $(CUTLASS_INC) -c $< -o $@
 
 paraketto.cuda: $(CONFORMER_DEPS) src/weights.o src/kernels.o src/cutlass_gemm.o src/cutlass_gemm.h $(CORRECTOR_OBJ)
-	$(CXX) $(CUDA_CXXFLAGS) $(CORRECTOR_CFLAGS) -DBACKEND_NAME='"CUTLASS FP16"' src/paraketto_cuda.cpp src/conformer.cpp src/weights.o src/kernels.o src/cutlass_gemm.o $(CORRECTOR_OBJ) $(CUDA_LDFLAGS) $(CORRECTOR_LDFLAGS) -o $@
+	$(CXX) $(CUDA_CXXFLAGS) $(CORRECTOR_CFLAGS) -DBACKEND_NAME='"CUTLASS FP16"' src/paraketto_cuda.cpp src/conformer.cpp src/conformer_base.cpp src/weights.o src/kernels.o src/cutlass_gemm.o $(CORRECTOR_OBJ) $(CUDA_LDFLAGS) $(CORRECTOR_LDFLAGS) -o $@
 
 # cuBLAS GEMM backend (faster on some shapes, requires libcublas)
 src/cublas_gemm.o: src/cublas_gemm.cu src/gemm.h src/kernels.h
-	$(NVCC) $(NVFLAGS) -arch=sm_120 -c $< -o $@
+	$(NVCC) $(NVFLAGS) -arch=$(ARCH) -c $< -o $@
 
 paraketto.cublas: $(CONFORMER_DEPS) src/weights.o src/kernels.o src/cublas_gemm.o $(CORRECTOR_OBJ)
-	$(CXX) $(CUDA_CXXFLAGS) $(CORRECTOR_CFLAGS) -DBACKEND_NAME='"cuBLAS FP16"' src/paraketto_cuda.cpp src/conformer.cpp src/weights.o src/kernels.o src/cublas_gemm.o $(CORRECTOR_OBJ) $(CUDA_LDFLAGS) -lcublas -lcublasLt $(CORRECTOR_LDFLAGS) -o $@
+	$(CXX) $(CUDA_CXXFLAGS) $(CORRECTOR_CFLAGS) -DBACKEND_NAME='"cuBLAS FP16"' src/paraketto_cuda.cpp src/conformer.cpp src/conformer_base.cpp src/weights.o src/kernels.o src/cublas_gemm.o $(CORRECTOR_OBJ) $(CUDA_LDFLAGS) -lcublas -lcublasLt $(CORRECTOR_LDFLAGS) -o $@
 
 # FP8 cublasLt backend
 src/kernels_fp8.o: src/kernels_fp8.cu src/kernels_fp8.h
-	$(NVCC) $(NVFLAGS) -arch=sm_120a -c $< -o $@
+	$(NVCC) $(NVFLAGS) -arch=$(ARCH_FP8) -c $< -o $@
 
-src/cutlass_gemm_fp8.o: src/cutlass_gemm_fp8.cu src/cutlass_gemm_fp8.h src/common.h
-	$(NVCC) $(NVFLAGS) -arch=sm_120 $(CUTLASS_INC) -c $< -o $@
+src/cutlass_gemm_fp8.o: src/cutlass_gemm_fp8.cu src/cutlass_gemm_fp8.h src/common.h | third_party/cutlass/include
+	$(NVCC) $(NVFLAGS) -arch=$(ARCH) $(CUTLASS_INC) -c $< -o $@
 
-src/conformer_fp8.o: src/conformer_fp8.cpp src/conformer_fp8.h src/model_defs.h src/conformer.h src/kernels.h src/kernels_fp8.h src/cutlass_gemm_fp8.h src/cutlass_gemm.h
+src/conformer_fp8.o: src/conformer_fp8.cpp src/conformer_fp8.h src/conformer_base.h src/model_defs.h src/kernels.h src/kernels_fp8.h src/cutlass_gemm_fp8.h src/cutlass_gemm.h
 	$(CXX) $(CUDA_CXXFLAGS) -I$(CUDA_HOME)/include -c $< -o $@
 
-paraketto.fp8: src/paraketto_cuda.cpp src/conformer_fp8.h src/model_defs.h src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o src/cutlass_gemm.o src/cutlass_gemm_fp8.o $(SHARED_HEADERS) $(CORRECTOR_OBJ)
-	$(CXX) $(CUDA_CXXFLAGS) $(CORRECTOR_CFLAGS) -DBACKEND_NAME='"CUTLASS FP8 (E4M3)"' -include src/conformer_fp8.h src/paraketto_cuda.cpp src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o src/cutlass_gemm.o src/cutlass_gemm_fp8.o $(CORRECTOR_OBJ) $(CUDA_LDFLAGS) $(CORRECTOR_LDFLAGS) -o $@
+paraketto.fp8: src/paraketto_cuda.cpp src/conformer_fp8.h src/conformer_base.cpp src/conformer_base.h src/model_defs.h src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o src/cutlass_gemm.o src/cutlass_gemm_fp8.o $(SHARED_HEADERS) $(CORRECTOR_OBJ)
+	$(CXX) $(CUDA_CXXFLAGS) $(CORRECTOR_CFLAGS) -DBACKEND_NAME='"CUTLASS FP8 (E4M3)"' -DPARAKETTO_FP8=1 src/paraketto_cuda.cpp src/conformer_base.cpp src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o src/cutlass_gemm.o src/cutlass_gemm_fp8.o $(CORRECTOR_OBJ) $(CUDA_LDFLAGS) $(CORRECTOR_LDFLAGS) -o $@
 
 # Generate paraketto-fp8.bin from paraketto-fp16.bin (offline quantization)
 generate-fp8: $(WEIGHTS)
@@ -189,22 +203,22 @@ repack: $(WEIGHTS)
 	uv run python scripts/repack_weights.py
 
 bench_gemm: tests/bench_gemm.cu
-	$(NVCC) $(NVFLAGS) -arch=sm_120 $(CUTLASS_INC) tests/bench_gemm.cu -lcublas -lcublasLt -o $@
+	$(NVCC) $(NVFLAGS) -arch=$(ARCH) $(CUTLASS_INC) tests/bench_gemm.cu -lcublas -lcublasLt -o $@
 
 bench_splitk: tests/bench_splitk.cu
-	$(NVCC) $(NVFLAGS) -arch=sm_120 $(CUTLASS_INC) tests/bench_splitk.cu -lcublas -lcublasLt -o $@
+	$(NVCC) $(NVFLAGS) -arch=$(ARCH) $(CUTLASS_INC) tests/bench_splitk.cu -lcublas -lcublasLt -o $@
 
 bench_tiles: tests/bench_tiles.cu
-	$(NVCC) $(NVFLAGS) -arch=sm_120 $(CUTLASS_INC) tests/bench_tiles.cu -lcublas -lcublasLt -o $@
+	$(NVCC) $(NVFLAGS) -arch=$(ARCH) $(CUTLASS_INC) tests/bench_tiles.cu -lcublas -lcublasLt -o $@
 
 bench_ff2: tests/bench_ff2.cu
-	$(NVCC) $(NVFLAGS) -arch=sm_120 $(CUTLASS_INC) tests/bench_ff2.cu -lcublas -lcublasLt -o $@
+	$(NVCC) $(NVFLAGS) -arch=$(ARCH) $(CUTLASS_INC) tests/bench_ff2.cu -lcublas -lcublasLt -o $@
 
 bench_fp8_cutlass: tests/bench_fp8_cutlass.cu
-	$(NVCC) $(NVFLAGS) -arch=sm_120a $(CUTLASS_INC) -Ithird_party/cutlass/examples/common tests/bench_fp8_cutlass.cu -lcublas -lcublasLt -o $@
+	$(NVCC) $(NVFLAGS) -arch=$(ARCH_FP8) $(CUTLASS_INC) -Ithird_party/cutlass/examples/common tests/bench_fp8_cutlass.cu -lcublas -lcublasLt -o $@
 
 bench_fp8_tiles: tests/bench_fp8_tiles.cu
-	$(NVCC) $(NVFLAGS) -arch=sm_120 $(CUTLASS_INC) tests/bench_fp8_tiles.cu -lcublas -lcublasLt -o $@
+	$(NVCC) $(NVFLAGS) -arch=$(ARCH) $(CUTLASS_INC) tests/bench_fp8_tiles.cu -lcublas -lcublasLt -o $@
 
 clean:
 	rm -f paraketto.cuda paraketto.cublas paraketto.static paraketto.fp8 paraketto.fp8.static paraketto.fp8.baseline

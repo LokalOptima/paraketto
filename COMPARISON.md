@@ -44,7 +44,7 @@ Two Whisper configurations were run:
 | **B — batched** | beam_size=1 (greedy) | on (batch_size=16) | `BatchedInferencePipeline`; greedy matches paraketto's decoder |
 
 paraketto numbers are from its README (RTX 5070 Ti, FP8 V2/V3).
-Harness + raw results live in `/home/lapo/git/whisper-bench/`
+Harness + raw results live in a separate `whisper-bench` repo
 (`bench_whisper.py`, `results.json` = config A, `results_batched_beam1.json` = config B).
 
 ---
