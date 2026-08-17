@@ -65,10 +65,12 @@ static inline void log_request(const httplib::Request& req, const httplib::Respo
 
 #ifdef WITH_CORRECTOR
 template<typename PipelineT>
-static void run_server(PipelineT& pipeline, Corrector* corrector, const std::string& host, int port) {
+static void run_server(PipelineT& pipeline, Corrector* corrector,
+                       const std::string& info_json, const std::string& host, int port) {
 #else
 template<typename PipelineT>
-static void run_server(PipelineT& pipeline, const std::string& host, int port) {
+static void run_server(PipelineT& pipeline,
+                       const std::string& info_json, const std::string& host, int port) {
 #endif
     httplib::Server svr;
     std::mutex mtx;
@@ -77,6 +79,12 @@ static void run_server(PipelineT& pipeline, const std::string& host, int port) {
 
     svr.Get("/health", [](const httplib::Request&, httplib::Response& res) {
         res.set_content("{\"status\":\"ok\"}", "application/json");
+    });
+
+    // Model/backend/device info — lets clients (and the web UI) show exactly
+    // what is running, so v2-vs-v3 and FP8-vs-FP16 mix-ups are visible at a glance.
+    svr.Get("/info", [info_json](const httplib::Request&, httplib::Response& res) {
+        res.set_content(info_json, "application/json");
     });
 
     svr.Post("/shutdown", [&svr](const httplib::Request&, httplib::Response& res) {
@@ -100,6 +108,11 @@ static void run_server(PipelineT& pipeline, const std::string& host, int port) {
   header { text-align: center; margin-bottom: 2rem; }
   header h1 { font-size: 1.5rem; font-weight: 700; color: #fff; letter-spacing: -0.02em; }
   header p { font-size: 0.82rem; color: #52525b; margin-top: 2px; }
+  .modelinfo { margin-top: 12px; font-size: 0.75rem; line-height: 1.6; }
+  .modelinfo .badge { display: inline-block; color: #d4d4d8; background: #18181b;
+                      border: 1px solid #27272a; border-radius: 6px; padding: 3px 9px;
+                      font-weight: 600; font-variant-numeric: tabular-nums; }
+  .modelinfo .sub { color: #3f3f46; margin-top: 5px; font-variant-numeric: tabular-nums; }
   .rec-area { display: flex; flex-direction: column; align-items: center; gap: 12px; }
   #recbtn { width: 72px; height: 72px; border-radius: 50%; border: 2px solid #27272a;
             background: #18181b; cursor: pointer; display: flex; align-items: center;
@@ -130,9 +143,22 @@ static void run_server(PipelineT& pipeline, const std::string& host, int port) {
   .drop-zone p { color: #3f3f46; font-size: 0.82rem; }
   .result { margin-top: 24px; display: none; }
   .result.visible { display: block; }
+  .transcript-wrap { position: relative; }
   .transcript { background: #0f0f11; border: 1px solid #1c1c1f; border-radius: 12px;
-                padding: 20px; font-size: 1.05rem; line-height: 1.7;
+                padding: 20px 20px 46px; font-size: 1.05rem; line-height: 1.7;
                 color: #f4f4f5; min-height: 60px; white-space: pre-wrap; }
+  #playbtn { position: absolute; bottom: 10px; right: 10px; width: 32px; height: 32px;
+             border-radius: 50%; border: 1px solid #27272a; background: #18181b;
+             cursor: pointer; display: none; align-items: center; justify-content: center;
+             padding: 0; transition: all 0.2s; }
+  #playbtn.visible { display: flex; }
+  #playbtn:hover { border-color: #3f3f46; background: #1c1c1f; transform: scale(1.05); }
+  #playbtn .play-icon, #playbtn .pause-icon { width: 13px; height: 13px; fill: #a1a1aa;
+                                              transition: fill 0.2s; }
+  #playbtn:hover .play-icon, #playbtn:hover .pause-icon { fill: #d4d4d8; }
+  #playbtn .pause-icon { display: none; }
+  #playbtn.playing .play-icon { display: none; }
+  #playbtn.playing .pause-icon { display: block; }
   .meta { display: flex; gap: 16px; margin-top: 10px; flex-wrap: wrap; }
   .meta span { font-size: 0.75rem; color: #3f3f46; font-variant-numeric: tabular-nums; }
   .meta .val { color: #71717a; }
@@ -149,6 +175,7 @@ static void run_server(PipelineT& pipeline, const std::string& host, int port) {
   <header>
     <h1>parakettő</h1>
     <p>speech-to-text</p>
+    <div id="modelinfo" class="modelinfo"></div>
   </header>
 
   <div class="rec-area">
@@ -171,12 +198,36 @@ static void run_server(PipelineT& pipeline, const std::string& host, int port) {
   <div class="spinner" id="spinner"></div>
 
   <div class="result" id="result">
-    <div class="transcript" id="transcript"></div>
+    <div class="transcript-wrap">
+      <div class="transcript" id="transcript"></div>
+      <button id="playbtn" onclick="togglePlay()" title="Play received audio">
+        <svg class="play-icon" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+        <svg class="pause-icon" viewBox="0 0 24 24"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>
+      </button>
+    </div>
     <div class="meta" id="meta"></div>
   </div>
 </div>
 <script>
 const $ = id => document.getElementById(id);
+
+// --- Playback of the received audio (debug: hear exactly what was transcribed) ---
+let audioURL = null, player = null;
+function setPlaybackAudio(blob) {
+  if (audioURL) URL.revokeObjectURL(audioURL);
+  audioURL = URL.createObjectURL(blob);
+  if (!player) {
+    player = new Audio();
+    player.onplay  = () => $('playbtn').classList.add('playing');
+    player.onpause = () => $('playbtn').classList.remove('playing');
+    player.onended = () => $('playbtn').classList.remove('playing');
+  }
+  player.src = audioURL;
+}
+function togglePlay() {
+  if (!player) return;
+  if (player.paused) { player.currentTime = 0; player.play(); } else player.pause();
+}
 
 // --- File upload / drop ---
 $('dropzone').addEventListener('click', () => $('fileinput').click());
@@ -209,6 +260,8 @@ function pcmToWav(chunks) {
 // --- Microphone: AudioWorklet capture + waveform visualization, transcribe on stop ---
 let micStream = null, micCtx = null, analyser = null, recording = false, recPcm = [];
 let waveRaf = null, recStart = 0;
+const REC_SKIP_S = 0.15;  // drop the first 150ms of capture to skip the mouse-click transient
+let skipSamples = 0;
 async function initMic() {
   if (micStream) return true;
   try {
@@ -226,7 +279,16 @@ async function initMic() {
     `], { type: 'application/javascript' })));
     const source = micCtx.createMediaStreamSource(micStream);
     const node = new AudioWorkletNode(micCtx, 'rec');
-    node.port.onmessage = e => { if (recording) recPcm.push(e.data); };
+    node.port.onmessage = e => {
+      if (!recording) return;
+      if (skipSamples > 0) {                    // drop the mouse-click lead-in
+        if (e.data.length <= skipSamples) { skipSamples -= e.data.length; return; }
+        recPcm.push(e.data.subarray(skipSamples));
+        skipSamples = 0;
+        return;
+      }
+      recPcm.push(e.data);
+    };
     source.connect(node);
     // Analyser for waveform visualization
     analyser = micCtx.createAnalyser();
@@ -288,6 +350,7 @@ async function toggleRecord() {
   if (recording) { stopRecord(); return; }
   if (!await initMic()) return;
   recPcm = [];
+  skipSamples = Math.round(micCtx.sampleRate * REC_SKIP_S);
   rmsLen = 0; rmsHead = 0; lastRmsPush = 0;
   recording = true;
   recStart = Date.now();
@@ -297,6 +360,7 @@ async function toggleRecord() {
   $('transcript').textContent = '';
   $('meta').innerHTML = '';
   $('result').classList.remove('visible');
+  if (player) player.pause();
   waveRaf = requestAnimationFrame(drawWaveform);
 }
 function stopRecord() {
@@ -310,6 +374,8 @@ function stopRecord() {
 // --- Transcribe (file upload or final recording) ---
 async function sendFile(file, name) {
   $('spinner').classList.add('visible');
+  setPlaybackAudio(file);
+  $('playbtn').classList.add('visible');
   const fd = new FormData();
   fd.append('file', file, name || file.name);
   try {
@@ -333,6 +399,15 @@ async function sendFile(file, name) {
   }
   $('spinner').classList.remove('visible');
 }
+
+// --- Show which model/backend is running (GET /info) ---
+const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+fetch('/info').then(r => r.json()).then(j => {
+  const wname = (j.weights || '').split('/').pop();
+  $('modelinfo').innerHTML =
+    `<span class="badge">${esc(j.model)} · ${esc(j.backend)}</span>` +
+    `<div class="sub">${esc(wname)} (${esc(j.weights_mb)} MB) · ${esc(j.device)} · ${esc(j.startup_ms)} ms startup</div>`;
+}).catch(() => {});
 </script>
 </body>
 </html>)html", "text/html");

@@ -158,14 +158,14 @@ src/cutlass_gemm.o: src/cutlass_gemm.cu src/cutlass_gemm.h src/gemm.h src/kernel
 	$(NVCC) $(NVFLAGS) -arch=sm_120 $(CUTLASS_INC) -c $< -o $@
 
 paraketto.cuda: $(CONFORMER_DEPS) src/weights.o src/kernels.o src/cutlass_gemm.o src/cutlass_gemm.h $(CORRECTOR_OBJ)
-	$(CXX) $(CUDA_CXXFLAGS) $(CORRECTOR_CFLAGS) src/paraketto_cuda.cpp src/conformer.cpp src/weights.o src/kernels.o src/cutlass_gemm.o $(CORRECTOR_OBJ) $(CUDA_LDFLAGS) $(CORRECTOR_LDFLAGS) -o $@
+	$(CXX) $(CUDA_CXXFLAGS) $(CORRECTOR_CFLAGS) -DBACKEND_NAME='"CUTLASS FP16"' src/paraketto_cuda.cpp src/conformer.cpp src/weights.o src/kernels.o src/cutlass_gemm.o $(CORRECTOR_OBJ) $(CUDA_LDFLAGS) $(CORRECTOR_LDFLAGS) -o $@
 
 # cuBLAS GEMM backend (faster on some shapes, requires libcublas)
 src/cublas_gemm.o: src/cublas_gemm.cu src/gemm.h src/kernels.h
 	$(NVCC) $(NVFLAGS) -arch=sm_120 -c $< -o $@
 
 paraketto.cublas: $(CONFORMER_DEPS) src/weights.o src/kernels.o src/cublas_gemm.o $(CORRECTOR_OBJ)
-	$(CXX) $(CUDA_CXXFLAGS) $(CORRECTOR_CFLAGS) src/paraketto_cuda.cpp src/conformer.cpp src/weights.o src/kernels.o src/cublas_gemm.o $(CORRECTOR_OBJ) $(CUDA_LDFLAGS) -lcublas -lcublasLt $(CORRECTOR_LDFLAGS) -o $@
+	$(CXX) $(CUDA_CXXFLAGS) $(CORRECTOR_CFLAGS) -DBACKEND_NAME='"cuBLAS FP16"' src/paraketto_cuda.cpp src/conformer.cpp src/weights.o src/kernels.o src/cublas_gemm.o $(CORRECTOR_OBJ) $(CUDA_LDFLAGS) -lcublas -lcublasLt $(CORRECTOR_LDFLAGS) -o $@
 
 # FP8 cublasLt backend
 src/kernels_fp8.o: src/kernels_fp8.cu src/kernels_fp8.h
@@ -178,7 +178,7 @@ src/conformer_fp8.o: src/conformer_fp8.cpp src/conformer_fp8.h src/model_defs.h 
 	$(CXX) $(CUDA_CXXFLAGS) -I$(CUDA_HOME)/include -c $< -o $@
 
 paraketto.fp8: src/paraketto_cuda.cpp src/conformer_fp8.h src/model_defs.h src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o src/cutlass_gemm.o src/cutlass_gemm_fp8.o $(SHARED_HEADERS) $(CORRECTOR_OBJ)
-	$(CXX) $(CUDA_CXXFLAGS) $(CORRECTOR_CFLAGS) -include src/conformer_fp8.h src/paraketto_cuda.cpp src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o src/cutlass_gemm.o src/cutlass_gemm_fp8.o $(CORRECTOR_OBJ) $(CUDA_LDFLAGS) $(CORRECTOR_LDFLAGS) -o $@
+	$(CXX) $(CUDA_CXXFLAGS) $(CORRECTOR_CFLAGS) -DBACKEND_NAME='"CUTLASS FP8 (E4M3)"' -include src/conformer_fp8.h src/paraketto_cuda.cpp src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o src/cutlass_gemm.o src/cutlass_gemm_fp8.o $(CORRECTOR_OBJ) $(CUDA_LDFLAGS) $(CORRECTOR_LDFLAGS) -o $@
 
 # Generate paraketto-fp8.bin from paraketto-fp16.bin (offline quantization)
 generate-fp8: $(WEIGHTS)

@@ -28,6 +28,12 @@
 
 using namespace paraketto;
 
+// Compute backend name, injected per-binary by the Makefile link recipe
+// (CUTLASS FP16 / cuBLAS FP16 / CUTLASS FP8). Falls back for ad-hoc builds.
+#ifndef BACKEND_NAME
+#define BACKEND_NAME "unknown backend"
+#endif
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -281,29 +287,50 @@ int main(int argc, char** argv) {
             return (stat(path.c_str(), &st) == 0) ? st.st_size / (1024.0 * 1024.0) : 0;
         };
         double weights_mb = file_size_mb(weights_path);
+        int    version    = pipeline.weights.config.version;
+        double startup_ms = ms(t_main_start, t_warmup_done);
+        double vram_total_mb = vram_total / (1024.0 * 1024.0);
+        double vram_free_mb  = vram_free  / (1024.0 * 1024.0);
 
         fprintf(stderr, "\n");
-        fprintf(stderr, "model:     parakeet-tdt-0.6b-v%d (custom CUDA)\n",
-                pipeline.weights.config.version);
+        fprintf(stderr, "model:     parakeet-tdt-0.6b-v%d  ·  %s\n", version, BACKEND_NAME);
         fprintf(stderr, "weights:   %s (%.0f MB)\n", weights_path.c_str(), weights_mb);
         fprintf(stderr, "device:    %s (compute %d.%d, %.0f MB VRAM, %.0f MB free)\n",
-                prop.name, prop.major, prop.minor,
-                vram_total / (1024.0 * 1024.0), vram_free / (1024.0 * 1024.0));
+                prop.name, prop.major, prop.minor, vram_total_mb, vram_free_mb);
         fprintf(stderr, "startup:   %.0f ms (cuda=%.0f prefetch=%.0f load=%.0f warmup=%.0f)\n",
-                ms(t_main_start, t_warmup_done), ms(t_main_start, t_cuda_init),
-                ms(t_main_start, t_prefetch),
+                startup_ms, ms(t_main_start, t_cuda_init), ms(t_main_start, t_prefetch),
                 ms(t_prefetch, t_init_done), ms(t_init_done, t_warmup_done));
-        fprintf(stderr, "endpoints: GET /health | POST /transcribe\n");
+        fprintf(stderr, "endpoints: GET /health | GET /info | POST /transcribe\n");
 #ifdef WITH_CORRECTOR
         if (enable_correct)
             fprintf(stderr, "corrector: enabled (%.0fms warmup)\n", corrector.last_correct_ms);
 #endif
         fprintf(stderr, "\n");
 
+        // Build the JSON served at GET /info so the web UI (and any client) can
+        // show exactly which model version and backend are running.
+        char nb[64];
+        std::string info = "{";
+        info += "\"model\":\"parakeet-tdt-0.6b-v" + std::to_string(version) + "\",";
+        info += "\"version\":" + std::to_string(version) + ",";
+        info += "\"backend\":\"" + json_escape(BACKEND_NAME) + "\",";
+        info += "\"weights\":\"" + json_escape(weights_path) + "\",";
+        snprintf(nb, sizeof nb, "%.0f", weights_mb);      info += "\"weights_mb\":" + std::string(nb) + ",";
+        info += "\"device\":\"" + json_escape(prop.name) + "\",";
+        info += "\"compute\":\"" + std::to_string(prop.major) + "." + std::to_string(prop.minor) + "\",";
+        snprintf(nb, sizeof nb, "%.0f", vram_total_mb);   info += "\"vram_total_mb\":" + std::string(nb) + ",";
+        snprintf(nb, sizeof nb, "%.0f", vram_free_mb);    info += "\"vram_free_mb\":" + std::string(nb) + ",";
+        snprintf(nb, sizeof nb, "%.0f", startup_ms);      info += "\"startup_ms\":" + std::string(nb);
 #ifdef WITH_CORRECTOR
-        run_server(pipeline, enable_correct ? &corrector : nullptr, server_host, server_port);
+        info += ",\"corrector\":";
+        info += (enable_correct ? "true" : "false");
+#endif
+        info += "}";
+
+#ifdef WITH_CORRECTOR
+        run_server(pipeline, enable_correct ? &corrector : nullptr, info, server_host, server_port);
 #else
-        run_server(pipeline, server_host, server_port);
+        run_server(pipeline, info, server_host, server_port);
 #endif
         return 0;
     }

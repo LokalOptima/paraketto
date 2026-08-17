@@ -166,13 +166,15 @@ Requires the llama.cpp git submodule (`git submodule update --init`).
 
 ## HTTP API
 
-- `GET /` — web UI (microphone recording + file upload)
+- `GET /` — web UI (microphone recording + file upload; shows the running model/backend)
 - `GET /health` — returns `{"status":"ok"}`
+- `GET /info` — model version, backend (FP8/FP16/cuBLAS), weights path, device, startup timing
 - `POST /transcribe` — multipart `file` upload, returns `{"text":"...","audio_duration_s":...,"inference_time_s":...}`
 - `POST /shutdown` — gracefully stops the server
 
 ```bash
 curl localhost:8080/health
+curl localhost:8080/info
 curl -F file=@audio.wav localhost:8080/transcribe
 curl -X POST localhost:8080/shutdown
 ```
