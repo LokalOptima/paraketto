@@ -177,11 +177,17 @@ def mean_std(values: list[float]) -> tuple[float, float]:
 
 
 def print_comparison(baseline: dict, current: dict, alpha: float = 0.05,
-                     mode: str = "expect-same") -> bool:
+                     mode: str = "expect-same", min_rtfx_pct: float = 2.0) -> bool:
     """Print comparison table and return True if expectation is met.
 
     baseline/current: {dataset: {"wer_sessions": [...], "rtfx_sessions": [...]}}
     Each list contains one value per session (the session mean).
+
+    min_rtfx_pct: practical-significance floor for RTFx. Sessions within one
+    invocation share GPU clock/thermal state, so the between-session variance
+    understates between-invocation drift (~1-2% on identical code). An RTFx
+    change only FAILs if it is both statistically significant AND larger than
+    this floor; smaller significant changes are reported as DRIFT (non-fatal).
     """
     all_pass = True
 
@@ -218,14 +224,19 @@ def print_comparison(baseline: dict, current: dict, alpha: float = 0.05,
         delta = c_mean - b_mean
 
         t_stat, p_val = ttest_ind(c, b, equal_var=False, alternative=wer_alt)
-        if np.isnan(p_val):
-            p_val = 1.0 if delta == 0 else 0.0
+        if (b_std == 0 and c_std == 0) or np.isnan(p_val):
+            # Zero variance on both sides makes the t-test degenerate:
+            # p = nan when the means are exactly equal, 0.0 when they differ
+            # by any amount — even 1e-15 of float summation noise. A real WER
+            # change is at least one word edit (>= ~0.01pp on every dataset),
+            # so decide the degenerate case by epsilon on the delta instead.
+            p_val = 1.0 if abs(delta) < 1e-6 else 0.0
 
         status = "FAIL" if p_val < alpha else "PASS"
         if p_val < alpha:
             all_pass = False
 
-        print(f"  {status:>4}  {ds:<15} "
+        print(f"  {status:>5}  {ds:<15} "
               f"base={b_mean:6.2f}% (+-{b_std:4.2f})  "
               f"curr={c_mean:6.2f}% (+-{c_std:4.2f})  "
               f"delta={delta:+.2f}pp  p={p_val:.3f}")
@@ -244,11 +255,15 @@ def print_comparison(baseline: dict, current: dict, alpha: float = 0.05,
 
         t_stat, p_val = ttest_ind(c, b, equal_var=False, alternative=rtfx_alt)
 
-        status = "FAIL" if p_val < alpha else "PASS"
-        if p_val < alpha:
+        if p_val < alpha and abs(pct_change) >= min_rtfx_pct:
+            status = "FAIL"
             all_pass = False
+        elif p_val < alpha:
+            status = "DRIFT"  # significant but below the practical floor
+        else:
+            status = "PASS"
 
-        print(f"  {status:>4}  {ds:<15} "
+        print(f"  {status:>5}  {ds:<15} "
               f"base={b_mean:7.0f}x (+-{b_std:5.1f})  "
               f"curr={c_mean:7.0f}x (+-{c_std:5.1f})  "
               f"delta={pct_change:+.1f}%  p={p_val:.3f}")
@@ -277,6 +292,10 @@ def main():
                         help="Number of runs per session (default: 3)")
     parser.add_argument("--port", type=int, default=18080,
                         help="Server port (default: 18080)")
+    parser.add_argument("--min-rtfx-drop", type=float, default=2.0, metavar="PCT",
+                        help="Practical-significance floor for RTFx changes (%%). "
+                             "Statistically significant changes below this are "
+                             "reported as DRIFT, not FAIL (default: 2.0)")
     parser.add_argument("--alpha", type=float, default=0.05,
                         help="Significance level for t-test (default: 0.05)")
     mode_group = parser.add_mutually_exclusive_group()
@@ -342,7 +361,8 @@ def main():
 
     if args.compare:
         baseline = json.loads(Path(args.compare).read_text())
-        passed = print_comparison(baseline, all_sessions, args.alpha, args.mode)
+        passed = print_comparison(baseline, all_sessions, args.alpha, args.mode,
+                                  min_rtfx_pct=args.min_rtfx_drop)
         sys.exit(0 if passed else 1)
 
 

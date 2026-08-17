@@ -2155,3 +2155,31 @@ The refactor extracts `CudaModelBase` (`conformer_base.h/.cpp`): shared fields, 
 ### Verification
 
 Transcripts were captured before the refactor (three English clips per backend, German and Italian on V3) and compared after: byte-identical for CUTLASS FP16, FP8, and FP8 V3. The cuBLAS "baseline" turned out to be error text — that binary had been deleted by an earlier `make clean` and never rebuilt — so its check is weaker: post-refactor output matches the CUTLASS transcripts exactly, which is the expected text. `bench_regression.py` against the July baselines showed RTFx deltas of −0.1% to +1.0% across all datasets and backends, all p ≥ 0.4. Decode time is unchanged (2.2–2.3 ms on the 7 s test clip). One WER flag appeared and traced to the baseline being older than the mel determinism fix (8c38706), not to this change — the baseline had run-to-run WER variance (±0.02) that the deterministic kernel no longer has, and current WER matches the committed README exactly.
+
+## bench_regression: degenerate t-tests and clock drift
+
+### Two false FAILs from one question
+
+Checking whether the CudaModelBase refactor was performance-neutral produced two FAIL verdicts from `bench_regression.py`, both wrong, each wrong in its own way.
+
+The first: FP8 earnings22 flagged `delta=+0.00pp p=0.000`. At full precision the current WER was `11.816838995568684` against a baseline of `11.816838995568682` — a difference of 1.78e-15, one float ULP of summation-order noise, from identical transcripts. The script had a NaN guard (`p_val = 1.0 if delta == 0 else 0.0`), but it never fired, and the first fix attempt — widening that guard — failed for an instructive reason: with zero variance on both sides and a nonzero mean difference, the t statistic is not NaN but *infinite*, so `ttest_ind` returns p = 0.0 exactly. The guard now triggers on the degenerate condition itself (`b_std == 0 and c_std == 0`, or NaN) and decides by epsilon: deltas under 1e-6pp pass. The margin is provable, not chosen by feel — the smallest WER change any dataset can physically produce is one word edit, which is 100/14921 = 0.0067pp on `long` and 0.14pp on earnings22 (698 reference words), so the epsilon sits 6,700× below the smallest real signal and ~9 orders above the noise it filters.
+
+The second: comparing a binary against a baseline saved *minutes earlier from that same binary* failed RTFx at −0.9% (p=0.006). The harness's session design assumes session means are independent replicates, but all five sessions of one invocation run back-to-back and share GPU clock and thermal state. Within-invocation variance is ±0.3 RTFx; between-invocation drift on identical code measured 0.5–1.1%. The t-test sees a tiny σ and calls a 1% shift significant — a test with a near-certain false-positive rate in the sub-1% band, on unchanged code.
+
+### The fix and its honest cost
+
+WER got the epsilon above. RTFx got a practical-significance floor: `--min-rtfx-drop` (default 2%, about 2× the observed same-code drift). A change fails only if it is statistically significant *and* exceeds the floor; significant changes below it print as `DRIFT` with the delta and p-value, visible but non-fatal.
+
+The floor is a real sensitivity reduction and worth stating plainly: a true 1.5% regression no longer hard-fails. But the old behavior was not sensitivity — a verdict that fires on identical code carries no information at that magnitude. Detecting sub-2% changes on this hardware would require a different design (interleaved A/B invocations of both binaries so drift hits both arms), not a lower threshold.
+
+### Falsification, then fresh baselines
+
+Both fixes were tested by injection rather than by rerunning until green. Adding exactly one word error on `long` — the smallest real regression the suite can express — still fails (`delta=+0.01pp p=0.000`). A synthetic −2.5% RTFx drop fails; −1.0% prints DRIFT. A clean same-binary compare now passes with the drift labeled.
+
+The three baselines were regenerated (5 sessions × 3 runs each) from current binaries; the old ones predated the mel determinism fix and carried nondeterministic WER variance that no current build can reproduce. Numbers match the committed README: difficult at 20.99 / 21.07 / 16.46% WER for cuda / cublas / fp8.
+
+### What to know next time
+
+1. `ttest_ind` on zero-variance samples returns p = 0.0 for *any* mean difference, including 1e-15. Guard the condition, not the NaN.
+2. Sessions inside one invocation are not independent samples of machine state. If the baseline and the comparison run in different invocations, ~1% RTFx drift is the noise floor regardless of how tight the within-run σ looks.
+3. When a regression gate misfires, fix it and then try to make it fire on a real injected regression. A gate that was only ever seen passing proves nothing.
