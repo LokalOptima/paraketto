@@ -2390,3 +2390,139 @@ Validation on the RTX 5070 Ti:
 The encoder and decoder operation sequences are unchanged. The full corpus
 comparison uses the canonical Make builds; timings from this correctness run
 are not a statistical performance comparison.
+
+## Native Linux dictation app (2026-10-27)
+
+Added an optional C++ desktop app using GTK 3, GStreamer, IBus, and libxdo.
+It owns an Ultra FP16 server on an automatically selected loopback port, shows
+readiness and live process VRAM, and retains recordings and transcripts with
+playback, copying, and deletion. The web UI also keeps recordings in a stack
+with a copy button; its history remains limited to the browser session.
+
+The GNOME shortcut toggles recording while a floating level indicator shows
+the destination without taking focus. IBus support is detected for the focused
+field on each recording. A temporary engine commits Unicode text directly and
+restores the previous engine; applications without a confirmed IBus field use
+X11 clipboard paste. Native delivery guards field focus, while the fallback
+can only guard the application window. A changed destination keeps the result
+in history. The initial integration targets GNOME on X11.
+
+IBus 1.5.29 can initially send legacy FocusIn before its asynchronous FocusId
+query finishes. The integration reactivates the engine once through public
+APIs and requires a real input context, rejecting the daemon's fake context.
+Destroyed engines release their references, and cancellation restores the
+previous engine even when activation was still pending.
+
+The server now exposes `/status` with its PID and optional live NVML memory
+statistics. Port zero selects a free port and emits a machine-readable ready
+event. The app verifies the child PID, stops only its own server, and arranges
+for that server to terminate if the app exits unexpectedly. A user launcher
+and Ctrl+Alt+Space shortcut can be installed without root privileges.
+
+[Speech Note](https://github.com/mkiol/dsnote) was the main mature reference for
+desktop input integration; [Nerd Dictation](https://github.com/ideasman42/nerd-dictation)
+also informed the separation of recording and text delivery. The app reuses
+established native libraries and the existing HTTP server; no Python runtime
+or code copied from those projects is included.
+
+Validation: the Make desktop build and optional CMake target pass. Three
+isolated integration tests cover recording/history, Unicode IBus delivery and
+focus cancellation, and server startup failure/shutdown. A separate full
+Ultra test fed recorded speech through GStreamer into a real GTK text field,
+first with IBus and then with the field's input method disabled. Both inserted
+exactly the persisted transcript, the overlay preserved focus, and quitting
+stopped the owned server. Live server memory was 1,866 MiB on the RTX 5070 Ti.
+Test sessions use private X11, D-Bus, IBus, and data directories; they do not
+type into the user's desktop. Physical microphone capture remains a manual
+check. Screenshots and end-to-end results are in `scratch/desktop-e2e/`.
+
+### Fix recording transition and Ghostty/tmux input
+
+Stopping a recording previously hid the overlay and immediately showed it
+again for transcription. The same window now stays visible across that
+transition; cancellation, short recordings, and submission errors still close
+it explicitly.
+
+Testing with Ghostty exposed a missed interaction: a global shortcut's keyboard
+grab temporarily sends IBus focus to its fake context. The original guard
+permanently rejected that as a destination change. Delivery now waits for the
+same real input context to return, while a different real field or application
+still invalidates the destination. The paste fallback also recognizes Ghostty
+and uses its Ctrl+Shift+V binding.
+
+The isolated Ghostty/tmux reproduction failed before the focus fix and receives
+the expected Unicode text afterward, both through native IBus and through
+clipboard paste with bracketed paste enabled. An X11 event trace confirms that
+the recording overlay no longer unmaps during the stop transition. The desktop
+integration tests also cover temporary focus loss and cancellation after moving
+to another real field. These checks use a fixture server and a private display,
+without typing into the live terminal or running GPU inference.
+
+The recording overlay now puts elapsed time before the destination on its top
+line, with the waveform and a circular cancel button below. Removed the
+redundant listening label and shortcut instruction. The same compact layout
+continues through transcription and delivery. Checked its appearance at 125%
+text scaling and verified that shortcut-driven Ghostty/tmux insertion still
+works without unmapping the overlay during the stop transition.
+
+### Desktop layout, model lifecycle, and application names
+
+Replaced the main window's custom theme and fixed text sizes with native GTK
+controls, system typography, and a compact history list. Transcription text
+comes first; timestamp, playback, copying, and an overflow menu share one footer.
+The header and menus use standard themed widgets. Preferences provides the
+idle timeout, a keep-loaded switch, and shortcut setup. The recording overlay
+retains the requested timer/destination line and round cancel button.
+
+The desktop app now opens without starting an inference process. Recording
+starts the model in the background and queues audio until it is ready. After
+five minutes without dictation, the app stops its owned server and releases
+the complete CUDA allocation. The timeout is configurable and resets after
+activity; recording, transcription, and pending delivery prevent eviction.
+Load now, Unload now, and Retry are explicit controls. Keep loaded disables
+automatic eviction between recordings, while manual unloading remains available.
+Preferences persist beside the history directory in `preferences.ini`.
+
+Load failures show a simple red message in the main window and dictation
+overlay. Recording stops, captured audio is retained when long enough to save,
+and startup diagnostics are written to the server log even when the weights
+are missing. Errors remain dismissible without ending the app. Histories are
+independent of model residency and still persist as JSON plus WAV files.
+
+Destination names now use installed desktop entries through GIO, matching the
+desktop ID or StartupWMClass and using the localized display name. Ghostty
+therefore appears as Ghostty. The original window class remains available to
+the input backend for paste-shortcut selection.
+
+Validation: Make and CMake builds pass, as do the existing three desktop
+integration checks. A new private-session lifecycle check covers cold startup,
+queued transcription, idle and manual unloading, protection during active
+work, persisted keep-loaded preferences, and failed-load history/log reporting.
+The Ghostty/tmux check still inserts Unicode text and displays the friendly
+name. Screenshots at 125% text scaling cover the history, preferences, and red
+error states. Two real Ultra load/transcribe/idle-unload cycles produced the
+same transcript, each reported 1,866 MiB of server VRAM, and each disappeared
+from NVIDIA's compute-process accounting after eviction. Test artifacts are in
+`scratch/desktop-redesign/`; lifecycle tests shorten the idle timeout locally.
+
+### Desktop status and history refinements
+
+The server state is bold and colour coded: yellow while sleeping, green when
+ready, and red on failure. Loading uses a native indeterminate progress bar,
+since the server does not report fractional progress. VRAM now displays model
+process usage against device capacity with padded monospaced fields. A single
+NVIDIA metadata query supplies capacity before the first model load; subsequent
+server status updates refresh it, and unloading retains the capacity display.
+
+The server and stats panel has a separate background from transcription history.
+Visible separators divide messages, and a native trash button replaces each
+recording's overflow menu. The transient notification strip is replaced by
+total saved words and whole-number WPM, weighted by recording duration. Failed
+transcriptions are excluded, and deleting history updates the totals. Word
+counting handles Unicode and keeps apostrophe contractions together.
+
+Validation: the desktop build, three integration checks, and private-session
+lifecycle checks pass. The history check covers duration-weighted WPM,
+contractions, failed results, and missing durations. Screenshots at 125% text
+scaling verify sleeping, loading, and ready states, including stable VRAM and
+control positions across state changes.

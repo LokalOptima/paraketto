@@ -8,8 +8,10 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <mutex>
 #include <string>
+#include <unistd.h>
 
 #include "cpp-httplib/httplib.h"
 #include "wav.h"
@@ -66,11 +68,13 @@ static inline void log_request(const httplib::Request& req, const httplib::Respo
 #ifdef WITH_CORRECTOR
 template<typename PipelineT>
 static void run_server(PipelineT& pipeline, Corrector* corrector,
-                       const std::string& info_json, const std::string& host, int port) {
+                       const std::string& info_json, const std::string& host, int port,
+                       const std::function<std::string()>& status = {}) {
 #else
 template<typename PipelineT>
 static void run_server(PipelineT& pipeline,
-                       const std::string& info_json, const std::string& host, int port) {
+                       const std::string& info_json, const std::string& host, int port,
+                       const std::function<std::string()>& status = {}) {
 #endif
     httplib::Server svr;
     std::mutex mtx;
@@ -85,6 +89,10 @@ static void run_server(PipelineT& pipeline,
     // what is running, so model and backend mix-ups are visible at a glance.
     svr.Get("/info", [info_json](const httplib::Request&, httplib::Response& res) {
         res.set_content(info_json, "application/json");
+    });
+
+    svr.Get("/status", [status](const httplib::Request&, httplib::Response& res) {
+        res.set_content(status ? status() : "{\"status\":\"ready\"}", "application/json");
     });
 
     svr.Post("/shutdown", [&svr](const httplib::Request&, httplib::Response& res) {
@@ -141,32 +149,36 @@ static void run_server(PipelineT& pipeline,
                text-align: center; cursor: pointer; transition: all 0.2s; }
   .drop-zone:hover, .drop-zone.dragover { border-color: #3f3f46; background: #0f0f11; }
   .drop-zone p { color: #3f3f46; font-size: 0.82rem; }
-  .result { margin-top: 24px; display: none; }
-  .result.visible { display: block; }
+  .results { display: flex; flex-direction: column; gap: 24px; margin-top: 24px; }
+  .result-header { display: flex; align-items: baseline; justify-content: space-between;
+                   gap: 12px; margin: 0 4px 8px; font-size: 0.75rem; color: #71717a; }
+  .recording-name { overflow-wrap: anywhere; min-width: 0; }
+  .recorded-at { flex-shrink: 0; font-variant-numeric: tabular-nums; }
   .transcript-wrap { position: relative; }
   .transcript { background: #0f0f11; border: 1px solid #1c1c1f; border-radius: 12px;
-                padding: 20px 20px 46px; font-size: 1.05rem; line-height: 1.7;
-                color: #f4f4f5; min-height: 60px; white-space: pre-wrap; }
-  #playbtn { position: absolute; bottom: 10px; right: 10px; width: 32px; height: 32px;
-             border-radius: 50%; border: 1px solid #27272a; background: #18181b;
-             cursor: pointer; display: none; align-items: center; justify-content: center;
-             padding: 0; transition: all 0.2s; }
-  #playbtn.visible { display: flex; }
-  #playbtn:hover { border-color: #3f3f46; background: #1c1c1f; transform: scale(1.05); }
-  #playbtn .play-icon, #playbtn .pause-icon { width: 13px; height: 13px; fill: #a1a1aa;
-                                              transition: fill 0.2s; }
-  #playbtn:hover .play-icon, #playbtn:hover .pause-icon { fill: #d4d4d8; }
-  #playbtn .pause-icon { display: none; }
-  #playbtn.playing .play-icon { display: none; }
-  #playbtn.playing .pause-icon { display: block; }
+                padding: 20px 20px 56px; font-size: 1.05rem; line-height: 1.7;
+                color: #f4f4f5; min-height: 100px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .result[aria-busy="true"] .transcript { color: #71717a; }
+  .result.error .transcript { color: #f87171; }
+  .result-actions { position: absolute; bottom: 10px; right: 10px; left: 10px;
+                    display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+  .result-btn { width: 32px; height: 32px; flex-shrink: 0; border-radius: 8px;
+                border: 1px solid #27272a; background: #18181b; color: #a1a1aa;
+                cursor: pointer; display: flex; align-items: center; justify-content: center;
+                padding: 0; transition: background 0.2s, color 0.2s; }
+  .result-btn:hover:not(:disabled) { border-color: #3f3f46; background: #1c1c1f; color: #d4d4d8; }
+  .result-btn:focus-visible { outline: 2px solid #a1a1aa; outline-offset: 3px; }
+  .result-btn:disabled { opacity: 0.35; cursor: default; }
+  .result-btn svg { width: 15px; height: 15px; }
+  .playbtn { border-radius: 50%; }
+  .playbtn svg { fill: currentColor; }
+  .playbtn .pause-icon { display: none; }
+  .playbtn.playing .play-icon { display: none; }
+  .playbtn.playing .pause-icon { display: block; }
+  .copy-status { color: #a1a1aa; font-size: 0.72rem; }
   .meta { display: flex; gap: 16px; margin-top: 10px; flex-wrap: wrap; }
   .meta span { font-size: 0.75rem; color: #3f3f46; font-variant-numeric: tabular-nums; }
   .meta .val { color: #71717a; }
-  .spinner { display: none; margin: 20px auto; width: 20px; height: 20px;
-             border: 2px solid #27272a; border-top-color: #71717a; border-radius: 50%;
-             animation: spin 0.6s linear infinite; }
-  .spinner.visible { display: block; }
-  @keyframes spin { to { transform: rotate(360deg); } }
   input[type="file"] { display: none; }
 </style>
 </head>
@@ -195,43 +207,114 @@ static void run_server(PipelineT& pipeline,
   </div>
   <input type="file" id="fileinput" accept="audio/*">
 
-  <div class="spinner" id="spinner"></div>
-
-  <div class="result" id="result">
-    <div class="transcript-wrap">
-      <div class="transcript" id="transcript"></div>
-      <button id="playbtn" onclick="togglePlay()" title="Play received audio">
-        <svg class="play-icon" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
-        <svg class="pause-icon" viewBox="0 0 24 24"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>
-      </button>
-    </div>
-    <div class="meta" id="meta"></div>
-  </div>
+  <section class="results" id="results" aria-label="Recordings"></section>
+  <template id="result-template">
+    <article class="result" aria-busy="true">
+      <div class="result-header">
+        <span class="recording-name"></span>
+        <time class="recorded-at"></time>
+      </div>
+      <div class="transcript-wrap">
+        <div class="transcript" aria-live="polite">Transcribing…</div>
+        <div class="result-actions">
+          <span class="copy-status" role="status"></span>
+          <button class="playbtn result-btn" type="button" title="Play recording" aria-label="Play recording">
+            <svg class="play-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
+            <svg class="pause-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>
+          </button>
+          <button class="copybtn result-btn" type="button" title="Copy transcript" aria-label="Copy transcript" disabled>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></svg>
+          </button>
+        </div>
+      </div>
+      <div class="meta"></div>
+    </article>
+  </template>
 </div>
 <script>
 const $ = id => document.getElementById(id);
 
-// --- Playback of the received audio (debug: hear exactly what was transcribed) ---
-let audioURL = null, player = null;
-function setPlaybackAudio(blob) {
-  if (audioURL) URL.revokeObjectURL(audioURL);
-  audioURL = URL.createObjectURL(blob);
-  if (!player) {
-    player = new Audio();
-    player.onplay  = () => $('playbtn').classList.add('playing');
-    player.onpause = () => $('playbtn').classList.remove('playing');
-    player.onended = () => $('playbtn').classList.remove('playing');
+// --- Recording history: each request owns its transcript and playback ---
+let activePlayer = null, recordingCount = 0;
+function createResult(file, label) {
+  const element = $('result-template').content.firstElementChild.cloneNode(true);
+  const entry = {
+    element, text: '',
+    transcript: element.querySelector('.transcript'),
+    meta: element.querySelector('.meta'),
+    copyButton: element.querySelector('.copybtn'),
+  };
+  element.querySelector('.recording-name').textContent = label;
+  const time = element.querySelector('.recorded-at'), now = new Date();
+  time.dateTime = now.toISOString();
+  time.textContent = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  time.title = now.toLocaleString();
+
+  // Retain this URL for the lifetime of the card; later recordings must not revoke it.
+  const player = new Audio(URL.createObjectURL(file));
+  const playButton = element.querySelector('.playbtn');
+  const feedback = element.querySelector('.copy-status');
+  let feedbackTimer;
+  function showFeedback(message) {
+    clearTimeout(feedbackTimer);
+    feedback.textContent = message;
+    feedbackTimer = setTimeout(() => { feedback.textContent = ''; }, 2500);
   }
-  player.src = audioURL;
+  function updatePlayback(playing) {
+    playButton.classList.toggle('playing', playing);
+    playButton.title = playing ? 'Pause recording' : 'Play recording';
+    playButton.setAttribute('aria-label', playButton.title);
+    if (!playing && activePlayer === player) activePlayer = null;
+  }
+  player.onplay = () => { activePlayer = player; updatePlayback(true); };
+  player.onpause = player.onended = () => updatePlayback(false);
+  playButton.addEventListener('click', async () => {
+    if (!player.paused) { player.pause(); return; }
+    if (activePlayer && activePlayer !== player) activePlayer.pause();
+    activePlayer = player;
+    player.currentTime = 0;
+    try { await player.play(); }
+    catch (e) {
+      updatePlayback(false);
+      if (e.name !== 'AbortError') showFeedback('Playback unavailable');
+    }
+  });
+  entry.copyButton.addEventListener('click', async () => {
+    try { await copyText(entry.text); showFeedback('Copied'); }
+    catch { showFeedback('Copy failed'); }
+  });
+  $('results').prepend(element);
+  return entry;
 }
-function togglePlay() {
-  if (!player) return;
-  if (player.paused) { player.currentTime = 0; player.play(); } else player.pause();
+
+async function copyText(text) {
+  if (navigator.clipboard?.writeText) {
+    try { await navigator.clipboard.writeText(text); return; }
+    catch { /* Try selection-based copying if clipboard access is denied. */ }
+  }
+  // Also support HTTP connections where the Clipboard API is unavailable.
+  const field = document.createElement('textarea');
+  field.value = text;
+  field.readOnly = true;
+  field.style.cssText = 'position:fixed;left:-9999px;top:0';
+  const previousFocus = document.activeElement;
+  document.body.append(field);
+  try {
+    field.select();
+    if (!document.execCommand('copy')) throw new Error('Copy failed');
+  } finally {
+    field.remove();
+    previousFocus?.focus({ preventScroll: true });
+  }
 }
 
 // --- File upload / drop ---
 $('dropzone').addEventListener('click', () => $('fileinput').click());
-$('fileinput').addEventListener('change', e => { if (e.target.files[0]) sendFile(e.target.files[0]); });
+$('fileinput').addEventListener('change', e => {
+  const file = e.target.files[0];
+  e.target.value = '';  // Allow uploading the same file again as another entry.
+  if (file) sendFile(file);
+});
 $('dropzone').addEventListener('dragover', e => { e.preventDefault(); $('dropzone').classList.add('dragover'); });
 $('dropzone').addEventListener('dragleave', () => $('dropzone').classList.remove('dragover'));
 $('dropzone').addEventListener('drop', e => {
@@ -357,10 +440,7 @@ async function toggleRecord() {
   $('recbtn').classList.add('recording');
   $('waveform').classList.add('visible');
   $('rectime').classList.add('visible');
-  $('transcript').textContent = '';
-  $('meta').innerHTML = '';
-  $('result').classList.remove('visible');
-  if (player) player.pause();
+  if (activePlayer) activePlayer.pause();
   waveRaf = requestAnimationFrame(drawWaveform);
 }
 function stopRecord() {
@@ -373,31 +453,34 @@ function stopRecord() {
 }
 // --- Transcribe (file upload or final recording) ---
 async function sendFile(file, name) {
-  $('spinner').classList.add('visible');
-  setPlaybackAudio(file);
-  $('playbtn').classList.add('visible');
+  const entry = createResult(file, name ? `Recording ${++recordingCount}` : (file.name || 'Audio'));
   const fd = new FormData();
-  fd.append('file', file, name || file.name);
+  fd.append('file', file, name || file.name || 'recording.wav');
   try {
     const r = await fetch('/transcribe', { method: 'POST', body: fd });
     const j = await r.json();
-    if (!r.ok) { $('transcript').textContent = 'Error: ' + (j.error || r.status); }
+    if (!r.ok) {
+      entry.transcript.textContent = 'Error: ' + (j.error || r.status);
+      entry.element.classList.add('error');
+    }
     else {
-      $('transcript').textContent = j.text;
+      entry.text = j.text || '';
+      entry.transcript.textContent = entry.text || 'No speech detected.';
+      entry.copyButton.disabled = !entry.text;
       const dur = j.audio_duration_s.toFixed(1);
       const inf = (j.inference_time_s * 1000).toFixed(0);
       const rtfx = (j.audio_duration_s / j.inference_time_s).toFixed(0);
-      $('meta').innerHTML =
+      entry.meta.innerHTML =
         `<span>${dur}s audio</span>` +
         `<span><span class="val">${inf}ms</span> inference</span>` +
         `<span><span class="val">${rtfx}x</span> RTFx</span>`;
     }
-    $('result').classList.add('visible');
   } catch(e) {
-    $('transcript').textContent = 'Connection error';
-    $('result').classList.add('visible');
+    entry.transcript.textContent = 'Connection error';
+    entry.element.classList.add('error');
+  } finally {
+    entry.element.setAttribute('aria-busy', 'false');
   }
-  $('spinner').classList.remove('visible');
 }
 
 // --- Show which model/backend is running (GET /info) ---
@@ -469,10 +552,19 @@ fetch('/info').then(r => r.json()).then(j => {
         res.set_content(body, "application/json");
     });
 
+    // Port zero lets a supervising desktop app request a private, unused port.
+    if (port == 0) port = svr.bind_to_any_port(host);
+    else if (!svr.bind_to_port(host, port)) port = -1;
+    if (port < 0) {
+        fprintf(stderr, "failed to bind server on %s\n", host.c_str());
+        std::exit(1);
+    }
     const char* display_host = (host == "0.0.0.0") ? "localhost" : host.c_str();
     fprintf(stderr, "listening on http://%s:%d\n", display_host, port);
     fprintf(stderr, "\n");
-    if (!svr.listen(host, port)) {
+    printf("{\"event\":\"ready\",\"port\":%d,\"pid\":%ld}\n", port, static_cast<long>(getpid()));
+    fflush(stdout);
+    if (!svr.listen_after_bind()) {
         fprintf(stderr, "failed to bind %s:%d\n", host.c_str(), port);
         std::exit(1);
     }

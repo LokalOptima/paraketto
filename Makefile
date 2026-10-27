@@ -126,11 +126,11 @@ weights-export: scripts/export_weights.py
 src/kernels.o: src/kernels.cu src/kernels.h src/common.h
 	$(NVCC) $(NVFLAGS) -arch=$(ARCH) -c $< -o $@
 
-SHARED_HEADERS = src/paraketto.h src/common.h src/wav.h src/mel.h src/vocab.h src/server.h
+SHARED_HEADERS = src/paraketto.h src/common.h src/wav.h src/mel.h src/vocab.h src/server.h src/gpu_status.h
 
 # Shared CUDA backend flags
 CUDA_CXXFLAGS = -std=c++17 -O3 -march=native -flto=auto -Wno-deprecated-declarations -I$(CUDA_HOME)/include -Ithird_party -Isrc
-CUDA_LDFLAGS  = -flto=auto -L$(CUDA_HOME)/lib64 -lcudart -lpthread
+CUDA_LDFLAGS  = -flto=auto -L$(CUDA_HOME)/lib64 -lcudart -lpthread -ldl
 CUTLASS_INC   = -Ithird_party/cutlass/include -Ithird_party/cutlass/tools/util/include
 
 # Friendly error when the CUTLASS submodule hasn't been initialized
@@ -188,4 +188,32 @@ clean:
 	rm -f paraketto.cuda paraketto.cublas
 	rm -f bench_ff2 bench_gemm bench_splitk bench_tiles
 	rm -f src/*.o
-	rm -f scratch/test_cublas_fallback
+	rm -f scratch/test_cublas_fallback scratch/test_desktop
+	rm -f paraketto-desktop
+
+# Optional native Linux app. The inference builds do not need these libraries.
+DESKTOP_PKGS = gtk+-3.0 gio-unix-2.0 ibus-1.0 gstreamer-app-1.0 json-glib-1.0 x11
+DESKTOP_SOURCES = src/desktop/app.cpp src/desktop/audio.cpp src/desktop/backend.cpp src/desktop/history.cpp src/desktop/input.cpp
+DESKTOP_HEADERS = $(wildcard src/desktop/*.h) src/wav.h
+
+.PHONY: desktop
+desktop: paraketto.cuda paraketto-desktop
+
+paraketto-desktop: $(DESKTOP_SOURCES) $(DESKTOP_HEADERS)
+	pkg-config --exists $(DESKTOP_PKGS)
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -Wno-deprecated-declarations -Ithird_party -Isrc \
+		$(DESKTOP_SOURCES) $$(pkg-config --cflags --libs $(DESKTOP_PKGS)) -lxdo -pthread -o $@
+
+.PHONY: test-desktop
+test-desktop: scratch/test_desktop
+	sh tests/run_desktop_tests.sh
+
+.PHONY: test-desktop-lifecycle
+test-desktop-lifecycle: paraketto-desktop
+	sh tests/run_desktop_tests.sh uv run --no-project python tests/test_desktop_lifecycle.py
+
+scratch/test_desktop: tests/test_desktop.cpp $(filter-out src/desktop/app.cpp,$(DESKTOP_SOURCES)) $(DESKTOP_HEADERS)
+	mkdir -p scratch
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -Wno-deprecated-declarations -Ithird_party -Isrc \
+		$< $(filter-out src/desktop/app.cpp,$(DESKTOP_SOURCES)) \
+		$$(pkg-config --cflags --libs $(DESKTOP_PKGS)) -lxdo -pthread -o $@

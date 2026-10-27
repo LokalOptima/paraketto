@@ -20,6 +20,7 @@
 #include <cuda_fp16.h>
 #include "paraketto.h"
 #include "server.h"
+#include "gpu_status.h"
 
 #ifdef WITH_CORRECTOR
 #include "corrector.h"
@@ -242,10 +243,12 @@ int main(int argc, char** argv) {
 #endif
         info += "}";
 
+        GpuStatus gpu_status;
+        auto live_status = [&gpu_status] { return gpu_status.json(); };
 #ifdef WITH_CORRECTOR
-        run_server(pipeline, enable_correct ? &corrector : nullptr, info, server_host, server_port);
+        run_server(pipeline, enable_correct ? &corrector : nullptr, info, server_host, server_port, live_status);
 #else
-        run_server(pipeline, info, server_host, server_port);
+        run_server(pipeline, info, server_host, server_port, live_status);
 #endif
         return 0;
     }

@@ -177,6 +177,95 @@ WER uses the HF Open ASR Leaderboard normalizer with `num2words` expansion.
 
 All backends support the same server mode. Open `http://localhost:8080` in a browser for a web UI with microphone recording and file upload.
 
+Recordings and uploads stay in a stack, newest first, with playback and a copy
+button on each transcript. History lasts until you refresh or close the page.
+
+### Linux desktop dictation
+
+The optional native app manages a local Ultra FP16 server. Its window follows
+the desktop theme and text scale, with compact transcription history, playback,
+and a copy button. The server row uses bold yellow **Sleeping**, green **Ready**,
+and a pulsing bar while loading. Its padded, monospaced VRAM display shows
+**process usage / GPU capacity** in GiB, including zero usage when unloaded;
+hover over it for device-wide usage while the server is running.
+The stats pane shows total words in saved transcriptions and whole-number WPM
+(total words divided by their total recording time in minutes).
+
+Opening the app leaves the model **Sleeping**, with no model GPU allocation.
+Recording starts immediately and loads the model in the background. By default,
+the app unloads it after **5 minutes without dictation**. Preferences provides
+the idle timeout and **Keep loaded between recordings**. **Load now**, **Unload
+now**, and **Retry** are available in the server row; unloading is disabled
+during recording or transcription. Idle unloading stops the app's owned server
+process, releasing its CUDA context as well as model allocations. Its local
+HTTP port can change after loading again; standalone servers are unaffected.
+
+A failed load shows a simple red **Couldn’t load model** message in the window
+and active dictation overlay. Recording stops, any retained audio stays in
+history, and details are written to the server log. The error overlay stays
+until dismissed or another dictation is started.
+
+Build dependencies on Ubuntu/Debian (these install system packages):
+
+```bash
+sudo apt install libgtk-3-dev libibus-1.0-dev libgstreamer1.0-dev \
+  libgstreamer-plugins-base1.0-dev libjson-glib-dev libxdo-dev
+make desktop
+./paraketto-desktop --install-desktop
+./paraketto-desktop
+```
+
+`--install-desktop` adds a launcher to your user applications directory and a
+GNOME **Ctrl+Alt+Space** shortcut, preserving existing custom shortcuts. It does
+not enable autostart. Change the binding in GNOME Settings → Keyboard → Custom
+Shortcuts, or use Preferences to enable the default binding again.
+
+Focus a text field and press the shortcut to record. A floating audio-level
+indicator shows elapsed time and the destination's desktop application name
+(for example, **Ghostty**) without taking keyboard focus. Press the same
+shortcut to stop; the transcript is inserted when recognition finishes. The
+indicator's round × button beside the waveform cancels recording or pending insertion. The main window's
+Record button records directly into history.
+
+IBus support is checked for the focused input on each dictation. A temporary
+engine supplies native Unicode text delivery and then restores the previous
+engine. Applications without a confirmed IBus input use X11 clipboard/paste;
+that fallback leaves the transcript on the clipboard. A changed destination
+retains the result in history for manual copying. Native delivery tracks field
+focus; the X11 fallback can only track the application window. Initial desktop
+support targets GNOME on X11; Wayland integration is not yet validated.
+
+History and WAV recordings persist in `~/.local/share/paraketto/history/`
+(`$XDG_DATA_HOME/paraketto/history/` when set). Use a recording's trash button to delete both.
+Memory preferences persist in `~/.local/share/paraketto/preferences.ini`.
+The server log is `~/.local/share/paraketto/server.log`. Closing the window
+keeps dictation available; choose **Quit Paraketto** from the menu, or run
+`./paraketto-desktop --quit`, to stop the app and its server.
+
+Weights default to `paraketto-ultra-fp16.bin` beside the executable, then
+`~/.cache/paraketto/paraketto-ultra-fp16.bin`. Override with `--weights FILE`;
+`--server-binary FILE` and `--data-dir DIRECTORY` are also available when starting
+the app. The menu can import existing mono 16/24 kHz WAV recordings.
+
+The app reuses GTK, GStreamer, IBus, libxdo, and the existing cpp-httplib server.
+[Speech Note](https://github.com/mkiol/dsnote), with its maintained stable 4.x
+releases, was the main desktop-integration reference; its
+[active-window implementation](https://github.com/mkiol/dsnote/blob/main/src/fake_keyboard.cpp)
+uses native X11 input and clipboard fallbacks. We also reviewed
+[Nerd Dictation](https://github.com/ideasman42/nerd-dictation)'s recording/input
+separation. The desktop code lives in `src/desktop/`; no Python is needed at
+runtime. CMake users can opt in with `-DPARAKETTO_BUILD_DESKTOP=ON`.
+
+`make test-desktop` checks recording, persistent history, native IBus delivery,
+focus changes, and owned-server cleanup in a private X11/D-Bus session. It also
+requires the `xvfb` package. The test session does not change the active desktop's
+input engine or keyboard shortcuts.
+
+`make test-desktop-lifecycle` additionally checks loading on demand, automatic
+and manual unloading, protection during active work, persisted preferences, and
+load-failure reporting. It uses `uv` and a Python HTTP fixture in the same
+private session; it does not load a GPU model.
+
 ### LLM text correction (optional)
 
 Build with `WITH_CORRECTOR=1` to enable post-transcription text correction via an embedded LLM (OLMoE-1B-7B). Removes filler words, fixes capitalization/punctuation.
@@ -198,15 +287,21 @@ The Makefile is the canonical build for the standalone binaries. A separate CMak
 - `GET /` — web UI (microphone recording + file upload; shows the running model/backend)
 - `GET /health` — returns `{"status":"ok"}`
 - `GET /info` — model version, backend (CUTLASS FP16/cuBLAS FP16), weights path, device, startup timing
+- `GET /status` — readiness, server PID, live server-process and device-wide VRAM (NVML; unavailable values are omitted or `null`)
 - `POST /transcribe` — multipart `file` upload, returns `{"text":"...","audio_duration_s":...,"inference_time_s":...}`
 - `POST /shutdown` — gracefully stops the server
 
 ```bash
 curl localhost:8080/health
 curl localhost:8080/info
+curl localhost:8080/status
 curl -F file=@audio.wav localhost:8080/transcribe
 curl -X POST localhost:8080/shutdown
 ```
+
+For managed clients, `--server 127.0.0.1:0` binds an available loopback port and
+prints a JSON announcement to stdout: `{"event":"ready","port":…,"pid":…}`.
+Clients should then check `/status`. Request logs remain on stderr.
 
 ## Benchmarks
 

@@ -24,6 +24,7 @@ find_package(CUDAToolkit REQUIRED)
 
 option(PARAKETTO_USE_CUBLAS "Use cuBLAS instead of CUTLASS for FP16" OFF)
 option(PARAKETTO_BUILD_LIB_ONLY "Only build the library, skip the executable" OFF)
+option(PARAKETTO_BUILD_DESKTOP "Build the optional native Linux dictation app" OFF)
 
 # --- Library sources ---
 set(LIB_SOURCES
@@ -67,11 +68,22 @@ endif()
 # --- Executable (optional) ---
 if(NOT PARAKETTO_BUILD_LIB_ONLY)
     add_executable(paraketto src/paraketto_cuda.cpp)
-    target_link_libraries(paraketto paraketto_lib)
+    target_link_libraries(paraketto paraketto_lib ${CMAKE_DL_LIBS})
     target_compile_definitions(paraketto PRIVATE
         BACKEND_NAME="${PARAKETTO_BACKEND_NAME}"
     )
     target_include_directories(paraketto PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party
     )
+endif()
+
+if(PARAKETTO_BUILD_DESKTOP)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(DESKTOP REQUIRED IMPORTED_TARGET gtk+-3.0 gio-unix-2.0 ibus-1.0 gstreamer-app-1.0 json-glib-1.0 x11)
+    find_library(XDO_LIBRARY xdo REQUIRED)
+    add_executable(paraketto-desktop
+        src/desktop/app.cpp src/desktop/audio.cpp src/desktop/backend.cpp
+        src/desktop/history.cpp src/desktop/input.cpp)
+    target_include_directories(paraketto-desktop PRIVATE src third_party)
+    target_link_libraries(paraketto-desktop PRIVATE PkgConfig::DESKTOP ${XDO_LIBRARY} pthread)
 endif()
