@@ -63,6 +63,15 @@ std::string duration(double seconds) {
     int s = std::max(0, static_cast<int>(seconds));
     return take_string(g_strdup_printf("%02d:%02d", s / 60, s % 60));
 }
+float waveform_level(float rms, float previous, double elapsed) {
+    // Display-only scale: quiet below -50 dBFS, full height at -10 dBFS.
+    // Keep headroom for loud speech without hiding quieter syllables.
+    double db = 20.0 * std::log10(std::max(rms, 1e-6f));
+    double target = std::clamp((db + 50.0) / 40.0, 0.0, 1.0);
+    // Respond quickly to speech and let each bar fall gently between syllables.
+    double time_constant = target > previous ? 0.030 : 0.160;
+    return previous + (target - previous) * (1.0 - std::exp(-elapsed / time_constant));
+}
 std::string executable_path() { return take_string(g_file_read_link("/proc/self/exe", nullptr)); }
 
 void install_launcher() {
@@ -164,6 +173,7 @@ public:
         mode_ = Mode::Recording;
         overlay_until_ = 0;
         bars_.fill(0);
+        waveform_time_ = g_get_monotonic_time();
         gtk_style_context_remove_class(gtk_widget_get_style_context(overlay_title_), "failure");
         set_label(overlay_title_, duration(0) + "  ·  " + input_->destination());
         gtk_widget_set_tooltip_text(overlay_cancel_, "Cancel recording");
@@ -228,7 +238,7 @@ private:
     std::string shortcut_text_;
     std::optional<Result> pending_result_;
     std::string pending_wav_;
-    gint64 delivery_time_ = 0, overlay_until_ = 0, idle_since_ = 0;
+    gint64 delivery_time_ = 0, overlay_until_ = 0, idle_since_ = 0, waveform_time_ = 0;
     double total_vram_mb_ = -1;
     bool cancelled_delivery_ = false;
 
@@ -659,8 +669,10 @@ private:
         gtk_widget_set_sensitive(record_button_, mode_ == Mode::Recording || mode_ == Mode::Idle);
         if (mode_ == Mode::Recording) {
             input_->poll();
+            float level = waveform_level(recorder_.rms(), bars_.back(), (now - waveform_time_) / 1000000.0);
+            waveform_time_ = now;
             std::move(bars_.begin() + 1, bars_.end(), bars_.begin());
-            bars_.back() = recorder_.level();
+            bars_.back() = level;
             gtk_widget_queue_draw(wave_);
             set_label(overlay_title_, duration(recorder_.seconds()) + "  ·  " + input_->destination());
             auto error = recorder_.error();

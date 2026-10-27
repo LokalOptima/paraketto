@@ -2526,3 +2526,16 @@ lifecycle checks pass. The history check covers duration-weighted WPM,
 contractions, failed results, and missing durations. Screenshots at 125% text
 scaling verify sleeping, loading, and ready states, including stable VRAM and
 control positions across state changes.
+
+### Recording waveform sensitivity
+
+Replaced the recording indicator's fixed linear gain with a logarithmic display
+scale from -50 to -10 dBFS, with a noise floor and 30 ms attack / 160 ms release
+smoothing. Quiet speech now produces visible bars, while louder speech retains
+more variation. The recorder reports raw RMS amplitude and the UI applies the
+display mapping; microphone gain, saved audio, and transcription are unchanged.
+
+Validation: the desktop build and three integration checks pass. An isolated
+overlay preview with quiet-to-loud synthetic audio shows distinct rises and
+falls; the same check preserves Unicode insertion into Ghostty/tmux and keeps
+the overlay mapped while stopping the recording.

@@ -25,7 +25,7 @@ bool Recorder::start(const std::string& source, std::string& error) {
     stop();
     samples_.clear();
     sample_count_ = 0;
-    level_ = 0;
+    rms_ = 0;
     GError* e = nullptr;
     const auto description = source + " ! audioconvert ! audioresample ! "
         "audio/x-raw,format=S16LE,channels=1,rate=16000 ! "
@@ -67,7 +67,7 @@ GstFlowReturn Recorder::sample(GstAppSink* sink, gpointer data) {
             sum += normalized * normalized;
         }
         self.sample_count_ = self.samples_.size();
-        self.level_ = count ? std::min(1.0, std::sqrt(sum / count) * 7.0) : 0;
+        self.rms_ = count ? std::sqrt(sum / count) : 0;
         gst_buffer_unmap(buffer, &map);
     }
     gst_sample_unref(sample);
@@ -94,7 +94,7 @@ std::string Recorder::stop() {
         gst_object_unref(pipeline_);
         pipeline_ = nullptr;
     }
-    level_ = 0;
+    rms_ = 0;
     std::lock_guard<std::mutex> lock(mutex_);
     auto wav = samples_.empty() ? std::string() : pcm_wav(samples_);
     samples_.clear();

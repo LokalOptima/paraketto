@@ -17,7 +17,7 @@ public:
     std::string stop();
     std::string error();
     double seconds() const { return sample_count_.load() / 16000.0; }
-    float level() const { return level_.load(); }
+    float rms() const { return rms_.load(); } // Linear amplitude relative to full scale.
     bool full() const { return sample_count_.load() >= max_samples; }
     static constexpr size_t max_samples = 16000 * 60 * 30;
 private:
@@ -25,7 +25,7 @@ private:
     std::mutex mutex_;
     std::vector<int16_t> samples_;
     std::atomic<size_t> sample_count_{0};
-    std::atomic<float> level_{0};
+    std::atomic<float> rms_{0};
     static GstFlowReturn sample(GstAppSink*, gpointer);
 };
 

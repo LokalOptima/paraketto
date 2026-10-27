@@ -28,7 +28,7 @@ static void recorder_history() {
     std::string error;
     g_assert_true(recorder.start("audiotestsrc is-live=true wave=sine volume=0.3", error));
     g_assert_true(until([&] { return recorder.seconds() >= 0.25; }));
-    g_assert_cmpfloat(recorder.level(), >, 0.1);
+    g_assert_cmpfloat(recorder.rms(), >, 0.1);
     std::string wav = recorder.stop();
     auto decoded = paraketto::read_wav_from_memory(wav.data(), wav.size());
     g_assert_cmpint(decoded.sample_rate, ==, 16000);
