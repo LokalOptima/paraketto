@@ -398,11 +398,11 @@ private:
         gtk_widget_set_tooltip_text(loading_, "Loading model");
         atk_object_set_name(gtk_widget_get_accessible(loading_), "Loading model");
         gtk_stack_add_named(GTK_STACK(status_stack_), loading_, "loading");
-        pack(server, status_stack_, true);
+        pack(server, status_stack_);
         vram_ = label("", "vram");
         gtk_label_set_width_chars(GTK_LABEL(vram_), 19);
-        gtk_label_set_xalign(GTK_LABEL(vram_), 1);
-        pack(server, vram_);
+        gtk_label_set_xalign(GTK_LABEL(vram_), 0);
+        pack(server, vram_, true);
         // Homogeneous stacks reserve the same space for every state and action.
         server_actions_ = gtk_stack_new();
         gtk_widget_set_valign(server_actions_, GTK_ALIGN_CENTER);
