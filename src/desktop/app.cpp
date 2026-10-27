@@ -1,9 +1,10 @@
 #include "audio.h"
 #include "backend.h"
-#include "common.h"
+#include "app_common.h"
 #include "history.h"
 #include "input.h"
-#include "settings.h"
+#include "model_settings.h"
+#include "service/api.h"
 #include "wav.h"
 #include <gtk/gtk.h>
 #include <gdk/gdkx.h>
@@ -15,6 +16,7 @@
 #include <signal.h>
 
 namespace desktop {
+using namespace paraketto::app;
 namespace {
 const char* css = R"css(
 .heading { font-weight: 600; }
@@ -90,7 +92,7 @@ void install_launcher() {
 }
 
 struct Options {
-    std::string binary, weights, data, audio_source = "pulsesrc";
+    std::string service_url, data, audio_source = "pulsesrc";
 };
 
 std::string option_string(GVariantDict* dict, const char* name) {
@@ -106,23 +108,12 @@ std::string option_string(GVariantDict* dict, const char* name) {
 Options options_from(GVariantDict* dict) {
     Options result;
     auto option = [&](const char* name) { return option_string(dict, name); };
-    auto base = take_string(g_path_get_dirname(executable_path().c_str()));
-    result.binary = option("server-binary");
-    if (result.binary.empty()) result.binary = base + "/paraketto.cuda";
-    if (!g_file_test(result.binary.c_str(), G_FILE_TEST_IS_EXECUTABLE) && option("server-binary").empty())
-        result.binary = base + "/paraketto";
-    result.weights = option("weights");
-    if (result.weights.empty()) {
-        const auto local = base + "/paraketto-ultra-fp16.bin";
-        result.weights = g_file_test(local.c_str(), G_FILE_TEST_IS_REGULAR) ? local :
-            std::string(g_get_user_cache_dir()) + "/paraketto/paraketto-ultra-fp16.bin";
-    }
+    result.service_url = option("service-url");
+    if (result.service_url.empty()) result.service_url = paraketto::service::default_url;
     result.data = option("data-dir");
     if (result.data.empty()) result.data = std::string(g_get_user_data_dir()) + "/paraketto";
     auto source = option("audio-source");
     if (!source.empty()) result.audio_source = source;
-    result.binary = take_string(g_canonicalize_filename(result.binary.c_str(), nullptr));
-    result.weights = take_string(g_canonicalize_filename(result.weights.c_str(), nullptr));
     result.data = take_string(g_canonicalize_filename(result.data.c_str(), nullptr));
     return result;
 }
@@ -140,11 +131,9 @@ public:
         g_object_unref(provider);
         input_ = std::make_unique<TextInput>();
         shortcut_text_ = shortcut_label();
-        total_vram_mb_ = query_gpu_total_mb();
+        backend_ = std::make_unique<Backend>(options_.service_url);
         build_window();
         build_overlay();
-        try { settings_.load(options_.data + "/preferences.ini"); }
-        catch (const std::exception& error) { message("Could not read preferences: " + std::string(error.what())); }
         timer_ = g_timeout_add(40, [](gpointer p) -> gboolean { static_cast<App*>(p)->tick(); return G_SOURCE_CONTINUE; }, this);
         g_application_hold(G_APPLICATION(application_));
     }
@@ -162,12 +151,13 @@ public:
     void toggle(bool insert = true) {
         if (mode_ == Mode::Recording) { stop_recording(); return; }
         if (mode_ != Mode::Idle) return;
-        ensure_server();
+        prepare_model();
         player_.stop();
         playing_id_.clear();
         input_->begin(insert);
         std::string error;
         if (!recorder_.start(options_.audio_source, error)) {
+            backend_->hold_recording(false);
             input_->end(); overlay_error(error); return;
         }
         mode_ = Mode::Recording;
@@ -189,6 +179,7 @@ public:
             recorder_.stop(); input_->end(); reset_recording_button();
             gtk_widget_hide(overlay_);
             mode_ = Mode::Idle;
+            backend_->hold_recording(false);
         } else if (mode_ == Mode::Transcribing || mode_ == Mode::Delivering) {
             // Finish recognition into history, but cancel delivery to the target.
             cancelled_delivery_ = true;
@@ -205,10 +196,10 @@ public:
             std::vector<int16_t> samples;
             samples.reserve(wav.samples.size());
             for (float value : wav.samples) samples.push_back(static_cast<int16_t>(std::clamp(value, -1.0f, 1.0f) * 32767));
-            ensure_server();
+            prepare_model();
             input_->begin(false);
             submit(pcm_wav(samples));
-        } catch (const std::exception& e) { message(e.what()); }
+        } catch (const std::exception& e) { backend_->hold_recording(false); message(e.what()); }
     }
     void configure_shortcut() {
         std::string error;
@@ -237,8 +228,7 @@ private:
     std::string active_id_, playing_id_;
     std::string shortcut_text_;
     std::optional<Result> pending_result_;
-    std::string pending_wav_;
-    gint64 delivery_time_ = 0, overlay_until_ = 0, idle_since_ = 0, waveform_time_ = 0;
+    gint64 delivery_time_ = 0, overlay_until_ = 0, waveform_time_ = 0;
     double total_vram_mb_ = -1;
     bool cancelled_delivery_ = false;
 
@@ -261,33 +251,22 @@ private:
         if (!gtk_widget_get_visible(overlay_)) { place_overlay(); gtk_widget_show_all(overlay_); }
     }
     ServerState server_state() {
-        if (backend_) return backend_->state();
-        ServerState state;
-        state.starting = false;
-        state.message = "Sleeping";
-        state.server_vram_mb = 0;
-        return state;
+        return backend_->state();
     }
-    void ensure_server() {
-        auto state = server_state();
-        if (state.ready || state.starting) return;
-        backend_.reset();
-        backend_ = std::make_unique<Backend>(options_.binary, options_.weights, options_.data + "/server.log");
-        idle_since_ = 0;
+    void prepare_model() {
+        backend_->hold_recording(true);
     }
     void server_action() {
         if (mode_ != Mode::Idle) return;
         auto state = server_state();
-        if (state.ready || state.starting) { backend_.reset(); idle_since_ = 0; }
-        else ensure_server();
+        if (state.ready || state.starting) backend_->unload();
+        else backend_->load();
     }
     void save_preferences() {
-        idle_since_ = g_get_monotonic_time();
-        try { settings_.save(options_.data + "/preferences.ini"); }
-        catch (const std::exception& error) { message("Could not save preferences: " + std::string(error.what())); }
+        backend_->settings(settings_);
     }
     void open_server_log() {
-        auto path = options_.data + "/server.log";
+        auto path = server_state().log_path;
         if (!g_file_test(path.c_str(), G_FILE_TEST_IS_REGULAR)) { message("The server has not started yet."); return; }
         auto uri = take_string(g_filename_to_uri(path.c_str(), nullptr, nullptr));
         GError* error = nullptr;
@@ -418,6 +397,7 @@ private:
 
     void show_preferences() {
         if (preferences_) { gtk_window_present(GTK_WINDOW(preferences_)); return; }
+        settings_ = server_state().settings;
         preferences_ = gtk_dialog_new_with_buttons("Preferences", GTK_WINDOW(window_),
             static_cast<GtkDialogFlags>(GTK_DIALOG_DESTROY_WITH_PARENT | GTK_DIALOG_USE_HEADER_BAR), nullptr, nullptr);
         gtk_window_set_default_size(GTK_WINDOW(preferences_), 500, -1);
@@ -482,10 +462,13 @@ private:
         pack(body, hint);
         pack(body, gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
         pack(body, label("Model", "heading"));
-        auto* weights = label(take_string(g_path_get_basename(options_.weights.c_str())), "secondary");
+        auto model_path = server_state().weights;
+        auto* weights = label(model_path.empty() ? "Service unavailable" : take_string(g_path_get_basename(model_path.c_str())), "secondary");
         gtk_label_set_ellipsize(GTK_LABEL(weights), PANGO_ELLIPSIZE_MIDDLE);
-        gtk_widget_set_tooltip_text(weights, options_.weights.c_str());
+        gtk_widget_set_tooltip_text(weights, model_path.c_str());
         pack(body, weights);
+        pack(body, label("Service", "heading"));
+        pack(body, label(options_.service_url, "secondary"));
         gtk_widget_show_all(preferences_);
     }
     void build_overlay() {
@@ -568,23 +551,28 @@ private:
         gtk_style_context_remove_class(style, "destructive-action");
         gtk_style_context_add_class(style, "suggested-action");
     }
-    void stop_recording() {
+    void stop_recording(const std::string& error = {}) {
         auto wav = recorder_.stop();
         reset_recording_button();
         if (wav.size() < 44 + 3200) {
+            backend_->hold_recording(false);
             mode_ = Mode::Idle; input_->end(); overlay_error("Recording was too short"); return;
         }
-        submit(std::move(wav));
+        submit(std::move(wav), error);
     }
-    void submit(std::string wav) {
+    void submit(std::string wav, const std::string& load_error = {}) {
         try {
-            if (!backend_) ensure_server();
             Entry e = history_.create(wav, input_->destination());
             active_id_ = e.id;
             entries_.insert(entries_.begin(), std::move(e));
             cancelled_delivery_ = false;
             mode_ = Mode::Transcribing;
-            pending_wav_ = std::move(wav);
+            if (!load_error.empty()) {
+                Result result; result.id = active_id_; result.error = load_error;
+                finish_result(std::move(result), false);
+                return;
+            }
+            if (!backend_->transcribe(active_id_, std::move(wav))) throw std::runtime_error("Transcription is already in progress");
             gtk_style_context_remove_class(gtk_widget_get_style_context(overlay_title_), "failure");
             set_label(overlay_title_, (server_state().ready ? "Transcribing… · " : "Loading model… · ") + input_->destination());
             gtk_widget_set_tooltip_text(overlay_cancel_, "Cancel insertion");
@@ -595,7 +583,8 @@ private:
         } catch (const std::exception& error) {
             if (auto* e = entry(active_id_)) { e->error = error.what(); e->delivery = "Not transcribed"; save(*e); }
             gtk_widget_hide(overlay_);
-            mode_ = Mode::Idle; input_->end(); message(error.what()); render_history();
+            mode_ = Mode::Idle; active_id_.clear(); backend_->hold_recording(false);
+            input_->end(); message(error.what()); render_history();
         }
     }
     void finish_result(Result result, bool allow_delivery) {
@@ -616,6 +605,7 @@ private:
             gtk_widget_set_tooltip_text(overlay_cancel_, "Dismiss");
         }
         mode_ = Mode::Idle;
+        backend_->hold_recording(false);
         active_id_.clear();
         overlay_until_ = failed ? 0 : g_get_monotonic_time() + 1500000;
         if (failed) { bars_.fill(0); gtk_widget_queue_draw(wave_); }
@@ -624,34 +614,36 @@ private:
     void tick() {
         auto state = server_state();
         auto now = g_get_monotonic_time();
-        if (mode_ != Mode::Idle || state.starting) idle_since_ = 0;
-        else if (backend_) {
-            if (!idle_since_) idle_since_ = now;
-            if (!settings_.keep_loaded && now - idle_since_ >= static_cast<gint64>(settings_.idle_seconds) * G_USEC_PER_SEC) {
-                backend_.reset(); idle_since_ = 0; state = server_state();
-            }
-        }
+        if (!preferences_ && state.connected) settings_ = state.settings;
+        auto action_error = backend_->action_error();
+        if (!action_error.empty()) message(action_error);
         bool transcribing = mode_ == Mode::Transcribing || mode_ == Mode::Delivering;
-        bool failed = backend_ && !state.ready && !state.starting;
-        set_label(status_, !backend_ ? "Sleeping" : state.starting ? "Loading model…" :
-            failed ? (state.load_failed ? "Couldn’t load model" : "Server unavailable") : transcribing ? "Transcribing…" : "Ready");
+        bool failed = state.status == "offline" || state.status == "error";
+        bool sleeping = state.status == "sleeping";
+        set_label(status_, sleeping ? "Sleeping" : state.status == "connecting" ? "Connecting…" :
+            state.status == "unloading" ? "Unloading…" : state.starting ? "Loading model…" :
+            failed ? (state.load_failed ? "Couldn’t load model" : "Service unavailable") :
+            transcribing || state.status == "busy" ? "Transcribing…" : "Ready");
         auto* status_style = gtk_widget_get_style_context(status_);
-        set_class(status_style, "state-sleeping", !backend_);
+        set_class(status_style, "state-sleeping", sleeping);
         set_class(status_style, "state-ready", state.ready);
         if (failed) gtk_style_context_add_class(status_style, "failure");
         else gtk_style_context_remove_class(status_style, "failure");
         gtk_stack_set_visible_child_name(GTK_STACK(status_stack_), state.starting ? "loading" : "state");
         if (state.starting) gtk_progress_bar_pulse(GTK_PROGRESS_BAR(loading_));
         std::string detail;
-        if (!backend_) detail = "Loads when you start recording";
+        if (sleeping) detail = "Loads when you start recording";
+        else if (state.status == "offline") detail = "Start the Paraketto service to transcribe";
+        else if (state.status == "connecting") detail = "Connecting to the transcription service";
+        else if (state.status == "unloading") detail = "Releasing GPU memory";
         else if (state.starting) detail = "Recording can start immediately";
         else if (!state.ready) detail = "Retry, or view the server log for details";
-        else if (mode_ != Mode::Idle) detail = "Model in use";
-        else if (settings_.keep_loaded) detail = "Automatic unloading disabled";
-        else detail = "Unloads in " + duration(std::ceil(settings_.idle_seconds - (now - idle_since_) / 1000000.0));
+        else if (mode_ != Mode::Idle || state.busy) detail = "Model in use";
+        else if (state.settings.keep_loaded) detail = "Automatic unloading disabled";
+        else detail = "Unloads in " + duration(std::ceil(state.idle_remaining));
         set_label(server_detail_, detail);
         gtk_widget_set_tooltip_text(server_detail_, detail.c_str());
-        std::string model = state.model.empty() ? take_string(g_path_get_basename(options_.weights.c_str())) : state.model;
+        std::string model = state.model.empty() ? state.weights : state.model;
         if (!state.device.empty()) model += "\n" + state.device;
         gtk_widget_set_tooltip_text(status_, model.c_str());
         if (state.total_vram_mb > 0) total_vram_mb_ = state.total_vram_mb;
@@ -659,13 +651,13 @@ private:
             return mb >= 0 ? take_string(g_strdup_printf("%6.2f", mb / 1024)) : std::string("    --");
         };
         set_label(vram_, memory_field(state.server_vram_mb) + " / " + memory_field(total_vram_mb_) + " GiB");
-        std::string memory = !backend_ ? "The model is unloaded" : state.used_vram_mb >= 0 ? take_string(g_strdup_printf(
+        std::string memory = sleeping ? "The model is unloaded" : state.used_vram_mb >= 0 ? take_string(g_strdup_printf(
             "Model process memory. Entire GPU: %.2f / %.2f GiB used.", state.used_vram_mb / 1024, state.total_vram_mb / 1024)) : "Model VRAM usage is unavailable";
         gtk_widget_set_tooltip_text(vram_, memory.c_str());
         gtk_stack_set_visible_child_name(GTK_STACK(server_actions_),
-            !backend_ ? "Load now" : state.starting ? "Cancel" : state.ready ? "Unload now" : "Retry");
+            sleeping ? "Load now" : state.starting ? "Cancel" : state.ready ? "Unload now" : "Retry");
         auto* model_action = g_action_map_lookup_action(G_ACTION_MAP(application_), "model");
-        g_simple_action_set_enabled(G_SIMPLE_ACTION(model_action), mode_ == Mode::Idle);
+        g_simple_action_set_enabled(G_SIMPLE_ACTION(model_action), mode_ == Mode::Idle && state.connected && !state.busy && state.status != "unloading");
         gtk_widget_set_sensitive(record_button_, mode_ == Mode::Recording || mode_ == Mode::Idle);
         if (mode_ == Mode::Recording) {
             input_->poll();
@@ -677,7 +669,7 @@ private:
             set_label(overlay_title_, duration(recorder_.seconds()) + "  ·  " + input_->destination());
             auto error = recorder_.error();
             if (failed) {
-                stop_recording();
+                stop_recording(state.load_failed ? "Couldn’t load model" : "Service unavailable");
                 if (mode_ == Mode::Idle) {
                     overlay_error(state.load_failed ? "Couldn’t load model" : "Server unavailable");
                 }
@@ -685,17 +677,8 @@ private:
             else if (recorder_.full()) stop_recording();
         }
         if (mode_ == Mode::Transcribing || mode_ == Mode::Delivering) input_->poll();
-        if (!pending_wav_.empty() && state.ready) {
-            if (backend_->transcribe(active_id_, std::move(pending_wav_))) {
-                pending_wav_.clear();
-                set_label(overlay_title_, "Transcribing… · " + input_->destination());
-            }
-        } else if (!pending_wav_.empty() && !state.starting) {
-            pending_wav_.clear();
-            Result result; result.id = active_id_;
-            result.error = state.load_failed ? "Couldn’t load model" : "Server unavailable";
-            finish_result(std::move(result), false);
-        }
+        if (mode_ == Mode::Transcribing && state.ready)
+            set_label(overlay_title_, "Transcribing… · " + input_->destination());
         if (backend_) {
             if (auto result = backend_->result()) {
                 pending_result_ = std::move(result);
@@ -834,12 +817,11 @@ int main(int argc, char** argv) {
     const GOptionEntry options[] = {
         {"toggle", 0, 0, G_OPTION_ARG_NONE, nullptr, "Start or stop dictation in the focused application", nullptr},
         {"cancel", 0, 0, G_OPTION_ARG_NONE, nullptr, "Cancel recording or pending insertion", nullptr},
-        {"quit", 0, 0, G_OPTION_ARG_NONE, nullptr, "Quit the app and its server", nullptr},
+        {"quit", 0, 0, G_OPTION_ARG_NONE, nullptr, "Quit the app (service stays available)", nullptr},
         {"install-shortcut", 0, 0, G_OPTION_ARG_NONE, nullptr, "Enable the GNOME Ctrl+Alt+Space shortcut", nullptr},
         {"install-desktop", 0, 0, G_OPTION_ARG_NONE, nullptr, "Add a user application launcher and the dictation shortcut", nullptr},
-        {"weights", 0, 0, G_OPTION_ARG_FILENAME, nullptr, "FP16 weights (default: Ultra)", "FILE"},
-        {"server-binary", 0, 0, G_OPTION_ARG_FILENAME, nullptr, "Paraketto server executable", "FILE"},
-        {"data-dir", 0, 0, G_OPTION_ARG_FILENAME, nullptr, "History and log directory", "DIRECTORY"},
+        {"service-url", 0, 0, G_OPTION_ARG_STRING, nullptr, "Paraketto API (default: http://127.0.0.1:8080)", "URL"},
+        {"data-dir", 0, 0, G_OPTION_ARG_FILENAME, nullptr, "History directory", "DIRECTORY"},
         {"audio-source", 0, 0, G_OPTION_ARG_STRING, nullptr, "GStreamer microphone source (default: pulsesrc)", "SOURCE"},
         {"transcribe", 0, 0, G_OPTION_ARG_FILENAME, nullptr, "Transcribe a WAV into history", "FILE"},
         {nullptr, 0, 0, G_OPTION_ARG_NONE, nullptr, nullptr, nullptr}

@@ -126,7 +126,7 @@ weights-export: scripts/export_weights.py
 src/kernels.o: src/kernels.cu src/kernels.h src/common.h
 	$(NVCC) $(NVFLAGS) -arch=$(ARCH) -c $< -o $@
 
-SHARED_HEADERS = src/paraketto.h src/common.h src/wav.h src/mel.h src/vocab.h src/server.h src/gpu_status.h
+SHARED_HEADERS = src/paraketto.h src/common.h src/wav.h src/mel.h src/vocab.h src/server.h src/web_ui.h src/gpu_status.h
 
 # Shared CUDA backend flags
 CUDA_CXXFLAGS = -std=c++17 -O3 -march=native -flto=auto -Wno-deprecated-declarations -I$(CUDA_HOME)/include -Ithird_party -Isrc
@@ -189,15 +189,27 @@ clean:
 	rm -f bench_ff2 bench_gemm bench_splitk bench_tiles
 	rm -f src/*.o
 	rm -f scratch/test_cublas_fallback scratch/test_desktop
-	rm -f paraketto-desktop
+	rm -f paraketto-desktop paraketto-service
 
 # Optional native Linux app. The inference builds do not need these libraries.
 DESKTOP_PKGS = gtk+-3.0 gio-unix-2.0 ibus-1.0 gstreamer-app-1.0 json-glib-1.0 x11
 DESKTOP_SOURCES = src/desktop/app.cpp src/desktop/audio.cpp src/desktop/backend.cpp src/desktop/history.cpp src/desktop/input.cpp
-DESKTOP_HEADERS = $(wildcard src/desktop/*.h) src/wav.h
+APP_HEADERS = src/app_common.h src/model_settings.h src/service/api.h
+DESKTOP_HEADERS = $(wildcard src/desktop/*.h) $(APP_HEADERS) src/wav.h
+SERVICE_SOURCES = src/service/main.cpp src/service/worker.cpp
+SERVICE_PKGS = gio-unix-2.0 json-glib-1.0
+
+paraketto-service: $(SERVICE_SOURCES) src/service/worker.h $(APP_HEADERS) src/web_ui.h
+	pkg-config --exists $(SERVICE_PKGS)
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -Ithird_party -Isrc \
+		$(SERVICE_SOURCES) $$(pkg-config --cflags --libs $(SERVICE_PKGS)) -pthread -o $@
 
 .PHONY: desktop
-desktop: paraketto.cuda paraketto-desktop
+desktop: paraketto.cuda paraketto-service paraketto-desktop
+
+.PHONY: install-service
+install-service: paraketto-service
+	uv run --no-project python scripts/install_service.py
 
 paraketto-desktop: $(DESKTOP_SOURCES) $(DESKTOP_HEADERS)
 	pkg-config --exists $(DESKTOP_PKGS)
@@ -209,11 +221,15 @@ test-desktop: scratch/test_desktop
 	sh tests/run_desktop_tests.sh
 
 .PHONY: test-desktop-lifecycle
-test-desktop-lifecycle: paraketto-desktop
+test-desktop-lifecycle: paraketto-desktop paraketto-service
 	sh tests/run_desktop_tests.sh uv run --no-project python tests/test_desktop_lifecycle.py
 
-scratch/test_desktop: tests/test_desktop.cpp $(filter-out src/desktop/app.cpp,$(DESKTOP_SOURCES)) $(DESKTOP_HEADERS)
+.PHONY: test-service
+test-service: paraketto-service
+	uv run --no-project python tests/test_service.py
+
+scratch/test_desktop: tests/test_desktop.cpp $(filter-out src/desktop/app.cpp,$(DESKTOP_SOURCES)) src/service/worker.cpp src/service/worker.h $(DESKTOP_HEADERS)
 	mkdir -p scratch
 	$(CXX) -std=c++17 -O2 -Wall -Wextra -Wno-deprecated-declarations -Ithird_party -Isrc \
-		$< $(filter-out src/desktop/app.cpp,$(DESKTOP_SOURCES)) \
+		$< $(filter-out src/desktop/app.cpp,$(DESKTOP_SOURCES)) src/service/worker.cpp \
 		$$(pkg-config --cflags --libs $(DESKTOP_PKGS)) -lxdo -pthread -o $@

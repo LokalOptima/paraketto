@@ -1,74 +1,35 @@
-"""Exercise the real desktop process and owned-child lifecycle in a private session."""
+"""Exercise the real desktop as a client of a separately owned local service."""
+from concurrent.futures import ThreadPoolExecutor
 import json
-import os
-from pathlib import Path
-import signal
 import subprocess
-import tempfile
 import time
-import wave
+from service_test_support import Fixture, REPO, alive, wait
 
-repo = Path.cwd()
-binary = str(repo / 'paraketto-desktop')
-fixture = repo / 'tests/desktop_fixture_server.py'
-
-def wait(check, timeout=8):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        result = check()
-        if result:
-            return result
-        time.sleep(0.025)
-    raise AssertionError('Timed out waiting for desktop lifecycle transition')
-
-def alive(pid):
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-
-with tempfile.TemporaryDirectory(prefix='paraketto-lifecycle-') as tmp:
-    directory = Path(tmp)
-    weights = directory / 'weights'
-    weights.write_text('fixture')
-    audio = directory / 'sample.wav'
-    with wave.open(str(audio), 'wb') as out:
-        out.setparams((1, 2, 16000, 16000, 'NONE', 'not compressed'))
-        out.writeframes(b'\0\0' * 16000)
-    data = directory / 'data'
-    data.mkdir()
-    preferences = data / 'preferences.ini'
-    preferences.write_text('[Model]\nidle-seconds=1\nkeep-loaded=false\n')
-    env = dict(os.environ, PARAKETTO_FIXTURE_DIR=str(directory))
+binary = str(REPO / 'paraketto-desktop')
+with Fixture() as fixture:
+    fixture.start()
+    data = fixture.directory / 'client'
     app = None
-    log = (directory / 'app.log').open('w')
+    log = (fixture.directory / 'app.log').open('w')
 
     def command(*args):
-        subprocess.run([binary, *args], check=True, capture_output=True, timeout=8, env=env)
+        subprocess.run([binary, *args], check=True, capture_output=True, timeout=8, env=fixture.env)
 
     def action(name):
+        # Controls reflect the client's 250 ms status poll plus a GTK frame.
+        time.sleep(0.35)
         subprocess.run(['gdbus', 'call', '--session', '--dest', 'io.localoptima.Paraketto',
             '--object-path', '/io/localoptima/Paraketto', '--method', 'org.gtk.Actions.Activate',
-            name, '[]', '{}'], check=True, capture_output=True, timeout=5, env=env)
+            name, '[]', '{}'], check=True, capture_output=True, timeout=5, env=fixture.env)
 
-    def start(model_weights=weights):
-        process = subprocess.Popen([binary, '--server-binary', str(fixture), '--weights', str(model_weights),
-            '--data-dir', str(data), '--audio-source', 'audiotestsrc is-live=true'], env=env, stdout=log, stderr=log)
-        # A remote no-op confirms that GApplication has registered its bus name.
-        time.sleep(0.2)
-        command('--cancel')
+    def start():
+        process = subprocess.Popen([binary, '--service-url', fixture.url, '--data-dir', str(data),
+            '--audio-source', 'audiotestsrc is-live=true'], env=fixture.env, stdout=log, stderr=log)
+        wait(lambda: subprocess.run(['xdotool', 'search', '--all', '--onlyvisible', '--pid', str(process.pid),
+            '--name', '^Paraketto$'], capture_output=True).returncode == 0)
+        time.sleep(0.3)  # Let the first API poll update the desktop actions.
         assert process.poll() is None
         return process
-
-    def server(previous=0):
-        try:
-            status = json.loads((directory / 'server.json').read_text())
-            if status['pid'] == previous or not alive(status['pid']):
-                return None
-            return status['pid'] if (directory / 'client-ready').read_text() == str(status['pid']) else None
-        except (OSError, ValueError):
-            return None
 
     def entries():
         return sorted([json.loads(p.read_text()) for p in (data / 'history').glob('*.json')],
@@ -76,52 +37,71 @@ with tempfile.TemporaryDirectory(prefix='paraketto-lifecycle-') as tmp:
 
     try:
         app = start()
-        assert not (directory / 'server.json').exists(), 'Opening the app loaded the model'
-        command('--transcribe', str(audio))
-        pid = wait(server)
-        wait(lambda: (directory / 'request-started').exists())
+        assert fixture.status()['status'] == 'sleeping'
+        command('--transcribe', str(fixture.audio))
+        wait(lambda: fixture.status()['status'] == 'busy')
+        worker = fixture.status()['worker_pid']
         time.sleep(1.2)
-        action('model')  # Must be disabled while transcription is in progress.
-        assert alive(pid), 'Model was unloaded during transcription'
-        (directory / 'release-transcription').write_text('continue')
+        action('model')
+        assert alive(worker), 'Desktop interrupted active transcription'
+        (fixture.directory / 'release-transcription').write_text('continue')
         wait(lambda: entries() and entries()[0]['text'] == 'Lifecycle fixture transcript')
-        wait(lambda: not alive(pid))
-
-        action('model')
-        pid = wait(lambda: server(pid))
-        action('model')
-        wait(lambda: not alive(pid))
+        wait(lambda: fixture.status()['status'] == 'sleeping')
+        assert not alive(worker)
 
         command('--toggle')
-        pid = wait(lambda: server(pid))
-        time.sleep(1.3)
-        action('model')
-        assert alive(pid), 'Model was unloaded while recording'
+        wait(lambda: fixture.status()['status'] == 'ready')
+        worker = fixture.status()['worker_pid']
+        time.sleep(2.5)
+        assert alive(worker), 'Recording did not renew its model reservation'
         command('--cancel')
-        wait(lambda: not alive(pid))
-        command('--quit'); app.wait(timeout=5)
+        wait(lambda: fixture.status()['status'] == 'sleeping')
 
-        preferences.write_text('[Model]\nidle-seconds=1\nkeep-loaded=true\n')
+        fixture.request('/settings', 'PATCH', {'keep_loaded': True})
+        action('model')
+        wait(lambda: fixture.status()['status'] == 'ready')
+        worker = fixture.status()['worker_pid']
+        (fixture.directory / 'release-transcription').unlink()
+        with ThreadPoolExecutor(max_workers=1) as requests:
+            external = requests.submit(fixture.transcribe)
+            wait(lambda: fixture.status()['status'] == 'busy')
+            command('--quit'); app.wait(timeout=5)
+            assert fixture.process.poll() is None and alive(worker), 'Quitting the UI stopped shared inference'
+            (fixture.directory / 'release-transcription').write_text('continue')
+            assert external.result(timeout=5)[0] == 200
         app = start()
+        assert fixture.status()['worker_pid'] == worker, 'Restarting the UI loaded another model'
         action('model')
-        pid = wait(lambda: server(pid))
-        time.sleep(1.5)
-        assert alive(pid), 'Keep-loaded preference was ignored'
-        action('model')
-        wait(lambda: not alive(pid))
-        command('--quit'); app.wait(timeout=5)
+        wait(lambda: fixture.status()['status'] == 'sleeping')
 
-        app = start(directory / 'missing-weights')
-        command('--transcribe', str(audio))
+        fixture.stop()
+        time.sleep(0.5)
+        assert app.poll() is None, 'Desktop exited when the service stopped'
+        fixture.start(missing=True)
+        command('--transcribe', str(fixture.audio))
         wait(lambda: entries()[0]['error'] == 'Couldn’t load model')
-        assert 'Weights not found' in (data / 'server.log').read_text()
-        assert not alive(pid), 'Failed load left an inference process running'
+        assert 'Weights not found' in (fixture.data / 'server.log').read_text()
+        fixture.stop()
+        fixture.start()
+        previous = entries()[0]['id']
+        command('--transcribe', str(fixture.audio))
+        wait(lambda: entries()[0]['id'] != previous and entries()[0]['text'] == 'Lifecycle fixture transcript')
+        wait(lambda: fixture.status()['recording_leases'] == 0)
+        fixture.request('/model/unload', 'POST', {})
+        wait(lambda: fixture.status()['status'] == 'sleeping')
+        (fixture.directory / 'fail-load').write_text('fail during recording')
+        starts = len(list((fixture.directory / 'spawned').iterdir()))
+        previous = entries()[0]['id']
+        command('--toggle')
+        wait(lambda: entries()[0]['id'] != previous and entries()[0]['error'] == 'Couldn’t load model')
+        wait(lambda: fixture.status()['recording_leases'] == 0)
+        assert len(list((fixture.directory / 'spawned').iterdir())) == starts + 1, 'A failed preload was silently retried'
         command('--quit'); app.wait(timeout=5)
-        print('PASS: cold start, queued transcription, idle unload, busy guards, manual load/unload, persisted keep-loaded, and load failure')
+        assert fixture.request('/health')[0] == 200
+        print('PASS: desktop API client, cold transcription, recording reservations, independent UI/service lifetimes, shared inference, and service reconnect/failure recovery')
     finally:
         if app is not None and app.poll() is None:
-            app.send_signal(signal.SIGTERM)
-            app.wait(timeout=8)
+            app.terminate(); app.wait(timeout=8)
         log.close()
-        errors = (directory / 'app.log').read_text()
+        errors = (fixture.directory / 'app.log').read_text()
         assert 'CRITICAL' not in errors, errors

@@ -25,6 +25,7 @@ find_package(CUDAToolkit REQUIRED)
 option(PARAKETTO_USE_CUBLAS "Use cuBLAS instead of CUTLASS for FP16" OFF)
 option(PARAKETTO_BUILD_LIB_ONLY "Only build the library, skip the executable" OFF)
 option(PARAKETTO_BUILD_DESKTOP "Build the optional native Linux dictation app" OFF)
+option(PARAKETTO_BUILD_SERVICE "Build the persistent local transcription service" OFF)
 
 # --- Library sources ---
 set(LIB_SOURCES
@@ -75,6 +76,14 @@ if(NOT PARAKETTO_BUILD_LIB_ONLY)
     target_include_directories(paraketto PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party
     )
+endif()
+
+if(PARAKETTO_BUILD_DESKTOP OR PARAKETTO_BUILD_SERVICE)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(SERVICE REQUIRED IMPORTED_TARGET gio-unix-2.0 json-glib-1.0)
+    add_executable(paraketto-service src/service/main.cpp src/service/worker.cpp)
+    target_include_directories(paraketto-service PRIVATE src third_party)
+    target_link_libraries(paraketto-service PRIVATE PkgConfig::SERVICE pthread)
 endif()
 
 if(PARAKETTO_BUILD_DESKTOP)

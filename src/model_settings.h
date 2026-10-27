@@ -1,9 +1,9 @@
 #pragma once
 
-#include "common.h"
+#include "app_common.h"
 #include <algorithm>
 
-namespace desktop {
+namespace paraketto::app {
 
 struct Settings {
     int idle_seconds = 300;
@@ -35,4 +35,4 @@ struct Settings {
     }
 };
 
-} // namespace desktop
+} // namespace paraketto::app

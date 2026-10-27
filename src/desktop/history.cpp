@@ -1,5 +1,5 @@
 #include "history.h"
-#include "common.h"
+#include "app_common.h"
 #include <algorithm>
 #include <cerrno>
 #include <cmath>
@@ -7,6 +7,7 @@
 #include <pango/pango.h>
 
 namespace desktop {
+using namespace paraketto::app;
 
 HistoryStats history_stats(const std::vector<Entry>& entries) {
     HistoryStats stats;

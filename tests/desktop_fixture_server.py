@@ -2,11 +2,16 @@
 """Small HTTP fixture for the desktop lifecycle tests; never loads a GPU model."""
 import json
 import os
+import signal
 from pathlib import Path
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 directory = Path(os.environ['PARAKETTO_FIXTURE_DIR'])
+(directory / 'spawned').mkdir(exist_ok=True)
+(directory / 'spawned' / str(os.getpid())).write_text('worker')
+if os.environ.get('PARAKETTO_FIXTURE_IGNORE_TERM'):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
 class Handler(BaseHTTPRequestHandler):
     def reply(self, data):
@@ -31,7 +36,9 @@ class Handler(BaseHTTPRequestHandler):
             time.sleep(0.025)
         self.reply({'text': 'Lifecycle fixture transcript', 'audio_duration_s': 1, 'inference_time_s': 2})
 
-time.sleep(0.5)
+time.sleep(float(os.environ.get('PARAKETTO_FIXTURE_DELAY', '0.5')))
+if (directory / 'fail-load').exists():
+    raise SystemExit('Fixture model load failed')
 server = HTTPServer(('127.0.0.1', 0), Handler)
 status = {'event': 'ready', 'pid': os.getpid(), 'port': server.server_port}
 (directory / 'server.json').write_text(json.dumps(status))

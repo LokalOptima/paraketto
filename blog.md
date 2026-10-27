@@ -2539,3 +2539,43 @@ Validation: the desktop build and three integration checks pass. An isolated
 overlay preview with quiet-to-loud synthetic audio shows distinct rises and
 falls; the same check preserves Unicode insertion into Ghostty/tmux and keeps
 the overlay mapped while stopping the recording.
+
+### Persistent local service and desktop API client
+
+Split the desktop's combined process manager and HTTP client into a persistent
+`paraketto-service`, a private inference worker, and a desktop HTTP client. The
+service binds loopback on a stable port and starts with no model allocation.
+Its API remains reachable while the model sleeps, loads, unloads, or fails.
+The service owns model settings, automatic eviction, a bounded transcription
+queue, and manual load/unload controls. All clients share one worker. Quitting
+or restarting the desktop does not terminate the service or another client's
+transcription; restarting the service does not require restarting the desktop.
+
+Recording reservations renew through the API and expire if the client crashes.
+They protect long recordings before audio is submitted. Active and queued
+requests also prevent unloading. Shared settings retain the existing
+`preferences.ini` format. The web UI is shared with the standalone inference
+server and refreshes metadata after the first lazy load. JSON/file helpers now
+live outside the desktop directory, and the service links GIO/JSON-GLib without
+GTK or CUDA. `make install-service` installs the service for the user's login
+session; the app itself never launches or stops it.
+
+The code review covered ownership, request serialization, cancellation,
+reconnection, and API errors. Fixed stale error state during an explicit retry,
+listener startup/shutdown ordering, parent-death detection for the worker, and
+transport failure with queued requests. A failed preload now retains the
+recording as an error without silently retrying the load. Startup has a
+deadline; worker shutdown escalates if SIGTERM is ignored. API version/identity
+is checked before audio is uploaded. The API is local-only, rejects other
+browser origins, and has no
+HTTP process-shutdown endpoint.
+
+Validation: Make and CMake builds pass, as do the existing desktop checks and
+the new service/client lifecycle suites. Coverage includes four simultaneous
+requests sharing one model, queue limits, manual/idle unloading, recording
+reservations, crashed clients/workers, missing weights and retry, cancellation
+during loading, shutdown during inference, persisted preferences, and desktop
+reconnection. Two real Ultra load/transcribe/unload cycles returned identical
+text through the same service PID; each worker used 1,866 MiB and disappeared
+from NVIDIA's process accounting after eviction. The service itself had no
+CUDA allocation.

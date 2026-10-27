@@ -5,7 +5,7 @@
 #include <string>
 #include <stdexcept>
 
-namespace desktop {
+namespace paraketto::app {
 
 inline std::string take_string(gchar* value) {
     std::string result = value ? value : "";
@@ -22,11 +22,11 @@ public:
             std::string message = error->message;
             g_error_free(error);
             g_object_unref(parser_);
-            throw std::runtime_error(message);
+            throw std::invalid_argument(message);
         }
         if (!JSON_NODE_HOLDS_OBJECT(json_parser_get_root(parser_))) {
             g_object_unref(parser_);
-            throw std::runtime_error("Expected a JSON object");
+            throw std::invalid_argument("Expected a JSON object");
         }
     }
     ~Json() { g_object_unref(parser_); }
@@ -41,6 +41,10 @@ public:
         if (!n || !JSON_NODE_HOLDS_VALUE(n)) return fallback;
         GType t = json_node_get_value_type(n);
         return t == G_TYPE_INT64 || t == G_TYPE_DOUBLE ? json_node_get_double(n) : fallback;
+    }
+    bool boolean(const char* name, bool fallback = false) const {
+        JsonNode* n = json_object_get_member(object(), name);
+        return n && json_node_get_value_type(n) == G_TYPE_BOOLEAN ? json_node_get_boolean(n) : fallback;
     }
 };
 
@@ -88,4 +92,24 @@ inline void json_field(JsonBuilder* b, const char* name, double value) {
     json_builder_add_double_value(b, value);
 }
 
-} // namespace desktop
+inline void json_bool(JsonBuilder* b, const char* name, bool value) {
+    json_builder_set_member_name(b, name);
+    json_builder_add_boolean_value(b, value);
+}
+
+inline void json_int(JsonBuilder* b, const char* name, gint64 value) {
+    json_builder_set_member_name(b, name);
+    json_builder_add_int_value(b, value);
+}
+
+inline std::string json_error(const std::string& message) {
+    auto* b = json_builder_new();
+    json_builder_begin_object(b);
+    json_field(b, "error", message);
+    json_builder_end_object(b);
+    auto result = json_string(b);
+    g_object_unref(b);
+    return result;
+}
+
+} // namespace paraketto::app

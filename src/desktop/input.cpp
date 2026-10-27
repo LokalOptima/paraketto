@@ -1,5 +1,5 @@
 #include "input.h"
-#include "common.h"
+#include "app_common.h"
 #include <gdk/gdkx.h>
 #include <gio/gdesktopappinfo.h>
 #include <X11/Xatom.h>
@@ -71,6 +71,7 @@ std::string application_name(const std::string& window_class, const std::string&
 }
 
 namespace desktop {
+using namespace paraketto::app;
 
 TextInput::TextInput() {
     lifetime_ = std::make_shared<Lifetime>(Lifetime{this});

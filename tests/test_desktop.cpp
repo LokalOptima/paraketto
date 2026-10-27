@@ -1,7 +1,8 @@
 // Integration checks run under a private X server and private IBus session.
 #include "desktop/audio.h"
 #include "desktop/backend.h"
-#include "desktop/common.h"
+#include "service/worker.h"
+#include "app_common.h"
 #include "desktop/history.h"
 #include "desktop/input.h"
 #include "wav.h"
@@ -12,6 +13,7 @@
 #include <signal.h>
 
 using namespace desktop;
+using namespace paraketto::app;
 
 static bool until(const std::function<bool()>& condition, int milliseconds = 3000) {
     auto end = g_get_monotonic_time() + milliseconds * 1000LL;
@@ -73,6 +75,7 @@ static void recorder_history() {
 }
 
 static void backend_failure_and_shutdown() {
+    using Backend = paraketto::service::Worker;
     auto directory = take_string(g_dir_make_tmp("paraketto-backend-test-XXXXXX", nullptr));
     {
         Backend backend("/does/not/exist", directory + "/missing-weights", directory + "/server.log");

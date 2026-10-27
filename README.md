@@ -182,7 +182,7 @@ button on each transcript. History lasts until you refresh or close the page.
 
 ### Linux desktop dictation
 
-The optional native app manages a local Ultra FP16 server. Its window follows
+The optional native app connects to a persistent local Ultra FP16 service. Its window follows
 the desktop theme and text scale, with compact transcription history, playback,
 and a copy button. The server row uses bold yellow **Sleeping**, green **Ready**,
 and a pulsing bar while loading. Its padded, monospaced VRAM display shows
@@ -191,14 +191,15 @@ hover over it for device-wide usage while the server is running.
 The stats pane shows total words in saved transcriptions and whole-number WPM
 (total words divided by their total recording time in minutes).
 
-Opening the app leaves the model **Sleeping**, with no model GPU allocation.
+The service starts with the model **Sleeping**, with no model GPU allocation.
 Recording starts immediately and loads the model in the background. By default,
-the app unloads it after **5 minutes without dictation**. Preferences provides
+the service unloads it after **5 minutes without activity**. Preferences provides
 the idle timeout and **Keep loaded between recordings**. **Load now**, **Unload
 now**, and **Retry** are available in the server row; unloading is disabled
-during recording or transcription. Idle unloading stops the app's owned server
-process, releasing its CUDA context as well as model allocations. Its local
-HTTP port can change after loading again; standalone servers are unaffected.
+during recording or transcription by any client. Unloading stops the private
+GPU worker, releasing its CUDA context as well as model allocations. The API
+stays available on `http://127.0.0.1:8080`, including while the model sleeps or
+fails to load. The desktop is an HTTP client and never starts or stops the service.
 
 A failed load shows a simple red **Couldn’t load model** message in the window
 and active dictation overlay. Recording stops, any retained audio stays in
@@ -211,9 +212,15 @@ Build dependencies on Ubuntu/Debian (these install system packages):
 sudo apt install libgtk-3-dev libibus-1.0-dev libgstreamer1.0-dev \
   libgstreamer-plugins-base1.0-dev libjson-glib-dev libxdo-dev
 make desktop
+make install-service
 ./paraketto-desktop --install-desktop
 ./paraketto-desktop
 ```
+
+`make install-service` installs and starts a **user systemd service**, configured
+to start with your login session. It needs no sudo. Its executable remains in
+this checkout; rerun the installer if you move the checkout. For a foreground
+service instead, run `./paraketto-service` in another terminal.
 
 `--install-desktop` adds a launcher to your user applications directory and a
 GNOME **Ctrl+Alt+Space** shortcut, preserving existing custom shortcuts. It does
@@ -237,15 +244,19 @@ support targets GNOME on X11; Wayland integration is not yet validated.
 
 History and WAV recordings persist in `~/.local/share/paraketto/history/`
 (`$XDG_DATA_HOME/paraketto/history/` when set). Use a recording's trash button to delete both.
-Memory preferences persist in `~/.local/share/paraketto/preferences.ini`.
+The service owns memory preferences in `~/.local/share/paraketto/preferences.ini`;
+existing preferences are preserved. Desktop preferences update them through the API.
 The server log is `~/.local/share/paraketto/server.log`. Closing the window
 keeps dictation available; choose **Quit Paraketto** from the menu, or run
-`./paraketto-desktop --quit`, to stop the app and its server.
+`./paraketto-desktop --quit`, to stop the app. The service and other clients keep
+working. Stop the service with `systemctl --user stop paraketto.service`;
+start it again with `systemctl --user start paraketto.service`.
 
 Weights default to `paraketto-ultra-fp16.bin` beside the executable, then
-`~/.cache/paraketto/paraketto-ultra-fp16.bin`. Override with `--weights FILE`;
-`--server-binary FILE` and `--data-dir DIRECTORY` are also available when starting
-the app. The menu can import existing mono 16/24 kHz WAV recordings.
+`~/.cache/paraketto/paraketto-ultra-fp16.bin`. The **service** accepts `--weights FILE`,
+`--worker-binary FILE`, `--data-dir DIRECTORY`, `--port PORT`, and `--load-timeout SECONDS`
+(default 120). The **desktop** accepts `--service-url URL` and `--data-dir DIRECTORY`
+for its history. The menu can import existing mono 16/24 kHz WAV recordings.
 
 The app reuses GTK, GStreamer, IBus, libxdo, and the existing cpp-httplib server.
 [Speech Note](https://github.com/mkiol/dsnote), with its maintained stable 4.x
@@ -254,17 +265,59 @@ releases, was the main desktop-integration reference; its
 uses native X11 input and clipboard fallbacks. We also reviewed
 [Nerd Dictation](https://github.com/ideasman42/nerd-dictation)'s recording/input
 separation. The desktop code lives in `src/desktop/`; no Python is needed at
-runtime. CMake users can opt in with `-DPARAKETTO_BUILD_DESKTOP=ON`.
+runtime. The service lives in `src/service/` and only needs GIO and JSON-GLib,
+without GTK or CUDA linkage. CMake users can opt in with
+`-DPARAKETTO_BUILD_DESKTOP=ON` (includes the service) or `-DPARAKETTO_BUILD_SERVICE=ON`.
 
 `make test-desktop` checks recording, persistent history, native IBus delivery,
-focus changes, and owned-server cleanup in a private X11/D-Bus session. It also
+focus changes, and private-worker cleanup in a private X11/D-Bus session. It also
 requires the `xvfb` package. The test session does not change the active desktop's
 input engine or keyboard shortcuts.
 
-`make test-desktop-lifecycle` additionally checks loading on demand, automatic
-and manual unloading, protection during active work, persisted preferences, and
-load-failure reporting. It uses `uv` and a Python HTTP fixture in the same
-private session; it does not load a GPU model.
+`make test-service` checks API availability while unloaded, multiple clients,
+bounded queues, idle/manual unloading, recording reservations, persisted settings,
+failed loads, worker crashes, startup deadlines, and shutdown. `make test-desktop-lifecycle`
+checks the real desktop's API integration, recording reservations, quitting the
+UI during another client's request, and recovery after a service restart. Both
+use `uv` and a Python HTTP fixture; they do not load a GPU model.
+
+### Local service API
+
+The persistent service binds **only to loopback**. This milestone does not configure
+remote access or authentication. Browser requests from other origins are rejected,
+and process shutdown is controlled by systemd/signals rather than an HTTP endpoint.
+The existing standalone `paraketto.cuda --server` mode remains available separately.
+
+| Endpoint | Behaviour |
+|---|---|
+| `GET /health` | Service identity and API version, independent of model readiness |
+| `GET /status` | Model state, GPU memory, active/queued requests, recording reservations, idle countdown, and settings |
+| `GET /info` | Last known model/backend metadata; available without loading the model |
+| `POST /transcribe` | Multipart `file` containing a WAV; loads automatically and returns the existing transcription JSON |
+| `POST /model/load` | Preload asynchronously; returns `202` |
+| `POST /model/unload` | Unload or cancel an idle load; `409` if a client is recording or work is queued/active |
+| `PATCH /settings` | JSON `idle_seconds` (1–86400) and/or boolean `keep_loaded`, persisted by the service |
+| `POST /model/release` | Release the caller's recording reservation |
+
+States are `sleeping`, `loading`, `ready`, `busy`, `unloading`, `error`, and `stopping`.
+An offline service is a separate client-side condition. Status includes
+`service: "paraketto"` and integer `api_version: 1`. Errors use JSON `error` messages.
+Requests share one GPU worker and are serialized, with a maximum of four accepted
+transcriptions (including the active request); excess requests receive `429`.
+The upload limit is 64 MiB. Model-load failure returns `503` without stopping the API.
+
+Recording clients may pass `{"lease_id":"<UUID>"}` to `POST /model/load` and renew
+it while recording. Reservations expire after 10 seconds unless renewed; the
+desktop renews every 2 seconds and releases after cancellation/delivery. Send
+the same JSON to `POST /model/release` when finished. This prevents idle eviction
+while recording and permits recovery if a client crashes. Transcription requests
+protect the model automatically and do not require a reservation.
+
+```bash
+curl http://127.0.0.1:8080/status
+curl -F file=@recording.wav http://127.0.0.1:8080/transcribe
+curl -X POST http://127.0.0.1:8080/model/unload
+```
 
 ### LLM text correction (optional)
 
