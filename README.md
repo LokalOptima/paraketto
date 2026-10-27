@@ -183,8 +183,11 @@ button on each transcript. History lasts until you refresh or close the page.
 ### Linux desktop dictation
 
 The optional native app connects to a persistent local Ultra FP16 service. Its window follows
-the desktop theme and text scale, with compact transcription history, playback,
-and a copy button. The server row uses bold yellow **Sleeping**, green **Ready**,
+the desktop theme and text scale. History fills the window, grouped by day, with
+service controls and quiet stats in the footer. Transcripts initially show at
+most four visual lines; a small chevron expands or collapses longer entries.
+Playback, delete, and copy stay beside each entry, and Copy always uses the full
+transcript. The shortcut is shown as **Ctrl+Alt+Space**. The server row uses bold yellow **Sleeping**, green **Ready**,
 and a pulsing bar while loading. Its padded, monospaced VRAM display shows
 **process usage / GPU capacity** in GiB, including zero usage when unloaded;
 hover over it for device-wide usage while the server is running.
@@ -194,8 +197,8 @@ The stats pane shows total words in saved transcriptions and whole-number WPM
 The service starts with the model **Sleeping**, with no model GPU allocation.
 Recording starts immediately and loads the model in the background. By default,
 the service unloads it after **5 minutes without activity**. Preferences provides
-the idle timeout and **Keep loaded between recordings**. **Load now**, **Unload
-now**, and **Retry** are available in the server row; unloading is disabled
+the idle timeout and **Keep loaded between recordings**. **Load**, **Unload**,
+and **Retry** are available in the server row; unloading is disabled
 during recording or transcription by any client. Unloading stops the private
 GPU worker, releasing its CUDA context as well as model allocations. The API
 stays available while the model sleeps or fails to load. It prefers

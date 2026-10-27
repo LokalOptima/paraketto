@@ -2599,3 +2599,26 @@ Tests cover an occupied preferred port, fixed-port collisions (including a
 listener with port sharing enabled), endpoint permissions and cleanup, crash
 recovery, reconnecting the running desktop to a different port, stale PID
 rejection, and the explicit URL override.
+
+### History-first desktop layout
+
+Implemented the selected A layout using the existing native GTK 3 controls.
+Transcription history now fills the main area, with day headings, readable text,
+compact time/app/duration metadata, and play/delete/copy actions. Model status,
+padded monospaced VRAM, and load/unload controls sit in a compact bottom row;
+word count, WPM, and Ctrl+Alt+Space sit beneath it. The header's recording control
+uses microphone/stop icons, with tooltips and accessible names. Model details and the idle
+countdown remain available in the status tooltip. This is a layout revision;
+the GTK 4/libadwaita migration is separate.
+
+History previews are capped at four visual lines, with a down/up chevron to
+expand and collapse. Pango measures the full text so explicit paragraph breaks
+also obey the limit, and truncation preserves Unicode grapheme boundaries.
+Expansion stays selected through history refreshes; Copy retains the entire
+transcript. Shortcut installation now refreshes the displayed binding immediately.
+
+Validation: Make and CMake builds, four desktop integration checks, and the
+desktop/service lifecycle suite pass. Preview regressions cover wrapped text,
+multiple paragraphs, narrow widths, combining characters, and joined emoji.
+Private-session visual checks exercise expansion and full-text copying without
+touching the user's recordings or input focus.

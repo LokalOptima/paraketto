@@ -4,6 +4,7 @@
 #include "service/worker.h"
 #include "app_common.h"
 #include "desktop/history.h"
+#include "desktop/transcript.h"
 #include "desktop/input.h"
 #include "wav.h"
 #include <gdk/gdkx.h>
@@ -14,6 +15,42 @@
 
 using namespace desktop;
 using namespace paraketto::app;
+
+static void transcript_previews() {
+    auto* label = gtk_label_new(nullptr);
+    g_object_ref_sink(label);
+    const std::string four = "First line\nSecond line\nThird line\nFourth line";
+    auto exact = transcript_preview(label, four, 400);
+    g_assert_false(exact.truncated);
+    g_assert_cmpstr(exact.text.c_str(), ==, four.c_str());
+    const std::string paragraphs = four + "\nFifth line\nSixth line";
+    std::string unicode;
+    for (int i = 0; i < 90; ++i) unicode += "Café 日本語 👩‍💻 ";
+    for (const auto& source : {paragraphs, unicode}) {
+        size_t narrower = 0;
+        for (int width : {160, 400, 700}) {
+            auto preview = transcript_preview(label, source, width);
+            g_assert_true(preview.truncated);
+            g_assert_true(g_utf8_validate(preview.text.c_str(), -1, nullptr));
+            g_assert_true(g_str_has_suffix(preview.text.c_str(), "…"));
+            auto prefix = preview.text.substr(0, preview.text.size() - strlen("…"));
+            g_assert_true(source.compare(0, prefix.size(), prefix) == 0);
+            g_assert_cmpuint(prefix.size(), >=, narrower);
+            narrower = prefix.size();
+            auto* layout = gtk_widget_create_pango_layout(label, preview.text.c_str());
+            pango_layout_set_width(layout, width * PANGO_SCALE);
+            pango_layout_set_wrap(layout, PANGO_WRAP_WORD_CHAR);
+            g_assert_cmpint(pango_layout_get_line_count(layout), <=, 4);
+            pango_layout_set_text(layout, source.c_str(), source.size());
+            int count;
+            auto* boundaries = pango_layout_get_log_attrs_readonly(layout, &count);
+            auto boundary = g_utf8_strlen(prefix.c_str(), prefix.size());
+            g_assert_true(boundaries[boundary].is_cursor_position);
+            g_object_unref(layout);
+        }
+    }
+    g_object_unref(label);
+}
 
 static bool until(const std::function<bool()>& condition, int milliseconds = 3000) {
     auto end = g_get_monotonic_time() + milliseconds * 1000LL;
@@ -200,6 +237,7 @@ int main(int argc, char** argv) {
     gst_init(nullptr, nullptr);
     g_test_init(&argc, &argv, nullptr);
     g_test_add_func("/desktop/recording-history", recorder_history);
+    g_test_add_func("/desktop/transcript-previews", transcript_previews);
     g_test_add_func("/desktop/ibus-delivery", ibus_delivery);
     g_test_add_func("/desktop/backend-failure-shutdown", backend_failure_and_shutdown);
     return g_test_run();

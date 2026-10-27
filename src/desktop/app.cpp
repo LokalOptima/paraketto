@@ -4,7 +4,7 @@
 #include "history.h"
 #include "input.h"
 #include "model_settings.h"
-#include "service/api.h"
+#include "transcript.h"
 #include "wav.h"
 #include <gtk/gtk.h>
 #include <gdk/gdkx.h>
@@ -13,6 +13,7 @@
 #include <array>
 #include <cmath>
 #include <memory>
+#include <set>
 #include <signal.h>
 
 namespace desktop {
@@ -28,9 +29,13 @@ const char* css = R"css(
 .server-panel { background-color: mix(@theme_bg_color, @theme_fg_color, 0.06); }
 .transcriptions, .transcriptions viewport, .history-list, .history-list row { background-color: @theme_base_color; }
 .history-list row { padding: 0; }
-.history-entry { padding: 12px 16px; }
-.transcript-separator { min-height: 1px; background-color: alpha(@theme_fg_color, 0.22); margin: 0 16px; }
-.stats { padding: 12px 16px; }
+.history-entry { padding: 16px 24px; }
+.history-day { padding: 20px 24px 0; }
+.transcript-separator { min-height: 1px; background-color: alpha(@theme_fg_color, 0.12); margin: 0 24px; }
+.history-actions button { min-width: 24px; min-height: 24px; padding: 4px; }
+.history-metadata { font-size: 0.92em; }
+.server-row { padding: 12px 24px; }
+.stats-row { padding: 10px 24px; }
 .transcript { font-size: 1.08em; }
 .failure { color: @error_color; }
 .overlay { background: rgba(23,25,31,0.97); border: 1px solid #454953; border-radius: 16px; }
@@ -64,6 +69,25 @@ void pack(GtkWidget* box, GtkWidget* child, bool expand = false) {
 std::string duration(double seconds) {
     int s = std::max(0, static_cast<int>(seconds));
     return take_string(g_strdup_printf("%02d:%02d", s / 60, s % 60));
+}
+struct HistoryStamp { std::string day, heading, time; };
+HistoryStamp history_stamp(const Entry& entry) {
+    int year, month, day, hour, minute;
+    if (sscanf(entry.id.c_str(), "%4d%2d%2dT%2d%2d", &year, &month, &day, &hour, &minute) != 5 ||
+        year < 1 || year > 9999 || month < 1 || month > 12 || day < 1 || day > 31 ||
+        !g_date_valid_dmy(day, static_cast<GDateMonth>(month), year) || hour < 0 || hour > 23 || minute < 0 || minute > 59)
+        return {"", "History", entry.time};
+    auto* date = g_date_time_new_local(year, month, day, hour, minute, 0);
+    if (!date) return {"", "History", entry.time};
+    auto* now = g_date_time_new_now_local();
+    auto* yesterday = g_date_time_add_days(now, -1);
+    std::string key = entry.id.substr(0, 8);
+    std::string title = key == take_string(g_date_time_format(now, "%Y%m%d")) ? "Today" :
+        key == take_string(g_date_time_format(yesterday, "%Y%m%d")) ? "Yesterday" :
+        take_string(g_date_time_format(date, year == g_date_time_get_year(now) ? "%e %B" : "%e %B %Y"));
+    auto time = take_string(g_date_time_format(date, "%H:%M"));
+    g_date_time_unref(date); g_date_time_unref(now); g_date_time_unref(yesterday);
+    return {key, title, time};
 }
 float waveform_level(float rms, float previous, double elapsed) {
     // Display-only scale: quiet below -50 dBFS, full height at -10 dBFS.
@@ -168,7 +192,9 @@ public:
         gtk_widget_set_tooltip_text(overlay_cancel_, "Cancel recording");
         place_overlay();
         gtk_widget_show_all(overlay_);
-        gtk_button_set_label(GTK_BUTTON(record_button_), "Stop recording");
+        gtk_button_set_image(GTK_BUTTON(record_button_), gtk_image_new_from_icon_name("media-playback-stop-symbolic", GTK_ICON_SIZE_BUTTON));
+        gtk_widget_set_tooltip_text(record_button_, "Stop recording");
+        atk_object_set_name(gtk_widget_get_accessible(record_button_), "Stop recording");
         auto* style = gtk_widget_get_style_context(record_button_);
         gtk_style_context_remove_class(style, "suggested-action");
         gtk_style_context_add_class(style, "destructive-action");
@@ -203,9 +229,12 @@ public:
     void configure_shortcut() {
         std::string error;
         if (install_shortcut(executable_path(), "<Control><Alt>space", error)) {
-            shortcut_text_ = shortcut_label();
-            set_label(shortcut_, shortcut_text_);
+            refresh_shortcut();
         } else message(error);
+    }
+    void refresh_shortcut() {
+        shortcut_text_ = shortcut_label();
+        set_label(shortcut_, shortcut_text_);
     }
 private:
     enum class Mode { Idle, Recording, Transcribing, Delivering };
@@ -218,13 +247,14 @@ private:
     std::unique_ptr<TextInput> input_;
     Recorder recorder_;
     Player player_;
-    GtkWidget *window_, *overlay_, *history_box_, *status_, *vram_, *server_detail_, *record_button_;
+    GtkWidget *window_, *overlay_, *history_box_, *status_, *status_dot_, *vram_, *record_button_;
     GtkWidget *stats_, *status_stack_, *loading_, *shortcut_, *overlay_title_, *overlay_cancel_, *wave_, *server_actions_;
     GtkWidget* preferences_ = nullptr;
     guint timer_ = 0;
     Mode mode_ = Mode::Idle;
     std::array<float, 48> bars_{};
     std::string active_id_, playing_id_;
+    std::set<std::string> expanded_entries_;
     std::string shortcut_text_;
     std::optional<Result> pending_result_;
     gint64 delivery_time_ = 0, overlay_until_ = 0, waveform_time_ = 0;
@@ -302,9 +332,8 @@ private:
         gtk_header_bar_set_title(GTK_HEADER_BAR(header), "Paraketto");
         gtk_header_bar_set_show_close_button(GTK_HEADER_BAR(header), TRUE);
         gtk_window_set_titlebar(GTK_WINDOW(window_), header);
-        record_button_ = gtk_button_new_with_label("Record");
-        gtk_style_context_add_class(gtk_widget_get_style_context(record_button_), "suggested-action");
-        gtk_widget_set_tooltip_text(record_button_, "Record into history. Use the shortcut to dictate into another application.");
+        record_button_ = gtk_button_new_from_icon_name("audio-input-microphone-symbolic", GTK_ICON_SIZE_BUTTON);
+        reset_recording_button();
         g_signal_connect_swapped(record_button_, "clicked", G_CALLBACK(+[](App* a) { a->toggle(false); }), this);
         gtk_header_bar_pack_start(GTK_HEADER_BAR(header), record_button_);
         auto* menu_button = gtk_menu_button_new();
@@ -325,72 +354,77 @@ private:
 
         auto* root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
         gtk_container_add(GTK_CONTAINER(window_), root);
+        auto* scroll = gtk_scrolled_window_new(nullptr, nullptr);
+        gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+        gtk_style_context_add_class(gtk_widget_get_style_context(scroll), "transcriptions");
+        pack(root, scroll, true);
+        history_box_ = gtk_list_box_new();
+        gtk_list_box_set_selection_mode(GTK_LIST_BOX(history_box_), GTK_SELECTION_NONE);
+        gtk_style_context_add_class(gtk_widget_get_style_context(history_box_), "history-list");
+        gtk_list_box_set_header_func(GTK_LIST_BOX(history_box_), [](GtkListBoxRow* row, GtkListBoxRow* before, gpointer) {
+            auto* day = static_cast<const char*>(g_object_get_data(G_OBJECT(row), "day"));
+            if (!day) { gtk_list_box_row_set_header(row, nullptr); return; }
+            auto* previous = before ? static_cast<const char*>(g_object_get_data(G_OBJECT(before), "day")) : nullptr;
+            GtkWidget* header;
+            if (!previous || strcmp(day, previous)) {
+                header = label(static_cast<const char*>(g_object_get_data(G_OBJECT(row), "day-heading")), "secondary");
+                gtk_style_context_add_class(gtk_widget_get_style_context(header), "history-day");
+            } else {
+                header = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
+                gtk_style_context_add_class(gtk_widget_get_style_context(header), "transcript-separator");
+            }
+            gtk_list_box_row_set_header(row, header);
+            gtk_widget_show(header);
+        }, nullptr, nullptr);
+        gtk_container_add(GTK_CONTAINER(scroll), history_box_);
+        pack(root, gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
         auto* server_panel = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
         gtk_style_context_add_class(gtk_widget_get_style_context(server_panel), "server-panel");
         pack(root, server_panel);
         auto* server = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 16);
-        gtk_container_set_border_width(GTK_CONTAINER(server), 16);
-        auto* info = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
-        auto* first = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 16);
+        gtk_style_context_add_class(gtk_widget_get_style_context(server), "server-row");
+        auto* state = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+        status_dot_ = gtk_image_new_from_icon_name("media-record-symbolic", GTK_ICON_SIZE_MENU);
+        gtk_image_set_pixel_size(GTK_IMAGE(status_dot_), 10);
+        pack(state, status_dot_);
         status_ = label("Sleeping", "server-state");
         gtk_style_context_add_class(gtk_widget_get_style_context(status_), "state-sleeping");
         gtk_label_set_ellipsize(GTK_LABEL(status_), PANGO_ELLIPSIZE_END);
+        pack(state, status_, true);
         status_stack_ = gtk_stack_new();
-        gtk_stack_add_named(GTK_STACK(status_stack_), status_, "state");
+        gtk_stack_add_named(GTK_STACK(status_stack_), state, "state");
         loading_ = gtk_progress_bar_new();
         gtk_widget_set_valign(loading_, GTK_ALIGN_CENTER);
         gtk_widget_set_tooltip_text(loading_, "Loading model");
         atk_object_set_name(gtk_widget_get_accessible(loading_), "Loading model");
         gtk_stack_add_named(GTK_STACK(status_stack_), loading_, "loading");
-        pack(first, status_stack_, true);
+        pack(server, status_stack_, true);
         vram_ = label("", "vram");
         gtk_label_set_width_chars(GTK_LABEL(vram_), 19);
         gtk_label_set_xalign(GTK_LABEL(vram_), 1);
-        pack(first, vram_);
-        pack(info, first);
-        server_detail_ = label("Loads when you start recording", "secondary");
-        gtk_label_set_ellipsize(GTK_LABEL(server_detail_), PANGO_ELLIPSIZE_END);
-        pack(info, server_detail_);
-        pack(server, info, true);
+        pack(server, vram_);
         // Homogeneous stacks reserve the same space for every state and action.
         server_actions_ = gtk_stack_new();
         gtk_widget_set_valign(server_actions_, GTK_ALIGN_CENTER);
-        for (const char* text : {"Load now", "Cancel", "Unload now", "Retry"}) {
+        for (const char* text : {"Load", "Cancel", "Unload", "Retry"}) {
             auto* button = gtk_button_new_with_label(text);
             gtk_actionable_set_action_name(GTK_ACTIONABLE(button), "app.model");
             gtk_stack_add_named(GTK_STACK(server_actions_), button, text);
         }
         pack(server, server_actions_);
         pack(server_panel, server);
+        pack(server_panel, gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
+        auto* stats_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 16);
+        gtk_style_context_add_class(gtk_widget_get_style_context(stats_row), "stats-row");
         stats_ = label("");
-        gtk_style_context_add_class(gtk_widget_get_style_context(stats_), "stats");
+        gtk_style_context_add_class(gtk_widget_get_style_context(stats_), "secondary");
+        gtk_label_set_ellipsize(GTK_LABEL(stats_), PANGO_ELLIPSIZE_END);
         gtk_widget_set_tooltip_text(stats_, "Saved transcriptions. WPM = total words ÷ total recording time in minutes.");
-        pack(server_panel, stats_);
-        pack(root, gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
-        auto* transcriptions = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-        gtk_style_context_add_class(gtk_widget_get_style_context(transcriptions), "transcriptions");
-        pack(root, transcriptions, true);
-        auto* history_header = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
-        gtk_container_set_border_width(GTK_CONTAINER(history_header), 16);
-        pack(history_header, label("History", "heading"), true);
+        pack(stats_row, stats_, true);
         shortcut_ = label(shortcut_text_, "secondary");
         gtk_widget_set_tooltip_text(shortcut_, "Start or stop dictation in the focused application");
-        pack(history_header, shortcut_);
-        pack(transcriptions, history_header);
-        auto* scroll = gtk_scrolled_window_new(nullptr, nullptr);
-        gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
-        pack(transcriptions, scroll, true);
-        history_box_ = gtk_list_box_new();
-        gtk_list_box_set_selection_mode(GTK_LIST_BOX(history_box_), GTK_SELECTION_NONE);
-        gtk_style_context_add_class(gtk_widget_get_style_context(history_box_), "history-list");
-        gtk_list_box_set_header_func(GTK_LIST_BOX(history_box_), [](GtkListBoxRow* row, GtkListBoxRow* before, gpointer) {
-            if (!before) { gtk_list_box_row_set_header(row, nullptr); return; }
-            auto* separator = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
-            gtk_style_context_add_class(gtk_widget_get_style_context(separator), "transcript-separator");
-            gtk_list_box_row_set_header(row, separator);
-            gtk_widget_show(separator);
-        }, nullptr, nullptr);
-        gtk_container_add(GTK_CONTAINER(scroll), history_box_);
+        pack(stats_row, shortcut_);
+        pack(server_panel, stats_row);
         render_history();
     }
 
@@ -546,7 +580,9 @@ private:
         catch (const std::exception& error) { message("Could not save history: " + std::string(error.what())); }
     }
     void reset_recording_button() {
-        gtk_button_set_label(GTK_BUTTON(record_button_), "Record");
+        gtk_button_set_image(GTK_BUTTON(record_button_), gtk_image_new_from_icon_name("audio-input-microphone-symbolic", GTK_ICON_SIZE_BUTTON));
+        gtk_widget_set_tooltip_text(record_button_, "Record into history. Use the shortcut to dictate into another application.");
+        atk_object_set_name(gtk_widget_get_accessible(record_button_), "Record");
         auto* style = gtk_widget_get_style_context(record_button_);
         gtk_style_context_remove_class(style, "destructive-action");
         gtk_style_context_add_class(style, "suggested-action");
@@ -624,11 +660,12 @@ private:
             state.status == "unloading" ? "Unloading…" : state.starting ? "Loading model…" :
             failed ? (state.load_failed ? "Couldn’t load model" : "Service unavailable") :
             transcribing || state.status == "busy" ? "Transcribing…" : "Ready");
-        auto* status_style = gtk_widget_get_style_context(status_);
-        set_class(status_style, "state-sleeping", sleeping);
-        set_class(status_style, "state-ready", state.ready);
-        if (failed) gtk_style_context_add_class(status_style, "failure");
-        else gtk_style_context_remove_class(status_style, "failure");
+        for (auto* widget : {status_, status_dot_}) {
+            auto* style = gtk_widget_get_style_context(widget);
+            set_class(style, "state-sleeping", sleeping);
+            set_class(style, "state-ready", state.ready);
+            set_class(style, "failure", failed);
+        }
         gtk_stack_set_visible_child_name(GTK_STACK(status_stack_), state.starting ? "loading" : "state");
         if (state.starting) gtk_progress_bar_pulse(GTK_PROGRESS_BAR(loading_));
         std::string detail;
@@ -641,11 +678,9 @@ private:
         else if (mode_ != Mode::Idle || state.busy) detail = "Model in use";
         else if (state.settings.keep_loaded) detail = "Automatic unloading disabled";
         else detail = "Unloads in " + duration(std::ceil(state.idle_remaining));
-        set_label(server_detail_, detail);
-        gtk_widget_set_tooltip_text(server_detail_, detail.c_str());
         std::string model = state.model.empty() ? state.weights : state.model;
         if (!state.device.empty()) model += "\n" + state.device;
-        gtk_widget_set_tooltip_text(status_, model.c_str());
+        gtk_widget_set_tooltip_text(status_stack_, (detail + (model.empty() ? "" : "\n" + model)).c_str());
         if (state.total_vram_mb > 0) total_vram_mb_ = state.total_vram_mb;
         auto memory_field = [](double mb) {
             return mb >= 0 ? take_string(g_strdup_printf("%6.2f", mb / 1024)) : std::string("    --");
@@ -655,7 +690,7 @@ private:
             "Model process memory. Entire GPU: %.2f / %.2f GiB used.", state.used_vram_mb / 1024, state.total_vram_mb / 1024)) : "Model VRAM usage is unavailable";
         gtk_widget_set_tooltip_text(vram_, memory.c_str());
         gtk_stack_set_visible_child_name(GTK_STACK(server_actions_),
-            sleeping ? "Load now" : state.starting ? "Cancel" : state.ready ? "Unload now" : "Retry");
+            sleeping ? "Load" : state.starting ? "Cancel" : state.ready ? "Unload" : "Retry");
         auto* model_action = g_action_map_lookup_action(G_ACTION_MAP(application_), "model");
         g_simple_action_set_enabled(G_SIMPLE_ACTION(model_action), mode_ == Mode::Idle && state.connected && !state.busy && state.status != "unloading");
         gtk_widget_set_sensitive(record_button_, mode_ == Mode::Recording || mode_ == Mode::Idle);
@@ -700,28 +735,54 @@ private:
         }
         if (!playing_id_.empty() && !player_.playing()) { playing_id_.clear(); render_history(); }
     }
-    struct Row { App* app; std::string id; };
+    struct Row {
+        App* app;
+        std::string id, text;
+        GtkWidget* transcript = nullptr;
+        GtkWidget* expand = nullptr;
+        int width = -1;
+    };
+    void update_transcript(Row* row, bool force = false) {
+        int width = gtk_widget_get_allocated_width(row->transcript);
+        if (width <= 1 || (!force && width == row->width)) return;
+        row->width = width;
+        auto preview = transcript_preview(row->transcript, row->text, width);
+        bool expanded = expanded_entries_.count(row->id);
+        set_label(row->transcript, expanded ? row->text : preview.text);
+        gtk_widget_set_visible(row->expand, preview.truncated || expanded);
+        gtk_button_set_image(GTK_BUTTON(row->expand), gtk_image_new_from_icon_name(
+            expanded ? "pan-up-symbolic" : "pan-down-symbolic", GTK_ICON_SIZE_BUTTON));
+        const char* description = expanded ? "Collapse transcription" : "Expand transcription";
+        gtk_widget_set_tooltip_text(row->expand, description);
+        atk_object_set_name(gtk_widget_get_accessible(row->expand), description);
+    }
     void remove_entry(const std::string& id) {
         if (id == active_id_) return;
         if (auto* e = entry(id)) {
             try { history_.remove(*e); }
             catch (const std::exception& error) { message(error.what()); return; }
             if (playing_id_ == id) { player_.stop(); playing_id_.clear(); }
+            expanded_entries_.erase(id);
             entries_.erase(std::remove_if(entries_.begin(), entries_.end(), [&](const auto& e) { return e.id == id; }), entries_.end());
             render_history();
         }
     }
-    void add_history_row(GtkWidget* content) {
-        gtk_container_add(GTK_CONTAINER(history_box_), content);
-        auto* row = GTK_LIST_BOX_ROW(gtk_widget_get_parent(content));
-        gtk_list_box_row_set_activatable(row, FALSE);
-        gtk_list_box_row_set_selectable(row, FALSE);
+    void add_history_row(GtkWidget* content, const HistoryStamp* stamp = nullptr) {
+        auto* row = gtk_list_box_row_new();
+        if (stamp) {
+            g_object_set_data_full(G_OBJECT(row), "day", g_strdup(stamp->day.c_str()), g_free);
+            g_object_set_data_full(G_OBJECT(row), "day-heading", g_strdup(stamp->heading.c_str()), g_free);
+        }
+        gtk_list_box_row_set_activatable(GTK_LIST_BOX_ROW(row), FALSE);
+        gtk_list_box_row_set_selectable(GTK_LIST_BOX_ROW(row), FALSE);
+        gtk_container_add(GTK_CONTAINER(row), content);
+        gtk_container_add(GTK_CONTAINER(history_box_), row);
     }
     void render_history() {
         auto stats = history_stats(entries_);
-        auto markup = take_string(g_strdup_printf("<b>%zu</b> words transcribed   ·   <b>%lld</b> WPM",
+        auto summary = take_string(g_strdup_printf("%'zu words · %'lld WPM",
             stats.words, stats.words_per_minute));
-        gtk_label_set_markup(GTK_LABEL(stats_), markup.c_str());
+        set_label(stats_, summary);
         auto* children = gtk_container_get_children(GTK_CONTAINER(history_box_));
         for (auto* it = children; it; it = it->next) gtk_widget_destroy(GTK_WIDGET(it->data));
         g_list_free(children);
@@ -738,11 +799,12 @@ private:
         for (const auto& e : entries_) {
             auto* card = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
             gtk_style_context_add_class(gtk_widget_get_style_context(card), "history-entry");
-            auto* row = new Row{this, e.id};
-            g_object_set_data_full(G_OBJECT(card), "row", row, [](gpointer p) { delete static_cast<Row*>(p); });
             const std::string text = !e.text.empty() ? e.text : !e.error.empty() ?
                 (e.error == "Couldn’t load model" ? e.error : "Couldn’t transcribe recording") : e.delivery;
+            auto* row = new Row{this, e.id, text};
+            g_object_set_data_full(G_OBJECT(card), "row", row, [](gpointer p) { delete static_cast<Row*>(p); });
             auto* transcript = label(text, e.error.empty() ? "transcript" : "failure");
+            row->transcript = transcript;
             if (!e.error.empty()) gtk_widget_set_tooltip_text(transcript, e.error.c_str());
             gtk_label_set_line_wrap(GTK_LABEL(transcript), TRUE);
             gtk_label_set_line_wrap_mode(GTK_LABEL(transcript), PANGO_WRAP_WORD_CHAR);
@@ -757,17 +819,36 @@ private:
                 pack(card, warning);
             }
             auto* bottom = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
-            auto* metadata = label(e.time + "  ·  " + duration(e.duration), "secondary");
+            gtk_style_context_add_class(gtk_widget_get_style_context(bottom), "history-actions");
+            auto stamp = history_stamp(e);
+            auto* metadata = label(stamp.time + (e.destination.empty() ? "" : " · " + e.destination) + " · " + duration(e.duration), "secondary");
+            gtk_style_context_add_class(gtk_widget_get_style_context(metadata), "history-metadata");
             gtk_label_set_ellipsize(GTK_LABEL(metadata), PANGO_ELLIPSIZE_END);
             std::string details = e.destination + "\n" + e.delivery;
             if (e.inference_ms > 0) details += take_string(g_strdup_printf("\nTranscribed in %.0f ms", e.inference_ms));
             gtk_widget_set_tooltip_text(metadata, details.c_str());
             pack(bottom, metadata, true);
+            row->expand = icon_button("pan-down-symbolic", "Expand transcription");
+            gtk_widget_set_no_show_all(row->expand, TRUE);
+            g_signal_connect(row->expand, "clicked", G_CALLBACK(+[](GtkButton* button, gpointer p) {
+                auto* row = static_cast<Row*>(p);
+                auto& expanded = row->app->expanded_entries_;
+                if (!expanded.erase(row->id)) expanded.insert(row->id);
+                row->app->update_transcript(row, true);
+                atk_object_notify_state_change(gtk_widget_get_accessible(GTK_WIDGET(button)),
+                    ATK_STATE_EXPANDED, expanded.count(row->id));
+            }), row);
+            g_signal_connect(transcript, "size-allocate", G_CALLBACK(+[](GtkWidget*, GtkAllocation*, gpointer p) {
+                auto* row = static_cast<Row*>(p); row->app->update_transcript(row);
+            }), row);
+            g_signal_connect(transcript, "style-updated", G_CALLBACK(+[](GtkWidget*, gpointer p) {
+                auto* row = static_cast<Row*>(p); row->app->update_transcript(row, true);
+            }), row);
+            pack(bottom, row->expand);
             auto* remove = icon_button("user-trash-symbolic", "Delete recording and transcription");
             gtk_actionable_set_action_target_value(GTK_ACTIONABLE(remove), g_variant_new_string(e.id.c_str()));
             gtk_actionable_set_action_name(GTK_ACTIONABLE(remove), "app.delete-recording");
             gtk_widget_set_sensitive(remove, e.id != active_id_);
-            pack(bottom, remove);
             auto* play = icon_button(e.id == playing_id_ ? "media-playback-stop-symbolic" : "media-playback-start-symbolic", "Play recording");
             g_signal_connect(play, "clicked", G_CALLBACK(+[](GtkButton*, gpointer p) {
                 auto* row = static_cast<Row*>(p); auto* a = row->app;
@@ -781,6 +862,7 @@ private:
                 a->render_history();
             }), row);
             pack(bottom, play);
+            pack(bottom, remove);
             auto* copy = icon_button("edit-copy-symbolic", "Copy transcription");
             gtk_widget_set_sensitive(copy, !e.text.empty());
             g_signal_connect(copy, "clicked", G_CALLBACK(+[](GtkButton* button, gpointer p) {
@@ -791,7 +873,7 @@ private:
                     gtk_widget_set_tooltip_text(GTK_WIDGET(button), "Copied");
                 }
             }), row);
-            pack(bottom, copy); pack(card, bottom); add_history_row(card);
+            pack(bottom, copy); pack(card, bottom); add_history_row(card, &stamp);
         }
         gtk_widget_show_all(history_box_);
     }
@@ -841,6 +923,7 @@ int main(int argc, char** argv) {
                 try { desktop::install_launcher(); }
                 catch (const std::exception& e) { g_application_command_line_printerr(command, "%s\n", e.what()); return 1; }
             }
+            if (app) app->refresh_shortcut();
             g_application_command_line_print(command, "Ctrl+Alt+Space toggles Paraketto dictation.\n");
             return 0;
         }

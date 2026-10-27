@@ -366,6 +366,7 @@ std::string shortcut_label() {
     g_object_unref(settings);
     guint key = 0; GdkModifierType mods{};
     gtk_accelerator_parse(accel.c_str(), &key, &mods);
+    if (key == GDK_KEY_space && mods == (GDK_CONTROL_MASK | GDK_MOD1_MASK)) return "Ctrl+Alt+Space";
     return key ? take_string(gtk_accelerator_get_label(key, mods)) : "Shortcut not configured";
 }
 
