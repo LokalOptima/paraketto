@@ -2183,3 +2183,144 @@ The three baselines were regenerated (5 sessions × 3 runs each) from current bi
 1. `ttest_ind` on zero-variance samples returns p = 0.0 for *any* mean difference, including 1e-15. Guard the condition, not the NaN.
 2. Sessions inside one invocation are not independent samples of machine state. If the baseline and the comparison run in different invocations, ~1% RTFx drift is the noise floor regardless of how tight the within-run σ looks.
 3. When a regression gate misfires, fix it and then try to make it fire on a real injected regression. A gate that was only ever seen passing proves nothing.
+
+## Parakeet Ultra FP16 conversion and comparison (2026-10-27)
+
+Moondream's Ultra checkpoint retains V3's 24-block FastConformer, 640-wide
+two-layer LSTM, 8,193-token vocabulary including blank, and five TDT durations.
+Its 8,192 text tokens match our compiled V3 vocabulary exactly after decoding
+C++ UTF-8 escapes and replacing the SentencePiece space marker. The checkpoint
+is Safetensors in the Transformers layout, so our existing ONNX exporter cannot
+import it directly.
+
+Added `scripts/export_ultra_weights.py` to convert that checkpoint without
+PyTorch or NeMo. It checks model metadata, vocabulary, source tensor shapes,
+finite values, and the full output tensor order against the existing exporter.
+The conversion transposes linear weights, folds BatchNorm (epsilon 1e-5) into
+each depthwise convolution, reorders LSTM gates from PyTorch IFGO to our ONNX
+IOFG layout, and concatenates the two LSTM bias vectors. The converter writes
+an atomic PRKT V3 FP16 file of 1,253,967,368 bytes. Independent numerical tests
+exercise BatchNorm folding at padded convolution boundaries and recurrent LSTM
+state evolution over six steps.
+
+Source: `moondream/parakeet-ultra` revision
+`73175eb7aeb0d82f1e2a6b53b3aabc10a90bcd0b`. The downloaded Safetensors SHA-256
+matches Hugging Face's LFS metadata:
+`c9608f36d0ab956c14bfcc525479b0746b3b42a56f6949ec85c14eb7466717dc`.
+Converted FP16 SHA-256:
+`e75307d287c6c34a5a1811a8f50db518299c55a524ff37359a3b974982362dc4`.
+
+No inference code changed. The auxiliary VAD head is omitted: Ultra uses our
+existing silence splitting and decoder, including the two-symbol emission cap.
+Our test therefore measures Ultra weights in paraketto, rather than reproducing
+Photon's published pipeline. Ultra is FP16 only for now. FP16 needs no
+calibration; a future Ultra FP8 path should calibrate its own 218 activation
+scales on a diverse corpus and validate on held-out audio instead of assuming
+that the original V3 scales remain suitable.
+
+Added `tests/bench_weights.py` for sequential baseline/candidate runs with the
+same binary, local audio, and existing English/multilingual WER normalizers.
+It saves transcripts, per-clip timing, dataset WER, empty-output counts, server
+metadata, and file checksums. The comparison used an idle RTX 5070 Ti with the
+unchanged CUTLASS FP16 binary and the cached original V3 FP16 weights:
+
+```bash
+uv run python tests/bench_weights.py \
+  --weights paraketto-ultra-fp16.bin \
+  --baseline ~/.cache/paraketto/paraketto-v3-fp16.bin \
+  --datasets librispeech earnings22 long difficult \
+    fleurs_german fleurs_italian fleurs_french \
+    cv_de_heldout cv_it_heldout cv_fr_heldout \
+  --output scratch/ultra-benchmark.json
+```
+
+| Dataset | Clips | V3 FP16 WER | Ultra FP16 WER |
+|---|---:|---:|---:|
+| LibriSpeech | 100 | 1.94% | 1.64% |
+| Earnings22 | 40 | 12.41% | 10.49% |
+| Long audio | 50 | 1.92% | 1.78% |
+| Difficult | 50 | 20.74% | 18.56% |
+| FLEURS German | 347 | 6.99% | 6.43% |
+| FLEURS Italian | 346 | 4.97% | 4.19% |
+| FLEURS French | 332 | 6.95% | 6.63% |
+| Common Voice German, held out | 25 | 0.46% | 0.46% |
+| Common Voice Italian, held out | 25 | 2.90% | 2.49% |
+| Common Voice French, held out | 25 | 3.77% | 3.77% |
+
+Ultra improved eight dataset scores and tied two, with zero empty transcripts
+for either model across 1,340 clips / 21,042 seconds of audio. Aggregate
+inference took 18.27 s for V3 and 18.29 s for Ultra (1,152x vs 1,150x real time).
+These are single warmed passes, not a statistical latency comparison. The
+multilingual sets here use all locally available FLEURS clips, rather than the
+50-per-language subset in the earlier V3 FP8 table. README now includes this
+comparison and the download/conversion commands.
+
+## Ultra FP8 with checkpoint-specific activation calibration (2026-10-27)
+
+Converted Ultra's verified FP16 file with `scripts/generate_fp8_weights.py`.
+The 657,338,260-byte output has our usual E4M3 encoder weights and FP16 decoder,
+but format 2 would still select the baked original-V3 activation scales. Those
+scales are checkpoint-dependent: one Ultra activation site reached 1.659 times
+the old V3 allowance in the calibration corpus.
+
+The existing calibration hook recorded activation maxima while continuing to
+use the old static scales for inference. That can contaminate downstream
+measurements through clipping. `PARAKETTO_CALIB=1` now dynamically requantizes
+each FP8 GEMM's raw FP16 input with its own absmax and recomputes its scale
+product before the GEMM. This replaces any fused FP8 output created with stale
+scales. `PARAKETTO_CALIB=observe` retains the static path while recording ranges,
+for diagnostics. Normal inference still uses the fused static path.
+
+Added `scripts/calibrate_fp8.py`: 162 clips from ten local datasets, covering
+Common Voice en/de/it/fr, FLEURS de/it/fr, LibriSpeech, earnings, and difficult
+speech. The script skips the silence warmup, includes every real-audio chunk,
+takes the per-site maximum over the corpus, and multiplies all 218 scales by
+1.5. It records decoded-audio hashes so evaluation can exclude recordings even
+when dataset copies use different filenames or WAV encodings.
+
+PRKTFP8 format 3 embeds the 218 little-endian FP32 activation scales after the
+unchanged format-2 weight payload. The calibrated Ultra file is 657,339,132
+bytes, SHA-256 `2a08e9f963736433c3e43f2a2b3d8afac1413e6a63fc865dc2651b9556f9f200`.
+The runtime validates the complete payload size and positive finite scales,
+and `/info` reports whether scales are embedded or baked. Format-2 files retain
+the original V2/V3 defaults. No global scale table is replaced when switching
+between checkpoints, and no separate scale file is needed for inference.
+
+The comparison harness now accepts separate baseline/candidate binaries and
+`--exclude-calibration`. It removed 62 overlapping recordings from the previous
+1,340-clip evaluation, leaving 1,278 clips / 20,408 seconds (5.67 hours).
+Calibration used all 162 selected recordings; the other 100 calibration clips
+were outside the evaluation manifests. Both Ultra backends produced zero empty
+transcripts. WER was:
+
+| Dataset | Clips | Ultra FP16 | Calibrated Ultra FP8 |
+|---|---:|---:|---:|
+| LibriSpeech | 88 | 1.76% | 1.91% |
+| Earnings22 | 32 | 10.69% | 10.51% |
+| Long audio | 50 | 1.78% | 1.81% |
+| Difficult | 38 | 18.26% | 18.05% |
+| FLEURS German | 337 | 6.39% | 6.30% |
+| FLEURS Italian | 336 | 4.26% | 4.34% |
+| FLEURS French | 322 | 6.69% | 6.77% |
+| Common Voice German, held out | 25 | 0.46% | 0.46% |
+| Common Voice Italian, held out | 25 | 2.49% | 2.49% |
+| Common Voice French, held out | 25 | 3.77% | 3.77% |
+
+FP8 worsened four sets by at most 0.151 percentage points, improved three, and
+tied three. Aggregate inference was 17.54 s for FP16 and 17.45 s for FP8
+(1,163x vs 1,169x real time), which does not establish a speed advantage from
+these single warmed passes. The benefit measured here is memory: weights are
+47.6% smaller, and post-warmup GPU memory use was 1,889 MiB vs 1,205 MiB on the
+RTX 5070 Ti. Only English/German/Italian/French were validated. The auxiliary
+VAD and decoding policy remain as in our FP16 Ultra test.
+
+Artifacts: `scratch/ultra-fp8-calibration.json` contains scales and corpus hashes;
+`scratch/ultra-fp8-benchmark.json` contains metrics, transcripts, binary/weight
+checksums, and exclusions. Reproduction commands are in the README's Ultra FP8
+section. The existing V2/V3 FP8 smoke-test transcripts stayed byte-identical
+after the loader change, and the calibration unit checks cover chunk maxima,
+warmup exclusion, invalid observations, and audio identity across encodings.
+Integration checks also confirmed that deliberately changing all initial static
+scales to 1,000 leaves dynamic-calibration observations and transcripts exactly
+unchanged. The loader rejected truncated files and zero/NaN scale entries, and
+the final FP8 executable's checksum matches the binary used for the benchmark.

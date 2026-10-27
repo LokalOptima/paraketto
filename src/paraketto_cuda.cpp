@@ -222,7 +222,8 @@ int main(int argc, char** argv) {
             if (memcmp(base, "PRKTFP8", 7) == 0) {
                 uint32_t ver; memcpy(&ver, base + 8, 4);
                 uint32_t mver; memcpy(&mver, base + 12, 4);
-                valid = (ver == FP8_WEIGHTS_VERSION) && (mver == 2 || mver == 3);
+                valid = (ver == FP8_WEIGHTS_VERSION || ver == FP8_CALIBRATED_VERSION)
+                        && (mver == 2 || mver == 3);
             }
         }
         if (!valid) {
@@ -315,6 +316,10 @@ int main(int argc, char** argv) {
         info += "\"version\":" + std::to_string(version) + ",";
         info += "\"backend\":\"" + json_escape(BACKEND_NAME) + "\",";
         info += "\"weights\":\"" + json_escape(weights_path) + "\",";
+#ifdef PARAKETTO_FP8
+        info += "\"activation_scales\":\"";
+        info += pipeline.cuda_model.fp8_embedded_scales ? "embedded\"," : "baked\",";
+#endif
         snprintf(nb, sizeof nb, "%.0f", weights_mb);      info += "\"weights_mb\":" + std::string(nb) + ",";
         info += "\"device\":\"" + json_escape(prop.name) + "\",";
         info += "\"compute\":\"" + std::to_string(prop.major) + "." + std::to_string(prop.minor) + "\",";

@@ -70,11 +70,11 @@ check-weights: $(WEIGHTS)
 		exit 1; \
 	fi
 
-# Verify paraketto-fp8.bin is the expected format (PRKTFP8 v2)
+# Verify PRKTFP8 format 2 (baked scales) or 3 (embedded activation scales).
 check-weights-fp8: $(WEIGHTS_FP8)
 	@m=$$(od -An -tx1 -N7 $(WEIGHTS_FP8) | tr -d ' '); \
 	v=$$(od -An -td4 -N4 -j8 $(WEIGHTS_FP8) | tr -d ' '); \
-	if [ "$$m" != "50524b54465038" ] || [ "$$v" != "2" ]; then \
+	if [ "$$m" != "50524b54465038" ] || { [ "$$v" != "2" ] && [ "$$v" != "3" ]; }; then \
 		echo "ERROR: paraketto-fp8.bin has invalid header (magic=$$m, version=$$v). Delete and re-run to regenerate."; \
 		exit 1; \
 	fi

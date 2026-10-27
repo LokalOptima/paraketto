@@ -8,6 +8,10 @@ conformer_fp8.cpp's fp8_load.
 Usage:
   uv run python scripts/generate_fp8_weights.py                          # default paths
   uv run python scripts/generate_fp8_weights.py input.bin output.bin     # explicit paths
+
+This writes format 2, which uses the runtime's baked V2/V3 activation scales.
+For fine-tuned checkpoints, run calibrate_fp8.py next to produce format 3 with
+checkpoint-specific activation scales embedded in the weight file.
 """
 
 import struct

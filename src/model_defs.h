@@ -32,6 +32,8 @@ static constexpr uint32_t WEIGHTS_VERSION = 2;
 static constexpr size_t   WEIGHTS_HEADER  = 8;  // magic(4) + version(4)
 
 static constexpr uint32_t FP8_WEIGHTS_VERSION = 2;  // match HF fp8.bin
+// Format 3 appends 218 FP32 activation scales to the format-2 payload.
+static constexpr uint32_t FP8_CALIBRATED_VERSION = 3;
 static constexpr size_t   FP8_WEIGHTS_HEADER  = 16;  // magic(8) + version(4) + model_version(4)
 
 // ---------------------------------------------------------------------------

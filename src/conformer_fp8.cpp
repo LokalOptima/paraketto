@@ -1,6 +1,6 @@
 // conformer_fp8.cpp — FP8 CudaModel inference (CUTLASS FP8 backend)
 //
-// FP8 E4M3 weight quantization at init time, FP8 GEMMs via CUTLASS 2.x.
+// Offline-quantized FP8 E4M3 weights, FP8 GEMMs via CUTLASS 2.x.
 // FP16 sub-conv and batched attention GEMMs via CUTLASS FP16.
 // No cuBLAS or cublasLt dependency.
 
@@ -157,7 +157,7 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames,
     generate_pos_encoding_gpu(pos_enc, T_max, D_MODEL, stream);
 
     // -----------------------------------------------------------------------
-    // FP8 weight quantization — quantize all lt_gemm weight matrices to E4M3
+    // Load offline-quantized E4M3 weight matrices
     // -----------------------------------------------------------------------
     {
         // Compute total FP8 pool size (1 byte per element)
@@ -222,6 +222,7 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames,
 
         // Activation scratch
         fp8_act_buf = take8(T_max * D_FF);
+        fp8_calib_amax_buf = (int*)take8(sizeof(int));
 
         // Per-site activation scale cache
         fp8p = (char*)(((uintptr_t)fp8p + 255) & ~(uintptr_t)255);
@@ -237,17 +238,27 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames,
         // ---------------------------------------------------------------------------
         // FP8 weight cache — paraketto-fp8.bin format:
         //   char[8]  magic   = "PRKTFP8\0"
-        //   uint32   version = FP8_WEIGHTS_VERSION (2)
-        //   uint32   model_version (0=v1, 3=v3)
+        //   uint32   version = 2 (baked scales) or 3 (embedded activation scales)
+        //   uint32   model_version (2=v2, 3=v3)
         //   [fp8_pool blob: FP8 weights + scales, pool layout, single cudaMemcpy]
         //   [non-GEMM FP16 blob: LN, biases, conv_dw, embed, LSTM, decoder — packed]
+        //   [format 3 only: N_FP8_ACT_SITES little-endian float32 activation scales]
         //
         // pool_weights_size is computed from the allocation above — no need to store it.
-        // Try fp8_load first; if it fails, quantize from FP16 and save.
+        // Load prepared weights; format 3 carries its own activation scales.
         // ---------------------------------------------------------------------------
 
         // Compute pool blob size (fp8_pool through end of fp8_scales, at their aligned offsets)
         size_t pool_weights_size = (size_t)((char*)(fp8_scales + N_FP8_SCALES) - (char*)fp8_pool);
+        // Packed FP16 payload, matching generate_fp8_weights.py (no alignment).
+        const size_t fp16_elements =
+            3 * (SUB_CHANNELS * 9 + SUB_CHANNELS)
+            + 2 * (SUB_CHANNELS * SUB_CHANNELS + SUB_CHANNELS) + D_MODEL
+            + N_BLOCKS * (11 * D_MODEL + 2 * N_HEADS * HEAD_DIM + D_MODEL * CONV_K)
+            + (size_t)w->config.n_vocab * D_PRED
+            + 2 * (size_t)4 * D_PRED * 2 * D_PRED + 2 * 4 * D_PRED
+            + (size_t)D_PRED * D_JOINT + (size_t)D_JOINT * w->config.d_output
+            + 2 * D_JOINT + w->config.d_output;
 
         auto fp8_load = [&](const char* path) -> bool {
             const uint8_t* base = nullptr;
@@ -278,14 +289,33 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames,
             }
             uint32_t version; memcpy(&version, base + 8, 4);
             uint32_t model_ver; memcpy(&model_ver, base + 12, 4);
-            if (version != FP8_WEIGHTS_VERSION || (model_ver != 2 && model_ver != 3)) {
+            if ((version != FP8_WEIGHTS_VERSION && version != FP8_CALIBRATED_VERSION)
+                    || model_ver != (uint32_t)w->config.version) {
                 if (mmap_ptr) munmap(mmap_ptr, map_size);
                 return false;
             }
-            if (map_size < FP8_WEIGHTS_HEADER + pool_weights_size) {
+            const bool embedded = version == FP8_CALIBRATED_VERSION;
+            size_t payload_end = FP8_WEIGHTS_HEADER + pool_weights_size + fp16_elements * sizeof(half);
+            size_t expected_size = payload_end + (embedded ? N_FP8_ACT_SITES * sizeof(float) : 0);
+            if (map_size != expected_size) {
+                fprintf(stderr, "FP8 weight size mismatch: expected %zu, got %zu\n", expected_size, map_size);
                 if (mmap_ptr) munmap(mmap_ptr, map_size);
                 return false;
             }
+            if (embedded) {
+                for (int i = 0; i < N_FP8_ACT_SITES; i++) {
+                    float scale;
+                    memcpy(&scale, base + payload_end + i * sizeof(float), sizeof(float));
+                    if (!std::isfinite(scale) || scale <= 0.0f || !std::isfinite(1.0f / scale)) {
+                        fprintf(stderr, "Invalid FP8 activation scale at site %d\n", i);
+                        if (mmap_ptr) munmap(mmap_ptr, map_size);
+                        return false;
+                    }
+                }
+                CUDA_CHECK(cudaMemcpyAsync(fp8_act_site_scales, base + payload_end,
+                    N_FP8_ACT_SITES * sizeof(float), cudaMemcpyHostToDevice, stream));
+            }
+            fp8_embedded_scales = embedded;
 
             // Single cudaMemcpy for fp8_pool (FP8 weights + scales at aligned offsets)
             CUDA_CHECK(cudaMemcpyAsync(fp8_pool, base + FP8_WEIGHTS_HEADER,
@@ -374,14 +404,17 @@ void CudaModel::init(const Weights& weights, cudaStream_t s, int max_mel_frames,
             cudaFree(transpose_tmp);
         }
 
-        // Load baked activation scales (V2 or V3) and pre-compute alpha products
+        // Fall back to baked V2/V3 scales for format 2, then compute alpha products.
         static_assert(sizeof(FP8_BAKED_ACT_SCALES)    / sizeof(float) == N_FP8_ACT_SITES, "V2 scale count mismatch");
         static_assert(sizeof(FP8_BAKED_ACT_SCALES_V3) / sizeof(float) == N_FP8_ACT_SITES, "V3 scale count mismatch");
         const float* baked = (w->config.version == 3) ? FP8_BAKED_ACT_SCALES_V3
                                                       : FP8_BAKED_ACT_SCALES;
-        CUDA_CHECK(cudaMemcpyAsync(fp8_act_site_scales, baked,
-                                   N_FP8_ACT_SITES * sizeof(float),
-                                   cudaMemcpyHostToDevice, stream));
+        if (!fp8_embedded_scales)
+            CUDA_CHECK(cudaMemcpyAsync(fp8_act_site_scales, baked,
+                                       N_FP8_ACT_SITES * sizeof(float),
+                                       cudaMemcpyHostToDevice, stream));
+        fprintf(stderr, "  FP8 activation scales: %s\n",
+                fp8_embedded_scales ? "embedded in weight file" : "baked V2/V3 defaults");
         fp8_compute_all_alphas(fp8_alpha_products, fp8_scales, fp8_act_site_scales,
                                N_BLOCKS, stream);
     }
@@ -414,14 +447,24 @@ void CudaModel::free() {
 // Unified FP8 GEMM: quantize activation with pre-computed scales, run CUTLASS.
 // All weights are [n,k] row-major (NN weights pre-transposed at init).
 // Activation scales and alpha products are baked in at init time.
+static bool g_fp8_calib = false;
+static bool g_fp8_calib_dynamic = false;
+
 static void fp8_gemm_impl(cudaStream_t stream,
                            const half* X_fp16, int m, int k,
                            const uint8_t* W_fp8, int n,
                            half* Y,
                            uint8_t* act_buf, float* act_scale,
                            float* alpha_buf,
-                           bool prequantized) {
-    if (!prequantized)
+                           bool prequantized, const float* weight_scale,
+                           int* calib_amax_buf) {
+    if (g_fp8_calib_dynamic) {
+        // Requantize the raw FP16 activation, replacing any fused output made
+        // with stale scales. Downstream calibration must not observe clipping
+        // caused by another checkpoint's activation scales.
+        quantize_absmax_fp16_to_fp8(X_fp16, act_buf, act_scale, m * k, calib_amax_buf, stream);
+        fp8_compute_alpha(alpha_buf, weight_scale, act_scale, stream);
+    } else if (!prequantized)
         quantize_fp8_static(X_fp16, act_buf, act_scale, m * k, stream);
     cutlass_fp8_gemm(stream, act_buf, m, k, W_fp8, n, alpha_buf, Y);
 }
@@ -429,11 +472,12 @@ static void fp8_gemm_impl(cudaStream_t stream,
 // Position encoding generation moved to GPU kernel (generate_pos_encoding_gpu)
 
 // --- FP8 activation-scale calibration (env PARAKETTO_CALIB) -----------------
-// When enabled, records per-site activation amax over the forward pass and
-// emits a "SCALES:" line (scale = amax / 448) consumed by
+// With PARAKETTO_CALIB=1, dynamically rescales each GEMM input and records
+// per-site activation amax over the forward pass. "observe" only records
+// activations under the selected static scales, for saturation validation.
+// Both modes emit a "SCALES:" line (scale = amax / 448) consumed by
 // scripts/calibrate_v3_scales.py. Restores the runtime calibration pass that
 // was baked out in commit 4a3acb7. Zero overhead when disabled.
-static bool  g_fp8_calib = false;
 static float g_calib_amax[CudaModel::N_FP8_ACT_SITES];
 static void calib_record(cudaStream_t stream, int site, const half* dbuf, int n) {
     if (!g_fp8_calib) return;
@@ -445,6 +489,10 @@ static void calib_record(cudaStream_t stream, int site, const half* dbuf, int n)
     float mx = 0.0f;
     for (int i = 0; i < n; i++) {
         float v = fabsf(__half2float(h[i]));
+        if (!std::isfinite(v)) {
+            fprintf(stderr, "Non-finite calibration activation at site %d\n", site);
+            std::exit(1);
+        }
         if (v > mx) mx = v;
     }
     if (mx > g_calib_amax[site]) g_calib_amax[site] = mx;
@@ -452,6 +500,7 @@ static void calib_record(cudaStream_t stream, int site, const half* dbuf, int n)
 
 int CudaModel::encode_gpu(int T_mel) {
     g_fp8_calib = getenv("PARAKETTO_CALIB") != nullptr;
+    g_fp8_calib_dynamic = g_fp8_calib && strcmp(getenv("PARAKETTO_CALIB"), "observe") != 0;
     if (g_fp8_calib)
         for (int i = 0; i < N_FP8_ACT_SITES; i++) g_calib_amax[i] = 0.0f;
     // FP16 GEMM helper (sub-conv pointwise convolutions)
@@ -461,24 +510,24 @@ int CudaModel::encode_gpu(int T_mel) {
 
     // FP8 GEMM helpers — CUTLASS FP8 with baked activation scales
     auto gnn8 = [&](const half* X, int m, int k, const uint8_t* W, int n,
-                     const float* /*ws*/, int si, half* Y, bool preq = false) {
+                     const float* ws, int si, half* Y, bool preq = false) {
         fp8_gemm_impl(stream, X, m, k, W, n, Y, fp8_act_buf,
                       &fp8_act_site_scales[si],
-                      &fp8_alpha_products[si], preq);
+                      &fp8_alpha_products[si], preq, ws, fp8_calib_amax_buf);
     };
     auto gnn8_bias = [&](const half* X, int m, int k, const uint8_t* W, int n,
-                          const float* /*ws*/, int si, const half* bias, half* Y,
+                          const float* ws, int si, const half* bias, half* Y,
                           bool preq = false) {
         fp8_gemm_impl(stream, X, m, k, W, n, Y, fp8_act_buf,
                       &fp8_act_site_scales[si],
-                      &fp8_alpha_products[si], preq);
+                      &fp8_alpha_products[si], preq, ws, fp8_calib_amax_buf);
         bias_add_row_fp16(Y, bias, m, n, stream);
     };
     auto gnt8 = [&](const half* X, int m, int k, const uint8_t* W, int n,
-                     const float* /*ws*/, int si, half* Y, bool preq = false) {
+                     const float* ws, int si, half* Y, bool preq = false) {
         fp8_gemm_impl(stream, X, m, k, W, n, Y, fp8_act_buf,
                       &fp8_act_site_scales[si],
-                      &fp8_alpha_products[si], preq);
+                      &fp8_alpha_products[si], preq, ws, fp8_calib_amax_buf);
     };
     // Weight scale helper: fp8_scales[blk * 9 + offset]
     auto bscale = [&](int blk, int off) -> const float* { return &fp8_scales[blk * 9 + off]; };

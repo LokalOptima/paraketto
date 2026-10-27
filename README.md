@@ -138,6 +138,124 @@ make paraketto.fp8               # build FP8 binary
 
 Supports: bg, cs, da, de, el, en, es, et, fi, fr, hr, hu, it, lt, lv, mt, nl, pl, pt, ro, ru, sk, sl, sv, uk.
 
+### Parakeet Ultra
+
+[Moondream Parakeet Ultra](https://huggingface.co/moondream/parakeet-ultra) is a
+fine-tuned V3 checkpoint with the same architecture and vocabulary. Convert its
+Safetensors checkpoint to our V3 binary format, then use either FP16 backend:
+
+```bash
+uvx hf download moondream/parakeet-ultra \
+  --revision 73175eb7aeb0d82f1e2a6b53b3aabc10a90bcd0b \
+  --local-dir scratch/parakeet-ultra
+uv run python scripts/export_ultra_weights.py scratch/parakeet-ultra
+./paraketto.cuda --model v3 --weights paraketto-ultra-fp16.bin audio.wav
+```
+
+The converter checks the configuration, every tensor shape, and the vocabulary;
+transposes linear weights; folds convolution batch normalization; and reorders
+the LSTM gates. It needs no PyTorch or NeMo. Output is approximately 1.25 GB.
+The binary identifies this as V3; the weights path distinguishes Ultra.
+
+Ultra uses our existing decoder and silence-based long-audio chunking. Its
+auxiliary VAD head is not imported, so this does not reproduce Photon's exact
+inference pipeline. FP16 needs no calibration.
+
+Compare against the original V3 weights on the same local benchmark clips:
+
+```bash
+uv run python tests/bench_weights.py \
+  --weights paraketto-ultra-fp16.bin \
+  --baseline ~/.cache/paraketto/paraketto-v3-fp16.bin \
+  --output scratch/ultra-benchmark.json
+```
+
+The default comparison uses the existing English and de/it/fr benchmark sets.
+`--datasets` selects other local manifests, including `fleurs_german`,
+`fleurs_italian`, `fleurs_french`, and `cv_{de,it,fr}_heldout` when available.
+The JSON includes transcripts, WER, empty-output counts, and weight checksums.
+
+FP16 comparison on RTX 5070 Ti, 2026-10-27 (WER %, lower is better):
+
+| Local dataset | Clips | V3 | Ultra |
+|---|---:|---:|---:|
+| LibriSpeech | 100 | 1.94 | 1.64 |
+| Earnings22 | 40 | 12.41 | 10.49 |
+| Long audio | 50 | 1.92 | 1.78 |
+| Difficult | 50 | 20.74 | 18.56 |
+| FLEURS German | 347 | 6.99 | 6.43 |
+| FLEURS Italian | 346 | 4.97 | 4.19 |
+| FLEURS French | 332 | 6.95 | 6.63 |
+| Common Voice German, held out | 25 | 0.46 | 0.46 |
+| Common Voice Italian, held out | 25 | 2.90 | 2.49 |
+| Common Voice French, held out | 25 | 3.77 | 3.77 |
+
+Both models produced zero empty transcripts across 1,340 clips (5.85 hours).
+Aggregate throughput was 1,152× real time for V3 and 1,150× for Ultra in a
+single warmed pass; this is not a statistical speed comparison. These local
+FLEURS sets are larger than the 50-clip sets in the V3 FP8 table above.
+
+#### Ultra FP8 (Blackwell)
+
+Convert the FP16 file with the existing E4M3 weight quantizer, then calibrate
+activation ranges using Ultra's own weights. Calibration is an inference pass;
+there is no retraining.
+
+```bash
+make paraketto.fp8
+uv run python scripts/generate_fp8_weights.py \
+  paraketto-ultra-fp16.bin paraketto-ultra-fp8.bin
+uv run python scripts/calibrate_fp8.py \
+  --weights paraketto-ultra-fp8.bin \
+  --output paraketto-ultra-fp8-calibrated.bin \
+  --report scratch/ultra-fp8-calibration.json
+./paraketto.fp8 --model v3 --weights paraketto-ultra-fp8-calibrated.bin audio.wav
+```
+
+The calibrator requires the local corpora listed in `scripts/calibrate_fp8.py`:
+162 clips from Common Voice (en/de/it/fr), FLEURS (de/it/fr), LibriSpeech,
+Earnings22, and difficult speech. It dynamically rescales every FP8 GEMM input
+while measuring all 218 activation sites, takes their maxima across clips and
+chunks, and applies 1.5× headroom. The output bundles the scales with the weights
+in PRKTFP8 format 3 (657.3 MB). Original format-2 V2/V3 files continue to use
+their baked scales. Use the **calibrated** file for Ultra inference; the
+intermediate file still selects the original V3 scales.
+
+To compare FP8 against FP16, excluding calibration recordings by decoded-audio
+hash even if they appear under different filenames:
+
+```bash
+uv run python tests/bench_weights.py \
+  --baseline-binary paraketto.cuda --baseline paraketto-ultra-fp16.bin \
+  --binary paraketto.fp8 --weights paraketto-ultra-fp8-calibrated.bin \
+  --exclude-calibration scratch/ultra-fp8-calibration.json \
+  --datasets librispeech earnings22 long difficult \
+    fleurs_german fleurs_italian fleurs_french \
+    cv_de_heldout cv_it_heldout cv_fr_heldout \
+  --output scratch/ultra-fp8-benchmark.json
+```
+
+On the same RTX 5070 Ti, after excluding 62 calibration recordings:
+
+| Local dataset | Clips | Ultra FP16 WER | Ultra FP8 WER |
+|---|---:|---:|---:|
+| LibriSpeech | 88 | 1.76% | 1.91% |
+| Earnings22 | 32 | 10.69% | 10.51% |
+| Long audio | 50 | 1.78% | 1.81% |
+| Difficult | 38 | 18.26% | 18.05% |
+| FLEURS German | 337 | 6.39% | 6.30% |
+| FLEURS Italian | 336 | 4.26% | 4.34% |
+| FLEURS French | 322 | 6.69% | 6.77% |
+| Common Voice German, held out | 25 | 0.46% | 0.46% |
+| Common Voice Italian, held out | 25 | 2.49% | 2.49% |
+| Common Voice French, held out | 25 | 3.77% | 3.77% |
+
+Both produced zero empty transcripts on 1,278 evaluation clips (5.67 hours).
+Aggregate throughput was 1,163× for FP16 and 1,169× for FP8 in single warmed
+passes; no speed advantage is established by this measurement. GPU memory in
+the server's post-warmup snapshot was 1,889 MiB vs 1,205 MiB, and the weight file
+is 47.6% smaller. Validation covers English, German, Italian, and French.
+
 ## Usage
 
 ```bash
@@ -267,6 +385,7 @@ scripts/export_weights.py # NeMo → paraketto-fp16.bin converter
 ## Acknowledgments
 
 - **[Parakeet TDT 0.6B](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2)** by NVIDIA — the original ASR model ([V2](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) English, [V3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) multilingual). This project is a from-scratch C++/CUDA reimplementation of the inference pipeline. Model weights are used under CC-BY-4.0, Copyright NVIDIA Corporation.
+- **[Parakeet Ultra](https://huggingface.co/moondream/parakeet-ultra)** by Moondream — a post-trained V3 checkpoint, also CC-BY-4.0. The optional FP16 converter preserves our V3 inference layout.
 - **[CUTLASS](https://github.com/NVIDIA/cutlass)** by NVIDIA — CUDA Templates for Linear Algebra Subroutines, used as a git submodule for FP16 and FP8 GEMMs (BSD-3-Clause License, Copyright 2017-2026 NVIDIA Corporation & Affiliates)
 - **[llama.cpp](https://github.com/ggml-org/llama.cpp)** — optional LLM text correction via git submodule (MIT License, Copyright 2023-2026 The ggml authors)
 - **[cpp-httplib](https://github.com/yhirose/cpp-httplib)** by yhirose — HTTP server (MIT License)

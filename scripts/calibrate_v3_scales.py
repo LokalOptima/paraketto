@@ -14,6 +14,9 @@ collapsing the TDT decoder to all-blank. Here we include Common Voice (the
 triggering distribution), FLEURS, librispeech, and the difficult/earnings sets.
 
 Usage: uv run python scripts/calibrate_v3_scales.py [HEADROOM]   (default 1.5)
+
+For custom checkpoints, use calibrate_fp8.py to embed scales in their weight
+files without replacing the built-in V3 defaults.
 """
 
 import json

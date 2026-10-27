@@ -9,6 +9,8 @@ dependencies = [
     "jiwer",
     "requests",
     "onnx",
+    "safetensors>=0.4.3",
+    "ml_dtypes>=0.4.0",
     "datasets>=4.6.1",
     "whisper-normalizer>=0.1.12",
     "num2words>=0.5.14",
