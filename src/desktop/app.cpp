@@ -109,7 +109,6 @@ Options options_from(GVariantDict* dict) {
     Options result;
     auto option = [&](const char* name) { return option_string(dict, name); };
     result.service_url = option("service-url");
-    if (result.service_url.empty()) result.service_url = paraketto::service::default_url;
     result.data = option("data-dir");
     if (result.data.empty()) result.data = std::string(g_get_user_data_dir()) + "/paraketto";
     auto source = option("audio-source");
@@ -131,7 +130,7 @@ public:
         g_object_unref(provider);
         input_ = std::make_unique<TextInput>();
         shortcut_text_ = shortcut_label();
-        backend_ = std::make_unique<Backend>(options_.service_url);
+        backend_ = std::make_unique<Backend>(options_.service_url, options_.data);
         build_window();
         build_overlay();
         timer_ = g_timeout_add(40, [](gpointer p) -> gboolean { static_cast<App*>(p)->tick(); return G_SOURCE_CONTINUE; }, this);
@@ -468,7 +467,8 @@ private:
         gtk_widget_set_tooltip_text(weights, model_path.c_str());
         pack(body, weights);
         pack(body, label("Service", "heading"));
-        pack(body, label(options_.service_url, "secondary"));
+        auto service_url = server_state().url;
+        pack(body, label(service_url.empty() ? "Discovering local service…" : service_url, "secondary"));
         gtk_widget_show_all(preferences_);
     }
     void build_overlay() {
@@ -820,7 +820,7 @@ int main(int argc, char** argv) {
         {"quit", 0, 0, G_OPTION_ARG_NONE, nullptr, "Quit the app (service stays available)", nullptr},
         {"install-shortcut", 0, 0, G_OPTION_ARG_NONE, nullptr, "Enable the GNOME Ctrl+Alt+Space shortcut", nullptr},
         {"install-desktop", 0, 0, G_OPTION_ARG_NONE, nullptr, "Add a user application launcher and the dictation shortcut", nullptr},
-        {"service-url", 0, 0, G_OPTION_ARG_STRING, nullptr, "Paraketto API (default: http://127.0.0.1:8080)", "URL"},
+        {"service-url", 0, 0, G_OPTION_ARG_STRING, nullptr, "Paraketto API (default: discover the local service)", "URL"},
         {"data-dir", 0, 0, G_OPTION_ARG_FILENAME, nullptr, "History directory", "DIRECTORY"},
         {"audio-source", 0, 0, G_OPTION_ARG_STRING, nullptr, "GStreamer microphone source (default: pulsesrc)", "SOURCE"},
         {"transcribe", 0, 0, G_OPTION_ARG_FILENAME, nullptr, "Transcribe a WAV into history", "FILE"},

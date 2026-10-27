@@ -198,8 +198,10 @@ the idle timeout and **Keep loaded between recordings**. **Load now**, **Unload
 now**, and **Retry** are available in the server row; unloading is disabled
 during recording or transcription by any client. Unloading stops the private
 GPU worker, releasing its CUDA context as well as model allocations. The API
-stays available on `http://127.0.0.1:8080`, including while the model sleeps or
-fails to load. The desktop is an HTTP client and never starts or stops the service.
+stays available while the model sleeps or fails to load. It prefers
+`http://127.0.0.1:8080` and automatically chooses a free port if 8080 is occupied.
+The desktop discovers the address, including after a service restart, and never
+starts or stops the service itself. Preferences shows the current address.
 
 A failed load shows a simple red **Couldn’t load model** message in the window
 and active dictation overlay. Recording stops, any retained audio stays in
@@ -255,8 +257,12 @@ start it again with `systemctl --user start paraketto.service`.
 Weights default to `paraketto-ultra-fp16.bin` beside the executable, then
 `~/.cache/paraketto/paraketto-ultra-fp16.bin`. The **service** accepts `--weights FILE`,
 `--worker-binary FILE`, `--data-dir DIRECTORY`, `--port PORT`, and `--load-timeout SECONDS`
-(default 120). The **desktop** accepts `--service-url URL` and `--data-dir DIRECTORY`
-for its history. The menu can import existing mono 16/24 kHz WAV recordings.
+(default 120). An explicit `--port PORT` pins the address and fails if that port
+is occupied; `--port 0` always requests a free port. The **desktop** accepts
+`--service-url URL` to override discovery and `--data-dir DIRECTORY` for its
+history and local service discovery. When using a custom service data directory,
+give both processes the same `--data-dir`, or supply the desktop's `--service-url`.
+The menu can import existing mono 16/24 kHz WAV recordings.
 
 The app reuses GTK, GStreamer, IBus, libxdo, and the existing cpp-httplib server.
 [Speech Note](https://github.com/mkiol/dsnote), with its maintained stable 4.x
@@ -276,9 +282,10 @@ input engine or keyboard shortcuts.
 
 `make test-service` checks API availability while unloaded, multiple clients,
 bounded queues, idle/manual unloading, recording reservations, persisted settings,
-failed loads, worker crashes, startup deadlines, and shutdown. `make test-desktop-lifecycle`
+failed loads, worker crashes, startup deadlines, port collisions, and shutdown. `make test-desktop-lifecycle`
 checks the real desktop's API integration, recording reservations, quitting the
-UI during another client's request, and recovery after a service restart. Both
+UI during another client's request, discovery after a port change, stale-address
+rejection, and recovery after a service restart. Both
 use `uv` and a Python HTTP fixture; they do not load a GPU model.
 
 ### Local service API
@@ -287,6 +294,13 @@ The persistent service binds **only to loopback**. This milestone does not confi
 remote access or authentication. Browser requests from other origins are rejected,
 and process shutdown is controlled by systemd/signals rather than an HTTP endpoint.
 The existing standalone `paraketto.cuda --server` mode remains available separately.
+
+The service atomically publishes its port and PID in
+`~/.local/share/paraketto/service.json` (or its `--data-dir`), readable only by
+the current user, and removes it on clean shutdown. The desktop checks service
+identity, API version, and PID before sending audio or control requests, so a
+stale discovery file cannot silently select another service instance. An explicit
+`--service-url` checks identity/version without depending on the discovery file.
 
 | Endpoint | Behaviour |
 |---|---|
@@ -312,6 +326,8 @@ desktop renews every 2 seconds and releases after cancellation/delivery. Send
 the same JSON to `POST /model/release` when finished. This prevents idle eviction
 while recording and permits recovery if a client crashes. Transcription requests
 protect the model automatically and do not require a reservation.
+
+Use the address shown in Preferences; these examples assume port 8080:
 
 ```bash
 curl http://127.0.0.1:8080/status

@@ -49,8 +49,9 @@ class Fixture:
         self.port = 0
         self.log = (self.directory / 'service.log').open('w')
 
-    def start(self, missing=False, load_timeout=5):
-        self.process = subprocess.Popen([str(REPO / 'paraketto-service'), '--port', str(self.port),
+    def start(self, missing=False, load_timeout=5, auto_port=False):
+        port_args = [] if auto_port else ['--port', str(self.port)]
+        self.process = subprocess.Popen([str(REPO / 'paraketto-service'), *port_args,
             '--worker-binary', str(REPO / 'tests/desktop_fixture_server.py'), '--data-dir', str(self.data),
             '--weights', str(self.directory / 'missing-weights' if missing else self.weights),
             '--load-timeout', str(load_timeout)], env=self.env, stdout=subprocess.PIPE, stderr=self.log, text=True)
@@ -60,6 +61,10 @@ class Fixture:
         ready = json.loads(line)
         self.port = ready['port']
         self.url = f'http://127.0.0.1:{self.port}'
+        published = self.data / 'service.json'
+        assert json.loads(published.read_text()) == {
+            'service': 'paraketto', 'api_version': 1, 'pid': self.process.pid, 'port': self.port}
+        assert published.stat().st_mode & 0o777 == 0o600
         wait(lambda: self.status()['status'] == 'sleeping')
         return self
 

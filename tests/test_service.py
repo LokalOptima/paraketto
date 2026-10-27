@@ -1,10 +1,46 @@
 """Exercise the public API, multiple clients, failure recovery, and process ownership."""
 from concurrent.futures import ThreadPoolExecutor
+import errno
 import signal
 import os
+import socket
+import subprocess
 import time
 import uuid
-from service_test_support import Fixture, alive, wait
+from service_test_support import Fixture, REPO, alive, wait
+
+with socket.socket() as occupied:
+    try:
+        occupied.bind(('127.0.0.1', 8080))
+        occupied.listen()
+    except OSError as error:
+        # An existing listener also exercises fallback; leave it untouched.
+        assert error.errno == errno.EADDRINUSE
+    with Fixture() as fixture:
+        fixture.start(auto_port=True)
+        assert fixture.port != 8080, 'Automatic startup did not avoid the occupied port'
+        old_port, old_pid = fixture.port, fixture.process.pid
+        fixture.process.kill()
+        fixture.stop()
+        assert (fixture.data / 'service.json').exists(), 'Expected a stale descriptor after a crash'
+        with socket.socket() as old_address:
+            old_address.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            old_address.bind(('127.0.0.1', old_port)); old_address.listen()
+            fixture.port = 0
+            fixture.start()
+            assert fixture.port != old_port and fixture.process.pid != old_pid
+        fixture.stop()
+        assert not (fixture.data / 'service.json').exists(), 'Clean shutdown left a stale descriptor'
+print('PASS: occupied default port, endpoint publication, crash recovery, and discovery cleanup')
+
+with socket.socket() as occupied, Fixture() as fixture:
+    occupied.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    occupied.bind(('127.0.0.1', 0)); occupied.listen()
+    result = subprocess.run([str(REPO / 'paraketto-service'), '--port', str(occupied.getsockname()[1]),
+        '--data-dir', str(fixture.data)], capture_output=True, text=True, timeout=5)
+    assert result.returncode != 0 and 'Could not bind' in result.stderr
+    assert not (fixture.data / 'service.json').exists()
+print('PASS: an explicitly fixed port fails clearly when occupied')
 
 with Fixture() as fixture:
     fixture.start()

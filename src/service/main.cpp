@@ -27,6 +27,16 @@ struct Job {
     std::promise<Reply> completion;
 };
 
+class PublishedEndpoint {
+    std::string path_;
+public:
+    PublishedEndpoint(const std::string& data, int port) : path_(data + "/" + endpoint_filename) {
+        write_file(path_, "{\"service\":\"paraketto\",\"api_version\":" + std::to_string(api_version) +
+            ",\"pid\":" + std::to_string(getpid()) + ",\"port\":" + std::to_string(port) + "}\n");
+    }
+    ~PublishedEndpoint() { g_unlink(path_.c_str()); }
+};
+
 class Service {
 public:
     Service(std::string binary, std::string weights, std::string data, int load_timeout)
@@ -267,9 +277,9 @@ int main(int argc, char** argv) {
     using namespace paraketto::app;
     using namespace paraketto::service;
     gchar *weights_arg = nullptr, *binary_arg = nullptr, *data_arg = nullptr;
-    gint port = 8080, load_timeout = 120;
+    gint port = -1, load_timeout = 120; // Omitted port prefers 8080, then a free port.
     GOptionEntry options[] = {
-        {"port", 0, 0, G_OPTION_ARG_INT, &port, "Local API port (0 selects a free port)", "PORT"},
+        {"port", 0, 0, G_OPTION_ARG_INT, &port, "Fixed API port (default: 8080 with automatic fallback; 0: free port)", "PORT"},
         {"weights", 0, 0, G_OPTION_ARG_FILENAME, &weights_arg, "FP16 weights (default: Ultra)", "FILE"},
         {"worker-binary", 0, 0, G_OPTION_ARG_FILENAME, &binary_arg, "Inference worker executable", "FILE"},
         {"data-dir", 0, 0, G_OPTION_ARG_FILENAME, &data_arg, "Settings and worker log directory", "DIRECTORY"},
@@ -284,7 +294,7 @@ int main(int argc, char** argv) {
     }
     g_option_context_free(context);
     try {
-        if (port < 0 || port > 65535 || load_timeout < 1) throw std::runtime_error("Invalid port or load timeout");
+        if (port < -1 || port > 65535 || load_timeout < 1) throw std::runtime_error("Invalid port or load timeout");
         auto executable = take_string(g_file_read_link("/proc/self/exe", nullptr));
         auto base = take_string(g_path_get_dirname(executable.c_str()));
         std::string binary = binary_arg ? binary_arg : base + "/paraketto.cuda";
@@ -301,13 +311,32 @@ int main(int argc, char** argv) {
         int lock_fd = g_open((data + "/service.lock").c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
         if (lock_fd < 0 || flock(lock_fd, LOCK_EX | LOCK_NB) != 0)
             throw std::runtime_error("Another service owns this data directory");
-        httplib::Server http;
+        auto make_server = [] {
+            auto server = std::make_unique<httplib::Server>();
+            server->set_socket_options([](socket_t socket) {
+                // httplib defaults to SO_REUSEPORT, which would silently share
+                // traffic with another listener instead of detecting a conflict.
+                int enabled = 1;
+                setsockopt(socket, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled));
+            });
+            return server;
+        };
+        auto server = make_server();
+        if (port == -1) {
+            port = default_port;
+            if (!server->bind_to_port("127.0.0.1", port)) {
+                // A failed bind permanently decommissions this httplib instance.
+                server = make_server();
+                port = server->bind_to_any_port("127.0.0.1");
+            }
+        } else if (port == 0) port = server->bind_to_any_port("127.0.0.1");
+        else if (!server->bind_to_port("127.0.0.1", port)) port = -1;
+        if (port < 0) throw std::runtime_error("Could not bind local service port");
+        auto& http = *server;
         http.new_task_queue = [] { return new httplib::ThreadPool(8, 16); };
         http.set_payload_max_length(64 * 1024 * 1024);
-        if (port == 0) port = http.bind_to_any_port("127.0.0.1");
-        else if (!http.bind_to_port("127.0.0.1", port)) port = -1;
-        if (port < 0) throw std::runtime_error("Could not bind local service port");
         Service service(binary, weights, data, load_timeout);
+        PublishedEndpoint endpoint(data, port);
         auto reply = [](httplib::Response& response, const Reply& result) {
             response.status = result.status; response.set_content(result.body, "application/json");
         };
@@ -329,7 +358,10 @@ int main(int argc, char** argv) {
             catch (...) {}
             response.set_content(json_error(message), "application/json");
         });
-        http.Get("/health", [](const auto&, auto& res) { res.set_content("{\"service\":\"paraketto\",\"api_version\":1}", "application/json"); });
+        http.Get("/health", [](const auto&, auto& res) {
+            res.set_content("{\"service\":\"paraketto\",\"api_version\":" + std::to_string(api_version) +
+                ",\"pid\":" + std::to_string(getpid()) + "}", "application/json");
+        });
         http.Get("/status", [&](const auto&, auto& res) { res.set_content(service.status(), "application/json"); });
         http.Get("/info", [&](const auto&, auto& res) { res.set_content(service.info(), "application/json"); });
         http.Get("/", [](const auto&, auto& res) { res.set_content(paraketto::web_ui, "text/html"); });

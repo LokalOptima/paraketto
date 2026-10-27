@@ -39,4 +39,4 @@ WantedBy=default.target
 subprocess.run(['systemctl', '--user', 'daemon-reload'], check=True)
 subprocess.run(['systemctl', '--user', 'enable', 'paraketto.service'], check=True)
 subprocess.run(['systemctl', '--user', 'restart', 'paraketto.service'], check=True)
-print(f'Installed {unit}\nAPI: http://127.0.0.1:8080 (model loads on demand)')
+print(f'Installed {unit}\nThe desktop discovers the local API automatically; the model loads on demand.')

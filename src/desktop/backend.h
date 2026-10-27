@@ -15,7 +15,7 @@ namespace desktop {
 
 struct ServerState {
     bool connected = false, ready = false, starting = false, load_failed = false, busy = false;
-    std::string status = "connecting", message, model, device, weights, log_path;
+    std::string status = "connecting", message, model, device, weights, log_path, url;
     double server_vram_mb = -1, used_vram_mb = -1, total_vram_mb = -1, idle_remaining = 0;
     paraketto::app::Settings settings;
 };
@@ -27,7 +27,7 @@ struct Result {
 // HTTP client only. The service owns the inference process and residency policy.
 class Backend {
 public:
-    explicit Backend(std::string url);
+    Backend(std::string url, std::string data);
     ~Backend();
     ServerState state();
     void load();
@@ -39,7 +39,8 @@ public:
     std::optional<Result> result();
 private:
     struct Command { std::string method, path, body; };
-    std::string url_, lease_id_;
+    struct Endpoint { std::string url; int pid = 0; };
+    std::string url_, endpoint_file_, lease_id_;
     std::mutex mutex_;
     std::condition_variable wake_;
     std::thread monitor_, transcriber_;
@@ -51,6 +52,7 @@ private:
     bool busy_ = false, hold_ = false;
     std::string action_error_;
     std::shared_ptr<httplib::Client> control_, request_;
+    Endpoint endpoint() const;
     void command(std::string method, std::string path, std::string body = "{}");
     void monitor();
     void transcribe();

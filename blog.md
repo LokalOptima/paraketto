@@ -2579,3 +2579,23 @@ reconnection. Two real Ultra load/transcribe/unload cycles returned identical
 text through the same service PID; each worker used 1,866 MiB and disappeared
 from NVIDIA's process accounting after eviction. The service itself had no
 CUDA allocation.
+
+### Automatic local port discovery
+
+The service now tries port 8080 and falls back to an OS-assigned free port when
+occupied. Binding reserves the port directly, avoiding a check-then-bind race.
+An explicit `--port` remains fixed. The desktop reads an atomically published,
+owner-only endpoint file and follows port changes after service restarts;
+`--service-url` remains an explicit override. Service identity and PID are
+verified before audio or control requests, and clean shutdown removes the file.
+
+Collision testing exposed cpp-httplib's default `SO_REUSEPORT`, which allowed
+two listeners to share traffic. The service now uses exclusive listener binding
+with `SO_REUSEADDR` for restarts. Fallback creates a fresh httplib server because
+a failed bind decommissions the previous instance.
+
+Validation: Make and CMake builds and service/desktop lifecycle checks pass.
+Tests cover an occupied preferred port, fixed-port collisions (including a
+listener with port sharing enabled), endpoint permissions and cleanup, crash
+recovery, reconnecting the running desktop to a different port, stale PID
+rejection, and the explicit URL override.

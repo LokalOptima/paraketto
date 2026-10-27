@@ -1,6 +1,7 @@
 """Exercise the real desktop as a client of a separately owned local service."""
 from concurrent.futures import ThreadPoolExecutor
 import json
+import socket
 import subprocess
 import time
 from service_test_support import Fixture, REPO, alive, wait
@@ -8,7 +9,7 @@ from service_test_support import Fixture, REPO, alive, wait
 binary = str(REPO / 'paraketto-desktop')
 with Fixture() as fixture:
     fixture.start()
-    data = fixture.directory / 'client'
+    data = fixture.data
     app = None
     log = (fixture.directory / 'app.log').open('w')
 
@@ -22,8 +23,9 @@ with Fixture() as fixture:
             '--object-path', '/io/localoptima/Paraketto', '--method', 'org.gtk.Actions.Activate',
             name, '[]', '{}'], check=True, capture_output=True, timeout=5, env=fixture.env)
 
-    def start():
-        process = subprocess.Popen([binary, '--service-url', fixture.url, '--data-dir', str(data),
+    def start(explicit_url=False):
+        service_args = ['--service-url', fixture.url] if explicit_url else []
+        process = subprocess.Popen([binary, *service_args, '--data-dir', str(data),
             '--audio-source', 'audiotestsrc is-live=true'], env=fixture.env, stdout=log, stderr=log)
         wait(lambda: subprocess.run(['xdotool', 'search', '--all', '--onlyvisible', '--pid', str(process.pid),
             '--name', '^Paraketto$'], capture_output=True).returncode == 0)
@@ -81,11 +83,26 @@ with Fixture() as fixture:
         command('--transcribe', str(fixture.audio))
         wait(lambda: entries()[0]['error'] == 'Couldn’t load model')
         assert 'Weights not found' in (fixture.data / 'server.log').read_text()
+        old_port = fixture.port
         fixture.stop()
-        fixture.start()
+        with socket.socket() as occupied:
+            occupied.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            occupied.bind(('127.0.0.1', old_port)); occupied.listen()
+            fixture.port = 0
+            fixture.start()
+            assert fixture.port != old_port
         previous = entries()[0]['id']
         command('--transcribe', str(fixture.audio))
         wait(lambda: entries()[0]['id'] != previous and entries()[0]['text'] == 'Lifecycle fixture transcript')
+        published = fixture.data / 'service.json'
+        address = published.read_text()
+        stale = json.loads(address)
+        stale['pid'] += 1
+        published.write_text(json.dumps(stale))
+        previous = entries()[0]['id']
+        command('--transcribe', str(fixture.audio))
+        wait(lambda: entries()[0]['id'] != previous and entries()[0]['error'] == 'Service address is out of date')
+        published.write_text(address)
         wait(lambda: fixture.status()['recording_leases'] == 0)
         fixture.request('/model/unload', 'POST', {})
         wait(lambda: fixture.status()['status'] == 'sleeping')
@@ -98,7 +115,14 @@ with Fixture() as fixture:
         assert len(list((fixture.directory / 'spawned').iterdir())) == starts + 1, 'A failed preload was silently retried'
         command('--quit'); app.wait(timeout=5)
         assert fixture.request('/health')[0] == 200
-        print('PASS: desktop API client, cold transcription, recording reservations, independent UI/service lifetimes, shared inference, and service reconnect/failure recovery')
+        (fixture.directory / 'fail-load').unlink()
+        published.write_text('{broken')
+        app = start(explicit_url=True)
+        previous = entries()[0]['id']
+        command('--transcribe', str(fixture.audio))
+        wait(lambda: entries()[0]['id'] != previous and entries()[0]['text'] == 'Lifecycle fixture transcript')
+        command('--quit'); app.wait(timeout=5)
+        print('PASS: desktop API client, automatic port discovery/reconnection, stale-address rejection, explicit URL override, recording reservations, independent lifetimes, and failure recovery')
     finally:
         if app is not None and app.poll() is None:
             app.terminate(); app.wait(timeout=8)
