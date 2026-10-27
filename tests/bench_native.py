@@ -3,7 +3,6 @@
 Usage:
     uv run python tests/bench_native.py paraketto.cuda
     uv run python tests/bench_native.py paraketto.cublas
-    uv run python tests/bench_native.py paraketto.fp8
 """
 
 import sys

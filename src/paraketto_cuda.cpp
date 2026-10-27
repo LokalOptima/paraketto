@@ -1,4 +1,4 @@
-// paraketto_cuda.cpp — Custom CUDA/cuBLAS runtime for Parakeet TDT 0.6B V2
+// paraketto_cuda.cpp — CUDA runtime for Parakeet V2, V3, and Ultra
 //
 // Build: make paraketto.cuda
 // Usage: ./paraketto.cuda [--weights FILE] audio.wav
@@ -12,7 +12,6 @@
 #include <vector>
 
 #include <fcntl.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -29,7 +28,7 @@
 using namespace paraketto;
 
 // Compute backend name, injected per-binary by the Makefile link recipe
-// (CUTLASS FP16 / cuBLAS FP16 / CUTLASS FP8). Falls back for ad-hoc builds.
+// (CUTLASS FP16 / cuBLAS FP16). Falls back for ad-hoc builds.
 #ifndef BACKEND_NAME
 #define BACKEND_NAME "unknown backend"
 #endif
@@ -120,17 +119,9 @@ int main(int argc, char** argv) {
     const char* hf_base = "https://huggingface.co/localoptima/paraketto/resolve/main";
     if (!custom_weights) {
         if (model_version == 3) {
-#ifdef PARAKETTO_FP8
-            weights_path = dir + "/paraketto-v3-fp8.bin";
-#else
             weights_path = dir + "/paraketto-v3-fp16.bin";
-#endif
         } else {
-#ifdef PARAKETTO_FP8
-            weights_path = dir + "/paraketto-fp8.bin";
-#else
             weights_path = dir + "/paraketto-fp16.bin";
-#endif
         }
     }
 
@@ -144,62 +135,15 @@ int main(int argc, char** argv) {
     // Download weights if missing
     if (!custom_weights) {
         const char* fname;
-#ifdef PARAKETTO_FP8
-        fname = (model_version == 3) ? "paraketto-v3-fp8.bin" : "paraketto-fp8.bin";
-#else
         fname = (model_version == 3) ? "paraketto-v3-fp16.bin" : "paraketto-fp16.bin";
-#endif
         std::string url = std::string(hf_base) + "/" + fname;
         ensure_file(weights_path, url.c_str());
     }
 
     Weights prefetched;
-    std::thread prefetch_thread;
-
-    // FP8: read model version from header so config is set before pool allocation
-    void* fp8_prefetch_ptr = nullptr;
-    size_t fp8_prefetch_size = 0;
-#ifdef PARAKETTO_FP8
-    {
-        int fd = open(weights_path.c_str(), O_RDONLY);
-        if (fd >= 0) {
-            char hdr[16];
-            if (read(fd, hdr, 16) == 16
-                    && memcmp(hdr, "PRKTFP8", 7) == 0) {
-                uint32_t model_ver; memcpy(&model_ver, hdr + 12, 4);
-                if (model_ver == 3) {
-                    prefetched.config.version  = 3;
-                    prefetched.config.n_vocab  = 8193;
-                    prefetched.config.d_output = 8198;
-                    prefetched.config.blank_id = 8192;
-                }
-            }
-            close(fd);
-        }
-    }
-#endif
-
     // Prefetch in background while CUDA context inits.
-    prefetch_thread = std::thread([&]() {
-#ifdef PARAKETTO_FP8
-        // Pre-populate FP8 file pages while CUDA init runs
-        int fd = open(weights_path.c_str(), O_RDONLY);
-        if (fd >= 0) {
-            struct stat st; fstat(fd, &st);
-            fp8_prefetch_size = (size_t)st.st_size;
-            fp8_prefetch_ptr = mmap(nullptr, st.st_size, PROT_READ,
-                                    MAP_PRIVATE | MAP_POPULATE, fd, 0);
-            close(fd);
-            if (fp8_prefetch_ptr == MAP_FAILED) {
-                fp8_prefetch_ptr = nullptr;
-                fp8_prefetch_size = 0;
-            } else {
-                madvise(fp8_prefetch_ptr, st.st_size, MADV_SEQUENTIAL);
-            }
-        }
-#else
+    std::thread prefetch_thread([&]() {
         prefetched = Weights::prefetch(weights_path);
-#endif
     });
 
     // Force eager CUDA context initialization (overlaps with weight prefetch)
@@ -211,43 +155,13 @@ int main(int argc, char** argv) {
         if (wav_fd >= 0) { posix_fadvise(wav_fd, 0, 0, POSIX_FADV_WILLNEED); close(wav_fd); }
     }
 
-    if (prefetch_thread.joinable()) prefetch_thread.join();
-
-#ifdef PARAKETTO_FP8
-    // Validate fp8 weights — fail hard if corrupt/stale
-    if (fp8_prefetch_ptr) {
-        bool valid = false;
-        if (fp8_prefetch_size >= FP8_WEIGHTS_HEADER) {
-            auto base = (const uint8_t*)fp8_prefetch_ptr;
-            if (memcmp(base, "PRKTFP8", 7) == 0) {
-                uint32_t ver; memcpy(&ver, base + 8, 4);
-                uint32_t mver; memcpy(&mver, base + 12, 4);
-                valid = (ver == FP8_WEIGHTS_VERSION || ver == FP8_CALIBRATED_VERSION)
-                        && (mver == 2 || mver == 3);
-            }
-        }
-        if (!valid) {
-            munmap(fp8_prefetch_ptr, fp8_prefetch_size);
-            fprintf(stderr, "error: %s is corrupt or has wrong version.\n"
-                            "       Delete it and re-download: rm '%s' && make weights-fp8\n",
-                    weights_path.c_str(), weights_path.c_str());
-            return 1;
-        }
-    }
-#endif
+    prefetch_thread.join();
 
     auto t_prefetch = clk::now();
 
     Pipeline pipeline;
-    pipeline.init(std::move(prefetched), weights_path,
-                  fp8_prefetch_ptr, fp8_prefetch_size);
+    pipeline.init(std::move(prefetched));
     auto t_init_done = clk::now();
-
-    // Clean up FP8 prefetch mapping (data is on GPU now)
-    if (fp8_prefetch_ptr) {
-        munmap(fp8_prefetch_ptr, fp8_prefetch_size);
-        fp8_prefetch_ptr = nullptr;
-    }
 
 #ifdef WITH_CORRECTOR
     Corrector corrector;
@@ -316,10 +230,6 @@ int main(int argc, char** argv) {
         info += "\"version\":" + std::to_string(version) + ",";
         info += "\"backend\":\"" + json_escape(BACKEND_NAME) + "\",";
         info += "\"weights\":\"" + json_escape(weights_path) + "\",";
-#ifdef PARAKETTO_FP8
-        info += "\"activation_scales\":\"";
-        info += pipeline.cuda_model.fp8_embedded_scales ? "embedded\"," : "baked\",";
-#endif
         snprintf(nb, sizeof nb, "%.0f", weights_mb);      info += "\"weights_mb\":" + std::string(nb) + ",";
         info += "\"device\":\"" + json_escape(prop.name) + "\",";
         info += "\"compute\":\"" + std::to_string(prop.major) + "." + std::to_string(prop.minor) + "\",";

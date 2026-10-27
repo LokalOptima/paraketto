@@ -138,17 +138,6 @@ void conv2d_fp16(const half* input, const half* weight, const half* bias,
                  cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
-// im2col for 2D convolution (NCHW format)
-//   input:  [C_in, H_in, W_in]
-//   col:    [C_in*kH*kW, H_out*W_out]  (row-major)
-//   Extracts sliding window patches for use with GEMM-based convolution.
-// ---------------------------------------------------------------------------
-void im2col_2d_fp16(const half* input, half* col,
-                    int C_in, int H_in, int W_in,
-                    int kH, int kW, int stride, int pad,
-                    int H_out, int W_out, cudaStream_t stream);
-
-// ---------------------------------------------------------------------------
 // Row-broadcast bias add: x[i,j] += bias[j] for i in [0,rows), j in [0,cols)
 //   x: [rows, cols] row-major, bias: [cols]
 // ---------------------------------------------------------------------------

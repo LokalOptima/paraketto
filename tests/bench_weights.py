@@ -13,7 +13,6 @@ test. The JSON retains references and hypotheses for inspection.
 import argparse
 import hashlib
 import json
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -22,9 +21,6 @@ from jiwer import wer
 
 from bench_common import ROOT, load_manifest, print_results, server_process, whisper_normalize
 from test_v3_multilingual import multilingual_normalize
-
-sys.path.insert(0, str(ROOT / "scripts"))
-from calibrate_fp8 import audio_sha256
 
 LANGUAGES = {
     "german": "de", "italian": "it", "french": "fr",
@@ -97,8 +93,6 @@ def main():
     parser.add_argument("--datasets", nargs="+", default=DEFAULT_DATASETS)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--port", type=int, default=18140)
-    parser.add_argument("--exclude-calibration", type=Path,
-                        help="Exclude audio-content hashes listed in a calibration report")
     args = parser.parse_args()
     binary = args.binary.resolve()
     baseline_binary = args.baseline_binary.resolve() if args.baseline_binary else binary
@@ -109,26 +103,9 @@ def main():
     for name, manifest in datasets.items():
         if not manifest or not all(Path(e["audio_path"]).is_file() for e in manifest):
             parser.error(f"Empty manifest or missing audio in {name}")
-    excluded = {}
-    if args.exclude_calibration:
-        calibration = json.loads(args.exclude_calibration.read_text())
-        if checksum(args.weights) != calibration["output_sha256"]:
-            parser.error("Candidate weights do not match the calibration report")
-        hashes = {sample["audio_sha256"] for sample in calibration["samples"]}
-        for name, manifest in datasets.items():
-            kept = [entry for entry in manifest if audio_sha256(entry["audio_path"]) not in hashes]
-            excluded[name] = len(manifest) - len(kept)
-            if not kept:
-                parser.error(f"No evaluation clips remain in {name} after calibration exclusion")
-            datasets[name] = kept
-        print(f"Excluded calibration clips by audio content: {excluded}", flush=True)
     report = {"created_at": datetime.now(timezone.utc).isoformat(),
               "binary": str(binary), "binary_sha256": checksum(binary),
               "timing": "Single warmed pass per model; no statistical speed comparison."}
-    if args.exclude_calibration:
-        report["calibration_report"] = str(args.exclude_calibration.resolve())
-        report["calibration_report_sha256"] = checksum(args.exclude_calibration)
-        report["excluded_clips"] = excluded
     args.output.parent.mkdir(parents=True, exist_ok=True)
     for label, weights, backend in (("baseline", args.baseline, baseline_binary),
                                     ("candidate", args.weights, binary)):

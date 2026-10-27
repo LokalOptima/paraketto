@@ -661,53 +661,6 @@ void conv2d_fp16(const half* input, const half* weight, const half* bias,
 }
 
 // ---------------------------------------------------------------------------
-// im2col for 2D convolution (NCHW format)
-// Extracts patches: col[c*kH*kW + kh*kW + kw, oh*W_out + ow] = input[c, oh*s+kh-p, ow*s+kw-p]
-// ---------------------------------------------------------------------------
-
-__global__ void im2col_2d_kernel(const half* __restrict__ input, half* __restrict__ col,
-                                  int C_in, int H_in, int W_in,
-                                  int kH, int kW, int stride, int pad,
-                                  int H_out, int W_out) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int col_rows = C_in * kH * kW;
-    int col_cols = H_out * W_out;
-    int total = col_rows * col_cols;
-    if (idx >= total) return;
-
-    int spatial = idx % col_cols;
-    int patch = idx / col_cols;
-
-    int oh = spatial / W_out;
-    int ow = spatial % W_out;
-
-    int ic = patch / (kH * kW);
-    int kk = patch % (kH * kW);
-    int kh = kk / kW;
-    int kw = kk % kW;
-
-    int ih = oh * stride + kh - pad;
-    int iw = ow * stride + kw - pad;
-
-    half val = __float2half(0.0f);
-    if (ih >= 0 && ih < H_in && iw >= 0 && iw < W_in)
-        val = input[ic * H_in * W_in + ih * W_in + iw];
-
-    col[idx] = val;
-}
-
-void im2col_2d_fp16(const half* input, half* col,
-                    int C_in, int H_in, int W_in,
-                    int kH, int kW, int stride, int pad,
-                    int H_out, int W_out, cudaStream_t stream) {
-    int total = C_in * kH * kW * H_out * W_out;
-    int threads = 256;
-    int blocks = (total + threads - 1) / threads;
-    im2col_2d_kernel<<<blocks, threads, 0, stream>>>(
-        input, col, C_in, H_in, W_in, kH, kW, stride, pad, H_out, W_out);
-}
-
-// ---------------------------------------------------------------------------
 // Per-channel bias + ReLU for NCHW data (in-place)
 // x is [C, spatial] row-major. Adds bias[c] to channel c, applies ReLU.
 // ---------------------------------------------------------------------------

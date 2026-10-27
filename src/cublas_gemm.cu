@@ -165,6 +165,8 @@ static void lt_gemm(cudaStream_t stream,
             col_m, col_n, col_k, &alpha, A, CUDA_R_16F, ldA,
             B, CUDA_R_16F, ldB, &beta, C, CUDA_R_16F, ldC,
             CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        if (bias)
+            bias_add_fp16(C, bias, col_n, col_m, stream);
     }
 }
 

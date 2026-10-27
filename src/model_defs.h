@@ -1,7 +1,4 @@
-// model_defs.h — Shared model constants, config, and Weights struct
-//
-// Included by both conformer.h (FP16) and conformer_fp8.h (FP8) to avoid
-// duplicating the weight layout and model architecture definitions.
+// model_defs.h — Model constants, configuration, and FP16 weight layout
 
 #ifndef MODEL_DEFS_H_
 #define MODEL_DEFS_H_
@@ -21,20 +18,14 @@ namespace paraketto {
 //
 // paraketto-fp16.bin:
 //   uint32 magic   = 0x544B5250 ("PRKT" little-endian)
-//   uint32 version = 2
+//   uint32 version = 2 (V2 English) or 3 (V3 / Ultra multilingual)
 //   [raw FP16 tensor data, 256-byte aligned, fixed order matching source layout]
 //
 // Tensor order and sizes are defined by assign_weight_pointers() in weights.cpp.
 // The file layout IS the GPU layout — a single cudaMemcpy loads the entire file.
 
 static constexpr uint32_t WEIGHTS_MAGIC   = 0x544B5250;  // "PRKT"
-static constexpr uint32_t WEIGHTS_VERSION = 2;
 static constexpr size_t   WEIGHTS_HEADER  = 8;  // magic(4) + version(4)
-
-static constexpr uint32_t FP8_WEIGHTS_VERSION = 2;  // match HF fp8.bin
-// Format 3 appends 218 FP32 activation scales to the format-2 payload.
-static constexpr uint32_t FP8_CALIBRATED_VERSION = 3;
-static constexpr size_t   FP8_WEIGHTS_HEADER  = 16;  // magic(8) + version(4) + model_version(4)
 
 // ---------------------------------------------------------------------------
 // Model constants
@@ -164,17 +155,10 @@ struct Weights {
     // ---------------------------------------------------------------------------
 
     /// Prefetch: mmap paraketto-fp16.bin (CPU only, no CUDA).
-    /// populate=false skips MAP_POPULATE (FP8 path: only GPU layout needed).
-    static Weights prefetch(const std::string& path, bool populate = true);
+    static Weights prefetch(const std::string& path);
 
     /// Upload prefetched data to GPU, assign weight pointers.
     void upload(cudaStream_t stream = nullptr);
-
-    /// FP8 first-run: full layout cudaMalloc + assign pointers (no data upload).
-    void allocate_only();
-
-    /// FP8 steady-state: only non-GEMM weights (~5 MB vs ~1.2 GB full layout).
-    void allocate_nongemm_only();
 
     /// Free the GPU allocation.
     void free();

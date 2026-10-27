@@ -4,7 +4,7 @@ Uses curated FLEURS clips in data/{german,italian,french}/ (same format
 as English benchmarks). Download with: make download-data-v3
 
 Usage:
-    uv run python tests/test_v3_multilingual.py paraketto.fp8
+    uv run python tests/test_v3_multilingual.py paraketto.cuda
 """
 
 import json

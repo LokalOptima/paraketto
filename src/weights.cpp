@@ -1,12 +1,12 @@
-// weights.cpp — Weight loading shared by FP16 and FP8 backends
+// weights.cpp — FP16 weight loading for V2, V3, and Ultra
 //
 // paraketto-fp16.bin format:
 //   uint32 magic   = WEIGHTS_MAGIC (0x544B5250 "PRKT")
-//   uint32 version = WEIGHTS_VERSION (2)
+//   uint32 version = 2 (V2) or 3 (V3 / Ultra)
 //   [raw FP16 tensors, 256-byte aligned, in the fixed order below]
 //
 // The layout defined here IS the file format. No separate index or header.
-// Changing this layout requires regenerating paraketto-fp16.bin (run repack_weights.py).
+// Changing this layout requires a format version change and updated exporters.
 
 #include "model_defs.h"
 #include "common.h"
@@ -19,14 +19,15 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 
-using namespace paraketto;
 #include <unistd.h>
+
+using namespace paraketto;
 
 // ---------------------------------------------------------------------------
 // Weight layout — assigns pointers and computes total GPU allocation size.
 //
 // Tensors are placed in a fixed order with 256-byte alignment between them.
-// This order matches export_weights.py / repack_weights.py exactly.
+// This order matches scripts/weight_format.py exactly.
 // Returns total bytes needed (== file size minus the 8-byte header).
 // ---------------------------------------------------------------------------
 
@@ -111,7 +112,7 @@ static size_t assign_weight_pointers(Weights& w) {
 // Weights::prefetch — mmap paraketto-fp16.bin (CPU only, no CUDA)
 // ---------------------------------------------------------------------------
 
-Weights Weights::prefetch(const std::string& path, bool populate) {
+Weights Weights::prefetch(const std::string& path) {
     Weights w;
 
     int fd = open(path.c_str(), O_RDONLY);
@@ -120,16 +121,19 @@ Weights Weights::prefetch(const std::string& path, bool populate) {
         std::exit(1);
     }
     struct stat st;
-    fstat(fd, &st);
+    if (fstat(fd, &st) != 0 || st.st_size < (off_t)WEIGHTS_HEADER) {
+        fprintf(stderr, "Invalid or truncated weights header: %s\n", path.c_str());
+        close(fd);
+        std::exit(1);
+    }
     size_t file_size = (size_t)st.st_size;
-    int flags = MAP_PRIVATE | (populate ? MAP_POPULATE : 0);
-    void* mapped = mmap(nullptr, file_size, PROT_READ, flags, fd, 0);
+    void* mapped = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0);
     close(fd);
     if (mapped == MAP_FAILED) {
         fprintf(stderr, "mmap failed: %s\n", path.c_str());
         std::exit(1);
     }
-    if (populate) madvise(mapped, file_size, MADV_SEQUENTIAL);
+    madvise(mapped, file_size, MADV_SEQUENTIAL);
 
     // Validate header
     const uint8_t* base = (const uint8_t*)mapped;
@@ -165,7 +169,6 @@ void Weights::upload(cudaStream_t stream) {
 
     // Compute GPU allocation size from layout
     gpu_data_size = assign_weight_pointers(*this);  // gpu_data=null → compute only
-    CUDA_CHECK(cudaMalloc(&gpu_data, gpu_data_size));
 
     // Validate file data size
     size_t expected_file = WEIGHTS_HEADER + gpu_data_size;
@@ -174,6 +177,8 @@ void Weights::upload(cudaStream_t stream) {
                 expected_file, mmap_size);
         std::exit(1);
     }
+
+    CUDA_CHECK(cudaMalloc(&gpu_data, gpu_data_size));
 
     if (stream) {
         CUDA_CHECK(cudaMemcpyAsync(gpu_data, data, gpu_data_size,
@@ -191,94 +196,6 @@ void Weights::upload(cudaStream_t stream) {
     }
 
     assign_weight_pointers(*this);  // assign real pointers into gpu_data
-}
-
-// ---------------------------------------------------------------------------
-// Weights::allocate_only — FP8 first-run path: full layout for quantization
-// ---------------------------------------------------------------------------
-
-void Weights::allocate_only() {
-    gpu_data_size = assign_weight_pointers(*this);  // compute with gpu_data=null
-    CUDA_CHECK(cudaMalloc(&gpu_data, gpu_data_size));
-
-    if (mmap_ptr) {
-        munmap(mmap_ptr, mmap_size);
-        mmap_ptr  = nullptr;
-        mmap_size = 0;
-    }
-
-    assign_weight_pointers(*this);  // assign pointers into gpu_data
-}
-
-// ---------------------------------------------------------------------------
-// Non-GEMM weight layout — only weights used at runtime in the FP8 path.
-//
-// The FP8 path replaces all large GEMM matrices with FP8 quantized versions
-// (stored in fp8_pool). Only LayerNorm, biases, depthwise conv, embeddings,
-// and the small decoder GEMM weights (dec_proj, out_proj) are needed in FP16.
-// This is ~5 MB vs ~1.2 GB for the full layout.
-// ---------------------------------------------------------------------------
-
-static size_t assign_nongemm_weight_pointers(Weights& w) {
-    uint8_t* base = (uint8_t*)w.gpu_data;
-    size_t off = 0;
-
-    auto take = [&](half*& ptr, size_t n) {
-        off = (off + 255) & ~(size_t)255;
-        if (base) ptr = (half*)(base + off);
-        off += n * sizeof(half);
-    };
-
-    // Sub-conv weights (FP16 subsampling GEMMs — too small for FP8)
-    for (int i : {0, 2, 3, 5, 6}) {
-        size_t wn = (i == 3 || i == 6) ? (size_t)SUB_CHANNELS * SUB_CHANNELS
-                                        : SUB_CHANNELS * 9;
-        take(w.sub_conv[i].weight, wn);
-        take(w.sub_conv[i].bias,   SUB_CHANNELS);
-    }
-    take(w.sub_out_b, D_MODEL);  // bias only; sub_out_w uses FP8
-
-    // Per-block non-GEMM weights: LN, biases, depthwise conv, pos_bias
-    for (int i = 0; i < N_BLOCKS; i++) {
-        auto& blk = w.blocks[i];
-        take(blk.ff1_ln_w,   D_MODEL);  take(blk.ff1_ln_b,   D_MODEL);
-        take(blk.mhsa_ln_w,  D_MODEL);  take(blk.mhsa_ln_b,  D_MODEL);
-        take(blk.pos_bias_u, (size_t)N_HEADS * HEAD_DIM);
-        take(blk.pos_bias_v, (size_t)N_HEADS * HEAD_DIM);
-        take(blk.conv_ln_w,  D_MODEL);  take(blk.conv_ln_b,  D_MODEL);
-        take(blk.conv_dw_w,  (size_t)D_MODEL * CONV_K);
-        take(blk.conv_dw_b,  D_MODEL);
-        take(blk.ff2_ln_w,   D_MODEL);  take(blk.ff2_ln_b,   D_MODEL);
-        take(blk.final_ln_w, D_MODEL);  take(blk.final_ln_b, D_MODEL);
-    }
-
-    // Decoder weights (FP16 GEMMs — cublasLt FP8 doesn't support N=1)
-    take(w.embed_w,    (size_t)w.config.n_vocab * D_PRED);
-    take(w.dec_proj_w, (size_t)D_PRED  * D_JOINT);
-    take(w.dec_proj_b, D_JOINT);
-    take(w.out_proj_w, (size_t)D_JOINT * w.config.d_output);
-    take(w.out_proj_b, w.config.d_output);
-    take(w.enc_proj_b, D_JOINT);
-
-    off = (off + 255) & ~(size_t)255;
-    return off;
-}
-
-// ---------------------------------------------------------------------------
-// Weights::allocate_nongemm_only — FP8 steady-state: only non-GEMM weights
-// ---------------------------------------------------------------------------
-
-void Weights::allocate_nongemm_only() {
-    gpu_data_size = assign_nongemm_weight_pointers(*this);
-    CUDA_CHECK(cudaMalloc(&gpu_data, gpu_data_size));
-
-    if (mmap_ptr) {
-        munmap(mmap_ptr, mmap_size);
-        mmap_ptr  = nullptr;
-        mmap_size = 0;
-    }
-
-    assign_nongemm_weight_pointers(*this);
 }
 
 // ---------------------------------------------------------------------------

@@ -3,17 +3,13 @@
 // Usage:
 //   #include "paraketto.h"
 //   paraketto::Pipeline stt;
-//   auto w = paraketto::Weights::prefetch("~/.cache/paraketto/paraketto-fp8.bin");
+//   auto w = paraketto::Weights::prefetch("/path/to/paraketto-fp16.bin");
 //   stt.init(std::move(w));
 //   std::string text = stt.transcribe(samples, n_samples);
 
 #pragma once
 
-#ifdef PARAKETTO_FP8
-#include "conformer_fp8.h"  // CudaModel (FP8 variant), Weights, model constants
-#else
 #include "conformer.h"      // CudaModel, Weights, model constants
-#endif
 #include "common.h"      // CUDA_CHECK, mel constants
 #include "wav.h"         // read_wav, WavData
 #include "mel.h"         // MelSpec
@@ -86,27 +82,15 @@ struct Pipeline {
     MelSpec mel;
     cudaStream_t stream = nullptr;
 
-    void init(Weights&& prefetched,
-              const std::string& weights_path = "",
-              const void* fp8_prefetch = nullptr,
-              size_t fp8_prefetch_size = 0) {
+    void init(Weights&& prefetched) {
         CUDA_CHECK(cudaStreamCreate(&stream));
         weights = std::move(prefetched);
 
-#ifdef PARAKETTO_FP8
-        weights.allocate_nongemm_only();
-#else
         weights.upload(stream);
-#endif
 
         mel.init();
 
-#ifdef PARAKETTO_FP8
-        cuda_model.init(weights, stream, MAX_MEL_FRAMES,
-                        weights_path.c_str(), fp8_prefetch, fp8_prefetch_size);
-#else
         cuda_model.init(weights, stream, MAX_MEL_FRAMES);
-#endif
     }
 
     ~Pipeline() {

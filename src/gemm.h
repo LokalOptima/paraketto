@@ -4,8 +4,8 @@
 //   NN: Y[m,n] = X[m,k] @ W[k,n]
 //   NT: Y[m,n] = X[m,k] @ W[n,k]^T
 //
-// Build with -DUSE_CUBLAS to select cuBLAS backend (links -lcublas).
-// Default is CUTLASS (header-only, no extra runtime deps).
+// Link cutlass_gemm.o (default, cudart only) or cublas_gemm.o
+// (links -lcublas and -lcublasLt) to select the backend.
 
 #pragma once
 

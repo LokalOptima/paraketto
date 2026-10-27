@@ -24,7 +24,7 @@ from pathlib import Path
 import numpy as np
 from safetensors import safe_open
 
-from export_weights import MAGIC, TENSOR_ALIGN, align_up, tensor_order
+from weight_format import MAGIC, TENSOR_ALIGN, align_up, tensor_order
 
 ROOT = Path(__file__).resolve().parent.parent
 BATCH_NORM_EPS = 1e-5  # Transformers ParakeetEncoderConvolutionModule / BatchNorm1d
@@ -198,7 +198,7 @@ def export_weights(source: Path, output: Path) -> None:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
     print(f"Wrote {output}: {output.stat().st_size:,} bytes, PRKT V3 FP16")
-    print("V3 vocabulary verified; auxiliary VAD omitted. No FP8 calibration is needed for FP16.")
+    print("V3 vocabulary verified; auxiliary VAD omitted. FP16 needs no calibration.")
 
 
 def main():

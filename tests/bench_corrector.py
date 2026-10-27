@@ -1,7 +1,7 @@
 """Benchmark paraketto with LLM corrector: WER and RTFx.
 
 Usage:
-    uv run python tests/bench_corrector.py paraketto.fp8
+    uv run python tests/bench_corrector.py paraketto.cuda
 """
 
 import sys

@@ -3,7 +3,7 @@
 Reuses the identical multilingual normalizer + server harness as the FLEURS
 bench (test_v3_multilingual), so numbers are directly comparable.
 
-Usage: uv run python tests/test_cv_sample.py paraketto.fp8
+Usage: uv run python tests/test_cv_sample.py paraketto.cuda
 """
 import sys
 from pathlib import Path
@@ -52,7 +52,7 @@ def main(binary: Path, port: int = 18091) -> None:
 
 
 if __name__ == "__main__":
-    binary = ROOT / (sys.argv[1] if len(sys.argv) > 1 else "paraketto.fp8")
+    binary = ROOT / (sys.argv[1] if len(sys.argv) > 1 else "paraketto.cuda")
     if not binary.exists():
         print(f"Binary not found: {binary}", file=sys.stderr)
         sys.exit(1)

@@ -1,12 +1,12 @@
 """Measure startup time for each paraketto binary (cold + warm).
 
-Drops page caches between cold runs (requires sudo), then measures warm
-runs without cache drops. Reports min/median/max for each.
+Requests eviction of the weight file from page cache between cold runs,
+then measures warm runs without eviction. Reports min/median/max for each.
 
 Usage:
     uv run python tests/bench_startup.py [--runs N] [--binaries BIN,...]
     uv run python tests/bench_startup.py --runs 5
-    uv run python tests/bench_startup.py --binaries paraketto.fp8
+    uv run python tests/bench_startup.py --binaries paraketto.cuda
 """
 
 import argparse
@@ -20,10 +20,11 @@ from statistics import median
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
 
-ALL_BINARIES = ["paraketto.cuda", "paraketto.cublas", "paraketto.fp8"]
+ALL_BINARIES = ["paraketto.cuda", "paraketto.cublas"]
 
 # Weight files to evict from page cache for cold runs
-WEIGHT_FILES = ["paraketto-fp16.bin", "paraketto-fp8.bin"]
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "paraketto"
+WEIGHTS = CACHE_DIR / "paraketto-fp16.bin"
 
 STARTUP_RE = re.compile(
     r"startup:\s+(\d+)ms\s+\(cuda=(\d+)\s+prefetch=(\d+)\s+load=(\d+)\)"
@@ -37,13 +38,10 @@ def find_wav() -> Path:
 
 
 def evict_weight_caches() -> None:
-    """Evict weight files from OS page cache using POSIX_FADV_DONTNEED (no sudo)."""
-    for name in WEIGHT_FILES:
-        path = ROOT / name
-        if path.exists():
-            fd = os.open(str(path), os.O_RDONLY)
-            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-            os.close(fd)
+    """Evict the default V2 weight file using POSIX_FADV_DONTNEED (no sudo)."""
+    if WEIGHTS.exists():
+        with WEIGHTS.open("rb") as weights:
+            os.posix_fadvise(weights.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
 
 
 def measure_one(binary: Path, wav: Path) -> dict | None:

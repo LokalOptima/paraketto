@@ -8,7 +8,7 @@
 // Build: nvcc -std=c++17 -arch=sm_80 -O3 -I../third_party/cutlass/include \
 //        --expt-relaxed-constexpr -c cutlass_gemm.cu -o cutlass_gemm.o
 
-#include "cutlass_gemm.h"
+#include "gemm.h"
 #include "common.h"
 #include "kernels.h"  // for bias_add_fp16
 
@@ -100,19 +100,6 @@ using GemmSplitKNN_128x64_32_s5 = cutlass::gemm::device::GemmSplitKParallel<
     cutlass::gemm::GemmShape<16, 8, 16>,
     Epilogue<8>>;
 
-// --- NN tiles for FF linear2 at medium T ---
-
-using GemmNN_128x64_k32_s5 = cutlass::gemm::device::Gemm<
-    cutlass::half_t, cutlass::layout::ColumnMajor,
-    cutlass::half_t, cutlass::layout::ColumnMajor,
-    cutlass::half_t, cutlass::layout::ColumnMajor,
-    cutlass::half_t,
-    cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
-    cutlass::gemm::GemmShape<128, 64, 32>,
-    cutlass::gemm::GemmShape<64, 32, 32>,
-    cutlass::gemm::GemmShape<16, 8, 16>,
-    Epilogue<8>, Swizzle, 5, 8, 8>;
-
 // 64x128 tile (T=241-448: tied or better than 128x64)
 using GemmNN_64x128_k32_s5 = cutlass::gemm::device::Gemm<
     cutlass::half_t, cutlass::layout::ColumnMajor,
@@ -178,7 +165,7 @@ using BatchedNN_64x64_64_s6 = cutlass::gemm::device::GemmBatched<
     Epilogue<8>, BatchSwizzle, 6, 8, 8>;
 
 // NN batched, mixed: A 8-aligned, B 1-aligned, epilogue 8-aligned, stages=2
-// For weighted_sum when T is odd: ldA=HEAD_DIM(64), ldB=T(odd), ldC=HEAD_DIM(64)
+// For weighted_sum when T is odd: ldA=HEAD_DIM(128), ldB=T(odd), ldC=HEAD_DIM(128)
 using BatchedNN_64x64_32_s2_a8b1 = cutlass::gemm::device::GemmBatched<
     cutlass::half_t, cutlass::layout::ColumnMajor,
     cutlass::half_t, cutlass::layout::ColumnMajor,
@@ -203,7 +190,7 @@ using BatchedTN_64x64_64_s6 = cutlass::gemm::device::GemmBatched<
     Epilogue<8>, BatchSwizzle, 6, 8, 8>;
 
 // TN batched, mixed: inputs 8-aligned, epilogue 1-aligned, stages=6
-// For content_scores/pos_scores: input lds always 8-aligned (HEAD_DIM=64, D_MODEL=1024)
+// For content_scores/pos_scores: input lds always 8-aligned (HEAD_DIM=128, D_MODEL=1024)
 // but output ld=T or 2T-1 may be odd. Full pipeline speed with scalar epilogue stores.
 using BatchedTN_64x64_64_s6_e1 = cutlass::gemm::device::GemmBatched<
     cutlass::half_t, cutlass::layout::RowMajor,
@@ -217,19 +204,19 @@ using BatchedTN_64x64_64_s6_e1 = cutlass::gemm::device::GemmBatched<
     Epilogue<1>, BatchSwizzle, 6, 8, 8>;
 
 // =========================================================================
-// Workspace (for split-K if needed in the future)
+// Workspace for split-K GEMMs
 // =========================================================================
 
 static void* s_workspace = nullptr;
 static size_t s_workspace_size = 0;
 
-void cutlass_gemm_init(cudaStream_t) {
+void gemm_init(cudaStream_t) {
     // Split-K workspace: 128x128 tile, sk=4, T=800: 1024*800*2*4 = 6.5MB. 32MB is safe.
     s_workspace_size = 32 * 1024 * 1024;
     CUDA_CHECK(cudaMalloc(&s_workspace, s_workspace_size));
 }
 
-void cutlass_gemm_free() {
+void gemm_free() {
     if (s_workspace) { cudaFree(s_workspace); s_workspace = nullptr; }
 }
 
@@ -478,13 +465,13 @@ static void tn_dispatch(cudaStream_t stream,
 static const half HALF_ONE = __float2half(1.0f);
 static const half HALF_ZERO = __float2half(0.0f);
 
-void cutlass_gemm_nn(cudaStream_t stream,
+void gemm_nn(cudaStream_t stream,
                      const half* X, int m, int k,
                      const half* W, int n, half* Y) {
     nn_dispatch(stream, X, m, k, W, n, Y, HALF_ONE, HALF_ZERO);
 }
 
-void cutlass_gemm_nn_bias(cudaStream_t stream,
+void gemm_nn_bias(cudaStream_t stream,
                           const half* X, int m, int k,
                           const half* W, int n,
                           const half* bias, half* Y) {
@@ -492,13 +479,13 @@ void cutlass_gemm_nn_bias(cudaStream_t stream,
     bias_add_fp16(Y, bias, m, n, stream);
 }
 
-void cutlass_gemm_nt(cudaStream_t stream,
+void gemm_nt(cudaStream_t stream,
                      const half* X, int m, int k,
                      const half* W, int n, half* Y) {
     tn_dispatch(stream, X, m, k, W, n, Y, HALF_ONE, HALF_ZERO);
 }
 
-void cutlass_gemm_nt_bias(cudaStream_t stream,
+void gemm_nt_bias(cudaStream_t stream,
                           const half* X, int m, int k,
                           const half* W, int n,
                           const half* bias, half* Y) {
@@ -511,7 +498,7 @@ void cutlass_gemm_nt_bias(cudaStream_t stream,
 // =========================================================================
 
 
-void cutlass_batched_gemm_nn(cudaStream_t stream,
+void batched_gemm_nn(cudaStream_t stream,
                              const half* A, const half* B, half* C,
                              int batch, int m, int n, int k,
                              long long strideA, long long strideB, long long strideC) {
@@ -525,14 +512,14 @@ void cutlass_batched_gemm_nn(cudaStream_t stream,
             B, ldA_c, strideB, A, ldB_c, strideA, C, ldC_c, strideC,
             batch, HALF_ONE, HALF_ZERO, stream);
     else
-        // Mixed: A(ldA_c=HEAD_DIM=64) always 8-aligned, C(ldC_c=64) 8-aligned
+        // Mixed: A(ldA_c=HEAD_DIM=128) always 8-aligned, C(ldC_c=128) 8-aligned
         // Only B(ldB_c=T) may be unaligned → stages=2, AlignmentA=8, AlignmentB=1
         run_batched_gemm<BatchedNN_64x64_32_s2_a8b1>(col_m, col_n, col_k,
             B, ldA_c, strideB, A, ldB_c, strideA, C, ldC_c, strideC,
             batch, HALF_ONE, HALF_ZERO, stream);
 }
 
-void cutlass_batched_gemm_nt(cudaStream_t stream,
+void batched_gemm_nt(cudaStream_t stream,
                              const half* A, const half* B, half* C,
                              int batch, int m, int n, int k,
                              long long strideA, long long strideB, long long strideC) {
@@ -546,14 +533,14 @@ void cutlass_batched_gemm_nt(cudaStream_t stream,
             B, ldA_c, strideB, A, ldB_c, strideA, C, ldC_c, strideC,
             batch, HALF_ONE, HALF_ZERO, stream);
     else
-        // Mixed: inputs always 8-aligned (ld=HEAD_DIM=64), only output ld=T may be odd
+        // Mixed: inputs always 8-aligned (ld=HEAD_DIM=128), only output ld=T may be odd
         // → full pipeline stages=6 with scalar epilogue
         run_batched_gemm<BatchedTN_64x64_64_s6_e1>(col_m, col_n, col_k,
             B, ldA_c, strideB, A, ldB_c, strideA, C, ldC_c, strideC,
             batch, HALF_ONE, HALF_ZERO, stream);
 }
 
-void cutlass_batched_gemm_nt_ex(cudaStream_t stream,
+void batched_gemm_nt_ex(cudaStream_t stream,
                                 const half* A, int ldA, long long strideA,
                                 const half* B, int ldB, long long strideB,
                                 half* C, int ldC, long long strideC,
@@ -571,38 +558,5 @@ void cutlass_batched_gemm_nt_ex(cudaStream_t stream,
             B, ldB, strideB, A, ldA, strideA, C, ldC, strideC,
             batch, HALF_ONE, HALF_ZERO, stream);
 }
-
-// =========================================================================
-// gemm.h unified interface — forward to cutlass_* functions
-// =========================================================================
-
-#include "gemm.h"
-
-void gemm_init(cudaStream_t stream)   { cutlass_gemm_init(stream); }
-void gemm_free()                      { cutlass_gemm_free(); }
-
-void gemm_nn(cudaStream_t s, const half* X, int m, int k, const half* W, int n, half* Y)
-    { cutlass_gemm_nn(s, X, m, k, W, n, Y); }
-void gemm_nn_bias(cudaStream_t s, const half* X, int m, int k, const half* W, int n, const half* bias, half* Y)
-    { cutlass_gemm_nn_bias(s, X, m, k, W, n, bias, Y); }
-void gemm_nt(cudaStream_t s, const half* X, int m, int k, const half* W, int n, half* Y)
-    { cutlass_gemm_nt(s, X, m, k, W, n, Y); }
-void gemm_nt_bias(cudaStream_t s, const half* X, int m, int k, const half* W, int n, const half* bias, half* Y)
-    { cutlass_gemm_nt_bias(s, X, m, k, W, n, bias, Y); }
-
-void batched_gemm_nn(cudaStream_t s, const half* A, const half* B, half* C,
-                     int batch, int m, int n, int k,
-                     long long sA, long long sB, long long sC)
-    { cutlass_batched_gemm_nn(s, A, B, C, batch, m, n, k, sA, sB, sC); }
-void batched_gemm_nt(cudaStream_t s, const half* A, const half* B, half* C,
-                     int batch, int m, int n, int k,
-                     long long sA, long long sB, long long sC)
-    { cutlass_batched_gemm_nt(s, A, B, C, batch, m, n, k, sA, sB, sC); }
-void batched_gemm_nt_ex(cudaStream_t s,
-                        const half* A, int ldA, long long sA,
-                        const half* B, int ldB, long long sB,
-                        half* C, int ldC, long long sC,
-                        int batch, int m, int n, int k)
-    { cutlass_batched_gemm_nt_ex(s, A, ldA, sA, B, ldB, sB, C, ldC, sC, batch, m, n, k); }
 
 } // namespace paraketto

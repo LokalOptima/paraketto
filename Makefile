@@ -5,10 +5,9 @@ NVCC_IN_PATH := $(shell command -v nvcc 2>/dev/null)
 CUDA_HOME    ?= $(or $(CUDA_LATEST),$(patsubst %/bin/nvcc,%,$(NVCC_IN_PATH)),/usr/local/cuda)
 
 # GPU arch: auto-detected from the installed GPU (e.g. 12.0 -> sm_120).
-# Override with ARCH=sm_XX. The FP8 backend needs Blackwell (sm_120a).
+# Override with ARCH=sm_XX.
 GPU_CC   := $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '.')
 ARCH     ?= $(if $(GPU_CC),sm_$(GPU_CC),sm_120)
-ARCH_FP8 ?= sm_120a
 
 CXX      = g++
 NVCC     = $(CUDA_HOME)/bin/nvcc
@@ -17,9 +16,10 @@ NVFLAGS  = -std=c++17 -O3 -I$(CUDA_HOME)/include -Isrc --expt-relaxed-constexpr
 HF_BASE     = https://huggingface.co/localoptima/paraketto/resolve/main
 WEIGHTS_DIR = $(or $(XDG_CACHE_HOME),$(HOME)/.cache)/paraketto
 WEIGHTS     = $(WEIGHTS_DIR)/paraketto-fp16.bin
-WEIGHTS_FP8 = $(WEIGHTS_DIR)/paraketto-fp8.bin
 
-.PHONY: bench-all bench-cuda bench-cublas bench-fp8 bench-corrector weights weights-fp8 download-data download-weights check-weights check-weights-fp8 clean llama-libs
+.DEFAULT_GOAL := paraketto.cuda
+
+.PHONY: bench-all bench-cuda bench-cublas bench-corrector bench-v3 weights weights-export download-data download-data-v3 download-weights check-weights repack clean llama-libs
 
 # ---------------------------------------------------------------------------
 # LLM corrector (opt-in via WITH_CORRECTOR=1)
@@ -70,15 +70,6 @@ check-weights: $(WEIGHTS)
 		exit 1; \
 	fi
 
-# Verify PRKTFP8 format 2 (baked scales) or 3 (embedded activation scales).
-check-weights-fp8: $(WEIGHTS_FP8)
-	@m=$$(od -An -tx1 -N7 $(WEIGHTS_FP8) | tr -d ' '); \
-	v=$$(od -An -td4 -N4 -j8 $(WEIGHTS_FP8) | tr -d ' '); \
-	if [ "$$m" != "50524b54465038" ] || { [ "$$v" != "2" ] && [ "$$v" != "3" ]; }; then \
-		echo "ERROR: paraketto-fp8.bin has invalid header (magic=$$m, version=$$v). Delete and re-run to regenerate."; \
-		exit 1; \
-	fi
-
 # Download benchmark data from HuggingFace
 data/librispeech/manifest.json:
 	@echo "Downloading benchmark data..."
@@ -104,25 +95,16 @@ $(WEIGHTS):
 	@wget -q --show-progress -O $@ $(HF_BASE)/paraketto-fp16.bin
 	@echo "Downloaded $@ ($$(du -h $@ | cut -f1))"
 
-$(WEIGHTS_FP8):
-	@mkdir -p $(WEIGHTS_DIR)
-	@echo "Downloading paraketto-fp8.bin..."
-	@wget -q --show-progress -O $@ $(HF_BASE)/paraketto-fp8.bin
-	@echo "Downloaded $@ ($$(du -h $@ | cut -f1))"
-
 download-weights: $(WEIGHTS)
 weights: $(WEIGHTS)
-weights-fp8: $(WEIGHTS_FP8)
 
 BENCH_SEP = @printf '\n%s\n%s\n%s\n' '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━' '  $(1)'
 
-bench-all: paraketto.cuda paraketto.cublas paraketto.fp8 data/librispeech/manifest.json $(WEIGHTS) check-weights
+bench-all: paraketto.cuda paraketto.cublas data/librispeech/manifest.json $(WEIGHTS) check-weights
 	$(call BENCH_SEP,C++ CUDA · paraketto_cuda.cpp + CUTLASS FP16)
 	@uv run python tests/bench_native.py paraketto.cuda
 	$(call BENCH_SEP,C++ cuBLAS · paraketto_cuda.cpp + cuBLAS FP16)
 	@uv run python tests/bench_native.py paraketto.cublas
-	$(call BENCH_SEP,C++ FP8  · paraketto_cuda.cpp + CUTLASS FP8)
-	@uv run python tests/bench_native.py paraketto.fp8
 
 bench-cuda: paraketto.cuda data/librispeech/manifest.json $(WEIGHTS) check-weights
 	uv run python tests/bench_native.py paraketto.cuda
@@ -130,24 +112,21 @@ bench-cuda: paraketto.cuda data/librispeech/manifest.json $(WEIGHTS) check-weigh
 bench-cublas: paraketto.cublas data/librispeech/manifest.json $(WEIGHTS) check-weights
 	uv run python tests/bench_native.py paraketto.cublas
 
-bench-fp8: paraketto.fp8 data/librispeech/manifest.json $(WEIGHTS_FP8) check-weights-fp8
-	uv run python tests/bench_native.py paraketto.fp8
+bench-corrector: paraketto.cuda data/librispeech/manifest.json $(WEIGHTS)
+	uv run python tests/bench_corrector.py paraketto.cuda
 
-bench-corrector: paraketto.fp8 data/librispeech/manifest.json $(WEIGHTS_FP8)
-	uv run python tests/bench_corrector.py paraketto.fp8
-
-bench-v3: paraketto.fp8 data/german/manifest.json
-	uv run python tests/test_v3_multilingual.py paraketto.fp8
+bench-v3: paraketto.cuda data/german/manifest.json
+	uv run python tests/test_v3_multilingual.py paraketto.cuda
 
 # Re-generate weights from ONNX (only needed if export script changes)
 weights-export: scripts/export_weights.py
 	uv run python scripts/export_weights.py
 
 # C++ / CUDA build
-src/kernels.o: src/kernels.cu src/kernels.h
+src/kernels.o: src/kernels.cu src/kernels.h src/common.h
 	$(NVCC) $(NVFLAGS) -arch=$(ARCH) -c $< -o $@
 
-SHARED_HEADERS = src/common.h src/wav.h src/mel.h src/vocab.h src/server.h
+SHARED_HEADERS = src/paraketto.h src/common.h src/wav.h src/mel.h src/vocab.h src/server.h
 
 # Shared CUDA backend flags
 CUDA_CXXFLAGS = -std=c++17 -O3 -march=native -flto=auto -Wno-deprecated-declarations -I$(CUDA_HOME)/include -Ithird_party -Isrc
@@ -165,42 +144,25 @@ src/corrector.o: src/corrector.cpp src/corrector.h $(CORRECTOR_DEP)
 	$(CXX) $(CUDA_CXXFLAGS) $(CORRECTOR_CFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 endif
 
-CONFORMER_DEPS = src/paraketto_cuda.cpp src/conformer.cpp src/conformer.h src/conformer_base.cpp src/conformer_base.h src/model_defs.h src/kernels.h src/gemm.h $(SHARED_HEADERS)
+CONFORMER_DEPS = src/paraketto_cuda.cpp src/conformer.cpp src/conformer.h src/model_defs.h src/kernels.h src/gemm.h $(SHARED_HEADERS)
 
 # CUTLASS GEMM backend (default — no cuBLAS dependency, cudart only)
-src/cutlass_gemm.o: src/cutlass_gemm.cu src/cutlass_gemm.h src/gemm.h src/kernels.h | third_party/cutlass/include
+src/cutlass_gemm.o: src/cutlass_gemm.cu src/gemm.h src/kernels.h src/common.h | third_party/cutlass/include
 	$(NVCC) $(NVFLAGS) -arch=$(ARCH) $(CUTLASS_INC) -c $< -o $@
 
-paraketto.cuda: $(CONFORMER_DEPS) src/weights.o src/kernels.o src/cutlass_gemm.o src/cutlass_gemm.h $(CORRECTOR_OBJ)
-	$(CXX) $(CUDA_CXXFLAGS) $(CORRECTOR_CFLAGS) -DBACKEND_NAME='"CUTLASS FP16"' src/paraketto_cuda.cpp src/conformer.cpp src/conformer_base.cpp src/weights.o src/kernels.o src/cutlass_gemm.o $(CORRECTOR_OBJ) $(CUDA_LDFLAGS) $(CORRECTOR_LDFLAGS) -o $@
+paraketto.cuda: $(CONFORMER_DEPS) src/weights.o src/kernels.o src/cutlass_gemm.o $(CORRECTOR_OBJ)
+	$(CXX) $(CUDA_CXXFLAGS) $(CORRECTOR_CFLAGS) -DBACKEND_NAME='"CUTLASS FP16"' src/paraketto_cuda.cpp src/conformer.cpp src/weights.o src/kernels.o src/cutlass_gemm.o $(CORRECTOR_OBJ) $(CUDA_LDFLAGS) $(CORRECTOR_LDFLAGS) -o $@
 
 # cuBLAS GEMM backend (faster on some shapes, requires libcublas)
-src/cublas_gemm.o: src/cublas_gemm.cu src/gemm.h src/kernels.h
+src/cublas_gemm.o: src/cublas_gemm.cu src/gemm.h src/kernels.h src/common.h
 	$(NVCC) $(NVFLAGS) -arch=$(ARCH) -c $< -o $@
 
 paraketto.cublas: $(CONFORMER_DEPS) src/weights.o src/kernels.o src/cublas_gemm.o $(CORRECTOR_OBJ)
-	$(CXX) $(CUDA_CXXFLAGS) $(CORRECTOR_CFLAGS) -DBACKEND_NAME='"cuBLAS FP16"' src/paraketto_cuda.cpp src/conformer.cpp src/conformer_base.cpp src/weights.o src/kernels.o src/cublas_gemm.o $(CORRECTOR_OBJ) $(CUDA_LDFLAGS) -lcublas -lcublasLt $(CORRECTOR_LDFLAGS) -o $@
-
-# FP8 cublasLt backend
-src/kernels_fp8.o: src/kernels_fp8.cu src/kernels_fp8.h
-	$(NVCC) $(NVFLAGS) -arch=$(ARCH_FP8) -c $< -o $@
-
-src/cutlass_gemm_fp8.o: src/cutlass_gemm_fp8.cu src/cutlass_gemm_fp8.h src/common.h | third_party/cutlass/include
-	$(NVCC) $(NVFLAGS) -arch=$(ARCH) $(CUTLASS_INC) -c $< -o $@
-
-src/conformer_fp8.o: src/conformer_fp8.cpp src/conformer_fp8.h src/conformer_base.h src/model_defs.h src/kernels.h src/kernels_fp8.h src/cutlass_gemm_fp8.h src/cutlass_gemm.h
-	$(CXX) $(CUDA_CXXFLAGS) -I$(CUDA_HOME)/include -c $< -o $@
-
-paraketto.fp8: src/paraketto_cuda.cpp src/conformer_fp8.h src/conformer_base.cpp src/conformer_base.h src/model_defs.h src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o src/cutlass_gemm.o src/cutlass_gemm_fp8.o $(SHARED_HEADERS) $(CORRECTOR_OBJ)
-	$(CXX) $(CUDA_CXXFLAGS) $(CORRECTOR_CFLAGS) -DBACKEND_NAME='"CUTLASS FP8 (E4M3)"' -DPARAKETTO_FP8=1 src/paraketto_cuda.cpp src/conformer_base.cpp src/conformer_fp8.o src/weights.o src/kernels.o src/kernels_fp8.o src/cutlass_gemm.o src/cutlass_gemm_fp8.o $(CORRECTOR_OBJ) $(CUDA_LDFLAGS) $(CORRECTOR_LDFLAGS) -o $@
-
-# Generate paraketto-fp8.bin from paraketto-fp16.bin (offline quantization)
-generate-fp8: $(WEIGHTS)
-	uv run python scripts/generate_fp8_weights.py $(WEIGHTS) $(WEIGHTS_FP8)
+	$(CXX) $(CUDA_CXXFLAGS) $(CORRECTOR_CFLAGS) -DBACKEND_NAME='"cuBLAS FP16"' src/paraketto_cuda.cpp src/conformer.cpp src/weights.o src/kernels.o src/cublas_gemm.o $(CORRECTOR_OBJ) $(CUDA_LDFLAGS) -lcublas -lcublasLt $(CORRECTOR_LDFLAGS) -o $@
 
 # Convert existing weight files to current format (run once after updating)
 repack: $(WEIGHTS)
-	uv run python scripts/repack_weights.py
+	uv run python scripts/repack_weights.py $(WEIGHTS)
 
 bench_gemm: tests/bench_gemm.cu
 	$(NVCC) $(NVFLAGS) -arch=$(ARCH) $(CUTLASS_INC) tests/bench_gemm.cu -lcublas -lcublasLt -o $@
@@ -214,13 +176,16 @@ bench_tiles: tests/bench_tiles.cu
 bench_ff2: tests/bench_ff2.cu
 	$(NVCC) $(NVFLAGS) -arch=$(ARCH) $(CUTLASS_INC) tests/bench_ff2.cu -lcublas -lcublasLt -o $@
 
-bench_fp8_cutlass: tests/bench_fp8_cutlass.cu
-	$(NVCC) $(NVFLAGS) -arch=$(ARCH_FP8) $(CUTLASS_INC) -Ithird_party/cutlass/examples/common tests/bench_fp8_cutlass.cu -lcublas -lcublasLt -o $@
+.PHONY: test-cublas-fallback
+test-cublas-fallback: scratch/test_cublas_fallback
+	./scratch/test_cublas_fallback
 
-bench_fp8_tiles: tests/bench_fp8_tiles.cu
-	$(NVCC) $(NVFLAGS) -arch=$(ARCH) $(CUTLASS_INC) tests/bench_fp8_tiles.cu -lcublas -lcublasLt -o $@
+scratch/test_cublas_fallback: tests/test_cublas_fallback.cpp src/cublas_gemm.o src/kernels.o src/gemm.h src/common.h
+	mkdir -p scratch
+	$(CXX) $(CUDA_CXXFLAGS) $< src/cublas_gemm.o src/kernels.o $(CUDA_LDFLAGS) -lcublas -lcublasLt -Wl,--wrap=cublasLtMatmulAlgoGetHeuristic -o $@
 
 clean:
-	rm -f paraketto.cuda paraketto.cublas paraketto.static paraketto.fp8 paraketto.fp8.static paraketto.fp8.baseline
-	rm -f bench_ff2 bench_fp8 bench_gemm bench_splitk bench_tiles
+	rm -f paraketto.cuda paraketto.cublas
+	rm -f bench_ff2 bench_gemm bench_splitk bench_tiles
 	rm -f src/*.o
+	rm -f scratch/test_cublas_fallback

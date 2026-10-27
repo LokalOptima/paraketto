@@ -2324,3 +2324,69 @@ Integration checks also confirmed that deliberately changing all initial static
 scales to 1,000 leaves dynamic-calibration observations and transcripts exactly
 unchanged. The loader rejected truncated files and zero/NaN scale entries, and
 the final FP8 executable's checksum matches the binary used for the benchmark.
+
+
+## Keep main FP16-only and prune unused CUDA code (2026-10-27)
+
+FP8 inference, Ultra calibration/conversion, and the isolated kernel experiments
+are preserved on `fp8-ultra` at `a375d16`. The older `fp8` branch remains intact.
+The experiments did not establish a transcription-speed advantage on the
+RTX 5070 Ti, so main now keeps the CUTLASS and cuBLAS FP16 backends, including
+V2, V3, and the Ultra converter. Historical FP8 entries above describe the
+experimental branch; their reproduction commands belong on that branch.
+
+Removed the FP8 encoder, kernels, loaders, format constants, calibration tools,
+and benchmarks. Make and CMake now default to CUTLASS FP16, and the remaining
+benchmark commands select an FP16 executable. `Pipeline::init` only takes
+prefetched FP16 weights. The buffer pool, encoder, and decoder share one
+`CudaModel`, with no FP8/FP16 inheritance or duplicate allocation layout.
+
+The kernel audit removed the unused `im2col_2d_fp16` wrapper/device kernel and
+`GemmNN_128x64_k32_s5` CUTLASS configuration. CUTLASS now implements `gemm.h`
+directly, removing the duplicate `cutlass_*` API and forwarding wrappers.
+All 24 remaining custom-kernel entry points have runtime callers, all 23
+device kernels have launches, and all 14 CUTLASS configurations are dispatched.
+The retained precision and dispatch choices are unchanged.
+
+The audit also found a correctness bug: the cuBLAS fallback omitted bias when
+cuBLASLt returned no algorithm. It now uses the existing `bias_add_fp16` kernel.
+`make test-cublas-fallback` forces that condition through a linker wrapper and
+checks NN/NT multiplication, with and without bias, including cached plans.
+
+The FP16 exporters and legacy repacker now share `scripts/weight_format.py`
+instead of duplicating the 625-name tensor order. The Ultra converter no
+longer imports ONNX just to obtain layout helpers. Its output is byte-identical
+to the existing Ultra file (SHA-256
+`e75307d287c6c34a5a1811a8f50db518299c55a524ff37359a3b974982362dc4`).
+Short weight headers are rejected before mapping; payload size is checked
+before GPU allocation. The startup benchmark now evicts the actual cached
+weight file rather than looking for a stale repository-local copy, and Make
+tracks the public pipeline header so its changes trigger a rebuild.
+
+Validation artifacts are under `scratch/fp16-cleanup/`; generated weights,
+previous FP8 results, and captured operands remain local and untracked.
+
+Validation on the RTX 5070 Ti:
+
+- Both Make binaries and both CMake library/executable configurations build.
+- All 5,840 before/after transcript comparisons are byte-identical: V2 on
+  240 English clips, V3 on 1,340 English/de/it/fr clips, and Ultra on the same
+  1,340 clips, each with CUTLASS and cuBLAS. WER and empty-output counts are
+  unchanged within each backend.
+- Six additional 166.8-second chunking comparisons (three checkpoints, both
+  backends) are byte-identical. The standard long corpus reaches only 119.9 s,
+  so it does not by itself exercise the >120 s splitting path.
+- Both binaries reject six malformed-weight cases without crashing: empty,
+  short header, bad magic, unsupported version, and truncated V2/V3 payloads.
+- The forced cuBLAS fallback test fails on the original backend (missing bias)
+  and passes after the fix, including repeated use of cached plans.
+- The two Ultra numerical conversion tests pass. The shared tensor order
+  matches both original 625-name definitions; synthetic v1 repacking and
+  current V2/V3 no-op checks pass. All retained Python files compile.
+- Five Ultra clips per CMake backend match the corresponding pre-cleanup
+  CMake executable exactly. A one-comma difference between Make and CMake on
+  the long smoke clip also occurs at `08ad095`; it is not introduced here.
+
+The encoder and decoder operation sequences are unchanged. The full corpus
+comparison uses the canonical Make builds; timings from this correctness run
+are not a statistical performance comparison.

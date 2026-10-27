@@ -7,16 +7,16 @@ is the correct unit of replication.
 
 Usage:
     # Save baseline:
-    uv run python tests/bench_regression.py paraketto.fp8 --save baseline_fp8.json
+    uv run python tests/bench_regression.py paraketto.cuda --save baseline_cuda.json
 
     # Compare (default: --expect-better, one-sided, flags regressions only):
-    uv run python tests/bench_regression.py paraketto.fp8 --compare baseline_fp8.json
+    uv run python tests/bench_regression.py paraketto.cuda --compare baseline_cuda.json
 
     # Expect no change (two-sided, flags any difference):
-    uv run python tests/bench_regression.py paraketto.fp8 --compare baseline.json --expect-same
+    uv run python tests/bench_regression.py paraketto.cuda --compare baseline.json --expect-same
 
     # Tune sessions/runs (default: 5 sessions x 3 runs each):
-    uv run python tests/bench_regression.py paraketto.fp8 --save b.json --sessions 7 --runs 5
+    uv run python tests/bench_regression.py paraketto.cuda --save b.json --sessions 7 --runs 5
 """
 
 import argparse
@@ -281,7 +281,7 @@ def print_comparison(baseline: dict, current: dict, alpha: float = 0.05,
 
 def main():
     parser = argparse.ArgumentParser(description="Benchmark regression testing")
-    parser.add_argument("binary", help="Binary to benchmark (e.g. paraketto.fp8)")
+    parser.add_argument("binary", help="Binary to benchmark (e.g. paraketto.cuda)")
     parser.add_argument("--save", metavar="FILE",
                         help="Run benchmarks and save baseline to FILE")
     parser.add_argument("--compare", metavar="FILE",

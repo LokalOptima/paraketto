@@ -82,7 +82,7 @@ static void run_server(PipelineT& pipeline,
     });
 
     // Model/backend/device info — lets clients (and the web UI) show exactly
-    // what is running, so v2-vs-v3 and FP8-vs-FP16 mix-ups are visible at a glance.
+    // what is running, so model and backend mix-ups are visible at a glance.
     svr.Get("/info", [info_json](const httplib::Request&, httplib::Response& res) {
         res.set_content(info_json, "application/json");
     });

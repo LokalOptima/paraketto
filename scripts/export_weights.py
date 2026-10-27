@@ -6,8 +6,8 @@ paraketto-fp16.bin format:
   uint32  version = 2 (V2 English) or 3 (V3 multilingual)
   [raw FP16 tensor data, 256-byte aligned, in fixed order matching source layout]
 
-The tensor order here matches assign_weight_pointers() in weights.cpp exactly.
-This file IS the format specification — no separate index in the binary.
+The tensor order in weight_format.py matches assign_weight_pointers() in
+weights.cpp exactly; there is no separate index in the binary.
 
 Usage:
   uv run python scripts/export_weights.py         # V2 English
@@ -23,84 +23,12 @@ from pathlib import Path
 import numpy as np
 import onnx
 
+from weight_format import MAGIC, TENSOR_ALIGN, align_up, tensor_order
+
 REPOS = {
     2: "istupakov/parakeet-tdt-0.6b-v2-onnx",
     3: "istupakov/parakeet-tdt-0.6b-v3-onnx",
 }
-MAGIC         = struct.pack("<I", 0x544B5250)  # "PRKT"
-TENSOR_ALIGN  = 256
-
-# ---------------------------------------------------------------------------
-# Fixed tensor order — must match assign_weight_pointers() in weights.cpp
-# ---------------------------------------------------------------------------
-
-def tensor_order() -> list[str]:
-    names = []
-
-    # Subsampling (pre_encode)
-    for i in [0, 2, 3, 5, 6]:
-        names += [
-            f"encoder/pre_encode.conv.{i}.weight",
-            f"encoder/pre_encode.conv.{i}.bias",
-        ]
-    names += [
-        "encoder/pre_encode.out.weight",
-        "encoder/pre_encode.out.bias",
-    ]
-
-    # 24 conformer blocks
-    for i in range(24):
-        p = f"encoder/layers.{i}"
-        names += [
-            f"{p}.norm_feed_forward1.weight",
-            f"{p}.norm_feed_forward1.bias",
-            f"{p}.feed_forward1.linear1.weight",
-            f"{p}.feed_forward1.linear2.weight",
-            f"{p}.norm_self_att.weight",
-            f"{p}.norm_self_att.bias",
-            f"{p}.self_attn.linear_q.weight",
-            f"{p}.self_attn.linear_k.weight",
-            f"{p}.self_attn.linear_v.weight",
-            f"{p}.self_attn.linear_pos.weight",
-            f"{p}.self_attn.pos_bias_u",
-            f"{p}.self_attn.pos_bias_v",
-            f"{p}.self_attn.linear_out.weight",
-            f"{p}.norm_conv.weight",
-            f"{p}.norm_conv.bias",
-            f"{p}.conv.pointwise_conv1.weight",
-            f"{p}.conv.depthwise_conv.weight",
-            f"{p}.conv.depthwise_conv.bias",
-            f"{p}.conv.pointwise_conv2.weight",
-            f"{p}.norm_feed_forward2.weight",
-            f"{p}.norm_feed_forward2.bias",
-            f"{p}.feed_forward2.linear1.weight",
-            f"{p}.feed_forward2.linear2.weight",
-            f"{p}.norm_out.weight",
-            f"{p}.norm_out.bias",
-        ]
-
-    # Decoder + joint
-    names += [
-        "decoder/decoder.prediction.embed.weight",
-        "decoder/decoder.dec_rnn.lstm.weight_ih",
-        "decoder/decoder.dec_rnn.lstm.weight_hh",
-        "decoder/decoder.dec_rnn.lstm.bias",
-        "decoder/decoder.dec_rnn.lstm.1.weight_ih",
-        "decoder/decoder.dec_rnn.lstm.1.weight_hh",
-        "decoder/decoder.dec_rnn.lstm.1.bias",
-        "decoder/joint.enc.weight",
-        "decoder/joint.enc.bias",
-        "decoder/joint.pred.weight",
-        "decoder/joint.pred.bias",
-        "decoder/joint.joint_net.joint_net.2.weight",
-        "decoder/joint.joint_net.2.bias",
-    ]
-
-    return names
-
-
-def align_up(x: int, a: int) -> int:
-    return (x + a - 1) & ~(a - 1)
 
 
 def resolve_names(model: onnx.ModelProto) -> dict[str, str]:
