@@ -53,10 +53,6 @@ GtkWidget* label(const std::string& text, const char* style = nullptr) {
 void set_label(GtkWidget* widget, const std::string& text) {
     if (text != gtk_label_get_text(GTK_LABEL(widget))) gtk_label_set_text(GTK_LABEL(widget), text.c_str());
 }
-void set_class(GtkStyleContext* style, const char* name, bool enabled) {
-    if (enabled) gtk_style_context_add_class(style, name);
-    else gtk_style_context_remove_class(style, name);
-}
 GtkWidget* icon_button(const char* icon, const char* tooltip) {
     auto* widget = gtk_button_new_from_icon_name(icon, GTK_ICON_SIZE_BUTTON);
     gtk_style_context_add_class(gtk_widget_get_style_context(widget), "flat");
@@ -247,8 +243,8 @@ private:
     std::unique_ptr<TextInput> input_;
     Recorder recorder_;
     Player player_;
-    GtkWidget *window_, *overlay_, *history_box_, *status_, *status_dot_, *vram_, *record_button_;
-    GtkWidget *stats_, *status_stack_, *loading_, *shortcut_, *overlay_title_, *overlay_cancel_, *wave_, *server_actions_;
+    GtkWidget *window_, *overlay_, *history_box_, *vram_, *record_button_;
+    GtkWidget *stats_, *status_stack_, *shortcut_, *overlay_title_, *overlay_cancel_, *wave_, *server_actions_;
     GtkWidget* preferences_ = nullptr;
     guint timer_ = 0;
     Mode mode_ = Mode::Idle;
@@ -383,28 +379,42 @@ private:
         pack(root, server_panel);
         auto* server = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 16);
         gtk_style_context_add_class(gtk_widget_get_style_context(server), "server-row");
-        auto* state = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-        status_dot_ = gtk_image_new_from_icon_name("media-record-symbolic", GTK_ICON_SIZE_MENU);
-        gtk_image_set_pixel_size(GTK_IMAGE(status_dot_), 10);
-        pack(state, status_dot_);
-        status_ = label("Sleeping", "server-state");
-        gtk_style_context_add_class(gtk_widget_get_style_context(status_), "state-sleeping");
-        gtk_label_set_ellipsize(GTK_LABEL(status_), PANGO_ELLIPSIZE_END);
-        pack(state, status_, true);
         status_stack_ = gtk_stack_new();
-        gtk_stack_add_named(GTK_STACK(status_stack_), state, "state");
-        loading_ = gtk_progress_bar_new();
-        gtk_widget_set_valign(loading_, GTK_ALIGN_CENTER);
-        gtk_widget_set_tooltip_text(loading_, "Loading model");
-        atk_object_set_name(gtk_widget_get_accessible(loading_), "Loading model");
-        gtk_stack_add_named(GTK_STACK(status_stack_), loading_, "loading");
+        // Keep every label in a homogeneous stack: its size depends on all
+        // possible states, never on the current state or a changing label.
+        gtk_stack_set_homogeneous(GTK_STACK(status_stack_), TRUE);
+        struct StateLabel { const char *name, *text, *style; };
+        for (const auto& item : {
+            StateLabel{"sleeping", "Sleeping", "state-sleeping"},
+            StateLabel{"connecting", "Connecting…", nullptr},
+            StateLabel{"unloading", "Unloading…", nullptr},
+            StateLabel{"loading", "Loading…", nullptr},
+            StateLabel{"load-error", "Load failed", "failure"},
+            StateLabel{"offline", "Unavailable", "failure"},
+            StateLabel{"busy", "Transcribing…", "state-ready"},
+            StateLabel{"ready", "Ready", "state-ready"},
+        }) {
+            auto* state = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+            auto* dot = gtk_image_new_from_icon_name("media-record-symbolic", GTK_ICON_SIZE_MENU);
+            gtk_image_set_pixel_size(GTK_IMAGE(dot), 10);
+            pack(state, dot);
+            auto* text = label(item.text, "server-state");
+            gtk_label_set_single_line_mode(GTK_LABEL(text), TRUE);
+            pack(state, text, true);
+            if (item.style) for (auto* widget : {dot, text})
+                gtk_style_context_add_class(gtk_widget_get_style_context(widget), item.style);
+            gtk_stack_add_named(GTK_STACK(status_stack_), state, item.name);
+        }
         pack(server, status_stack_);
         vram_ = label("", "vram");
         gtk_label_set_width_chars(GTK_LABEL(vram_), 19);
+        gtk_label_set_max_width_chars(GTK_LABEL(vram_), 19);
+        gtk_label_set_ellipsize(GTK_LABEL(vram_), PANGO_ELLIPSIZE_END);
+        gtk_label_set_single_line_mode(GTK_LABEL(vram_), TRUE);
         gtk_label_set_xalign(GTK_LABEL(vram_), 0);
         pack(server, vram_, true);
-        // Homogeneous stacks reserve the same space for every state and action.
         server_actions_ = gtk_stack_new();
+        gtk_stack_set_homogeneous(GTK_STACK(server_actions_), TRUE);
         gtk_widget_set_valign(server_actions_, GTK_ALIGN_CENTER);
         for (const char* text : {"Load", "Cancel", "Unload", "Retry"}) {
             auto* button = gtk_button_new_with_label(text);
@@ -656,24 +666,16 @@ private:
         bool transcribing = mode_ == Mode::Transcribing || mode_ == Mode::Delivering;
         bool failed = state.status == "offline" || state.status == "error";
         bool sleeping = state.status == "sleeping";
-        set_label(status_, sleeping ? "Sleeping" : state.status == "connecting" ? "Connecting…" :
-            state.status == "unloading" ? "Unloading…" : state.starting ? "Loading model…" :
-            failed ? (state.load_failed ? "Couldn’t load model" : "Service unavailable") :
-            transcribing || state.status == "busy" ? "Transcribing…" : "Ready");
-        for (auto* widget : {status_, status_dot_}) {
-            auto* style = gtk_widget_get_style_context(widget);
-            set_class(style, "state-sleeping", sleeping);
-            set_class(style, "state-ready", state.ready);
-            set_class(style, "failure", failed);
-        }
-        gtk_stack_set_visible_child_name(GTK_STACK(status_stack_), state.starting ? "loading" : "state");
-        if (state.starting) gtk_progress_bar_pulse(GTK_PROGRESS_BAR(loading_));
+        gtk_stack_set_visible_child_name(GTK_STACK(status_stack_),
+            failed ? (state.load_failed ? "load-error" : "offline") :
+            transcribing && state.ready ? "busy" : state.status.c_str());
         std::string detail;
         if (sleeping) detail = "Loads when you start recording";
         else if (state.status == "offline") detail = "Start the Paraketto service to transcribe";
         else if (state.status == "connecting") detail = "Connecting to the transcription service";
         else if (state.status == "unloading") detail = "Releasing GPU memory";
-        else if (state.starting) detail = "Recording can start immediately";
+        else if (state.starting) detail = "Loading the model; progress is not reported. Recording can start immediately.";
+        else if (state.load_failed) detail = "Couldn’t load model. Retry, or view the server log for details";
         else if (!state.ready) detail = "Retry, or view the server log for details";
         else if (mode_ != Mode::Idle || state.busy) detail = "Model in use";
         else if (state.settings.keep_loaded) detail = "Automatic unloading disabled";
@@ -683,7 +685,7 @@ private:
         gtk_widget_set_tooltip_text(status_stack_, (detail + (model.empty() ? "" : "\n" + model)).c_str());
         if (state.total_vram_mb > 0) total_vram_mb_ = state.total_vram_mb;
         auto memory_field = [](double mb) {
-            return mb >= 0 ? take_string(g_strdup_printf("%6.2f", mb / 1024)) : std::string("    --");
+            return mb >= 0 ? take_string(g_strdup_printf("%6.2f", mb / 1024)) : std::string(" --.--");
         };
         set_label(vram_, memory_field(state.server_vram_mb) + " / " + memory_field(total_vram_mb_) + " GiB");
         std::string memory = sleeping ? "The model is unloaded" : state.used_vram_mb >= 0 ? take_string(g_strdup_printf(

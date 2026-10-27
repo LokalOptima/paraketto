@@ -2622,3 +2622,19 @@ desktop/service lifecycle suite pass. Preview regressions cover wrapped text,
 multiple paragraphs, narrow widths, combining characters, and joined emoji.
 Private-session visual checks exercise expansion and full-text copying without
 touching the user's recordings or input focus.
+
+### Stable desktop service status
+
+The footer's status label still changed its natural width between states, moving
+the adjacent VRAM field. Each state now has a static label in a homogeneous GTK
+stack, which reserves the widest state at the current text scale. VRAM uses a
+fixed character width and aligned decimal placeholders when readings are
+unavailable; action buttons retain their own reserved space. Loading now says
+“Loading…” instead of showing an indeterminate bar: the service does not expose
+actual loading progress.
+
+Validation: Make and CMake builds pass. An isolated desktop session measured
+identical widget bounds and VRAM decimal positions through 12 state transitions
+at both 100% and 125% text scaling, covering loading, unloading, unknown memory,
+ready/busy, connection states, and load failure. Screenshots confirmed the
+loading and ready states without using the GPU or changing live recordings.

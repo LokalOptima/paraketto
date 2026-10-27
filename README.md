@@ -188,7 +188,9 @@ service controls and quiet stats in the footer. Transcripts initially show at
 most four visual lines; a small chevron expands or collapses longer entries.
 Playback, delete, and copy stay beside each entry, and Copy always uses the full
 transcript. The shortcut is shown as **Ctrl+Alt+Space**. The server row uses bold yellow **Sleeping**, green **Ready**,
-and a pulsing bar while loading. Its padded, monospaced VRAM display shows
+and **Loading…** while the model loads; the service does not report loading progress.
+Status, VRAM, and action columns keep their positions across state changes.
+The padded, monospaced VRAM display shows
 **process usage / GPU capacity** in GiB, including zero usage when unloaded;
 hover over it for device-wide usage while the server is running.
 The stats pane shows total words in saved transcriptions and whole-number WPM
