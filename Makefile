@@ -69,12 +69,14 @@ cli: build vad
 
 # Transcribes the LibriSpeech clips and checks every transcript against FluidAudio's.
 compare: cli
-	$(CLI) --vad $(VAD_COMPILED) --chunk-ms 100 --compare $(FIXTURES) $(CLIPS)
+	$(CLI) --vad $(VAD_COMPILED) --chunk-ms 100 --compare $(FIXTURES) --hypotheses .build/hypotheses.tsv $(CLIPS) | tail -2
+	cd tools/export && uv run python ../../tests/score.py ../../$(FIXTURES) ../../.build/hypotheses.tsv
 
 # Joins the clips into one to three minute files and scores the recording-time segmentation on them.
 longform: cli
 	cd tools/export && uv run python ../../tests/make_longform.py --clips "$(abspath $(dir $(firstword $(wildcard $(CLIPS)))))" --out ../../.build/longform
-	$(CLI) --vad $(VAD_COMPILED) --chunk-ms 100 --compare .build/longform/reference.tsv .build/longform/gap*.wav
+	$(CLI) --vad $(VAD_COMPILED) --chunk-ms 100 --compare .build/longform/reference.tsv --hypotheses .build/longform/hypotheses.tsv .build/longform/gap*.wav | tail -2
+	cd tools/export && uv run python ../../tests/score.py ../../.build/longform/reference.tsv ../../.build/longform/hypotheses.tsv
 
 # Re-exports the VAD head from moondream/parakeet-ultra (needs uv; fetches ~9 MB of weights).
 vad-export:

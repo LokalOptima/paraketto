@@ -102,7 +102,7 @@ decode to blanks, while a fresh state at a window cut loses the sentence in prog
 `tests/make_longform.py` joins the LibriSpeech clips into one to three minute files with 0.3 to
 1 s gaps to test this. On those files, fed in 100 ms chunks:
 
-| Setting | Long files, word errors of 994 | Short clips, identical to FluidAudio |
+| Setting | Long files, word errors of 994 (hand count) | Short clips, identical to FluidAudio |
 |---|---|---|
 | state carried across every cut, 13 s windows only (before) | 90 | 15 of 17 |
 | fresh state at every cut, 0.8 s pause commits | 12 | 13 of 17 |
@@ -112,7 +112,9 @@ decode to blanks, while a fresh state at a window cut loses the sentence in prog
 The last row is the default. Shorter commit pauses cut at breaths inside sentences; 0.8 s cuts
 between them. Pause decisions are made on the audio heard so far, so feeding a whole file at once
 can place cuts differently from the app, which feeds 100 ms chunks; `make compare` and
-`make longform` use the app's chunked mode.
+`make longform` use the app's chunked mode and score word error rate with `tests/score.py`: Whisper's
+EnglishTextNormalizer on both sides, then `jiwer`, as the Open ASR Leaderboard does. Current result:
+0.20% on the short clips (one "colourists"), 1.21% on the long files.
 
 ### Faster than the stock export
 

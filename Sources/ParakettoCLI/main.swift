@@ -17,6 +17,7 @@ var showPlan = false
 var encoderPath: String?
 var chunkMilliseconds = 0  // > 0 feeds each file to a session in chunks, as the app does while recording
 var pauseSeconds = 0.8     // silence that commits a segment while recording; 0 = window fill only
+var hypothesesPath: String?  // writes file<TAB>text per file, for tests/score.py
 var useFused = true
 var fusedPath: String?
 var arguments = Array(CommandLine.arguments.dropFirst())
@@ -31,6 +32,7 @@ while !arguments.isEmpty {
     case "--encoder": encoderPath = arguments.removeFirst()
     case "--chunk-ms": chunkMilliseconds = Int(arguments.removeFirst()) ?? 0
     case "--pause": pauseSeconds = Double(arguments.removeFirst()) ?? 0.8
+    case "--hypotheses": hypothesesPath = arguments.removeFirst()
     case "--fused":
         let value = arguments.removeFirst()
         useFused = value != "off"
@@ -132,25 +134,6 @@ FileHandle.standardError.write(Data("encoder: \(encoderURL?.path ?? "FluidAudio 
 let transcriber = try ParakeetTranscriber(models: models, commitPauseSeconds: pauseSeconds)
 FileHandle.standardError.write(Data("commit pause: \(pauseSeconds) s\n".utf8))
 
-/// Word-level edit distance between two transcripts, ignoring case and punctuation.
-func wordErrors(_ hypothesis: String, _ reference: String) -> (errors: Int, words: Int) {
-    func words(_ s: String) -> [Substring] {
-        s.lowercased().unicodeScalars.map { CharacterSet.alphanumerics.contains($0) || $0 == " " ? Character($0) : " " }
-            .reduce(into: "") { $0.append($1) }.split(separator: " ")
-    }
-    let h = words(hypothesis), r = words(reference)
-    var previous = Array(0...h.count)
-    for i in 1...max(r.count, 1) where i <= r.count {
-        var current = [i] + [Int](repeating: 0, count: h.count)
-        for j in 1...max(h.count, 1) where j <= h.count {
-            current[j] = min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + (r[i - 1] == h[j - 1] ? 0 : 1))
-        }
-        previous = current
-    }
-    return (previous[h.count], r.count)
-}
-FileHandle.standardError.write(Data(String(format: "models loaded in %.0f ms from %@\n", Date().timeIntervalSince(started) * 1000, directory.path).utf8))
-
 var reference: [String: String] = [:]
 if let comparePath {
     for line in try String(contentsOfFile: comparePath, encoding: .utf8).split(separator: "\n") where !line.hasPrefix("#") {
@@ -163,7 +146,7 @@ if let comparePath {
 if let first = files.first { _ = try transcriber.transcribe(try loadSamples(first)) }
 
 var mismatches = 0
-var totalErrors = 0, totalWords = 0
+var hypotheses = ""
 var totalAudio = 0.0
 var totalTime = 0.0
 for path in files {
@@ -195,9 +178,7 @@ for path in files {
     totalTime += elapsed
     var status = ""
     if let expected = reference[name] {
-        let (errors, words) = wordErrors(result.text, expected)
-        totalErrors += errors; totalWords += words
-        status = expected == result.text ? "  [match]" : "  [DIFF \(errors) word(s)]"
+        status = expected == result.text ? "  [match]" : "  [DIFF]"
         if expected != result.text {
             mismatches += 1
             print("  expected: \(expected)")
@@ -205,12 +186,14 @@ for path in files {
     }
     let finishNote = chunkMilliseconds > 0 ? String(format: " (%.0f ms after the last chunk)", finishElapsed * 1000) : ""
     print(String(format: "%@\t%.1fs audio, %.0f ms%@, %.0fx, %d segment(s)%@\n\t%@", name, seconds, elapsed * 1000, finishNote, seconds / elapsed, result.segments, status, result.text))
+    hypotheses += "\(name)\t\(result.text)\n"
     if showTokens {
         print("\t" + result.tokens.map { "\($0.id)@\($0.frame)" }.joined(separator: " "))
     }
 }
+if let hypothesesPath { try hypotheses.write(toFile: hypothesesPath, atomically: true, encoding: .utf8) }
 if !vadProbe {
     print(String(format: "TOTAL %.1fs audio in %.0f ms = %.0fx RTFx", totalAudio, totalTime * 1000, totalAudio / totalTime))
-    if comparePath != nil { print("mismatches: \(mismatches) of \(files.count); \(totalErrors) word errors in \(totalWords) reference words") }
+    if comparePath != nil { print("not byte-identical: \(mismatches) of \(files.count) (see tests/score.py for word error rate)") }
 }
 exit(mismatches == 0 ? 0 : 1)
