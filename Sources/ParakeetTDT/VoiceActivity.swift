@@ -17,6 +17,21 @@ struct Segmenter {
     /// Without a proper pause, the cut goes to the least speech-like frame within this many frames of the window end.
     var fallbackSearchFrames = 38  // ~3 s
     var maximumSegmentFrames = ParakeetConstants.windowSamples / ParakeetConstants.samplesPerFrame  // 187
+    /// A silence at least this long ends the segment before it as soon as it is heard, so a
+    /// recording is transcribed phrase by phrase while it is still going. 0 disables it.
+    var commitPauseFrames = 10  // 0.8 s
+
+    /// The first silence of `commitPauseFrames` after at least `minimumSegmentFrames` of the segment
+    /// starting at `start`, as a cut a quarter second into it; nil when none has been heard yet.
+    func pauseCut(in probabilities: [Float], from start: Int) -> Int? {
+        guard commitPauseFrames > 0 else { return nil }
+        let speech = smoothed(probabilities[start...])
+        let earliest = start + minimumSegmentFrames
+        for run in runs(of: false, in: speech) where run.count >= commitPauseFrames && run.lowerBound + start >= earliest {
+            return run.lowerBound + start + commitPauseFrames / 2
+        }
+        return nil
+    }
 
     /// Where to end the segment starting at `start`, given probabilities for at least
     /// `0..<windowEnd`. Prefers the midpoint of the last pause fully inside the window, then

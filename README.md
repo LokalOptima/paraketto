@@ -7,7 +7,7 @@ Neural Engine with Core ML. Nothing leaves the Mac.
 
 - Menu bar only, no Dock icon
 - Shortcut: tap `Right ⌥` to start and stop a recording, `Esc` discards it. A tap is a press and release under 0.6 s with no other key in between, so Option+letter typing is unaffected. Change it in Settings (`⌘,` from the menu) by tapping another modifier key or pressing any key combination
-- Transcription runs while you speak: long recordings are cut at pauses and each segment is decoded as soon as its cut is known, so stopping costs only the last segment (40 to 100 ms)
+- Transcription runs while you speak: every pause of 0.8 s ends a segment and it is transcribed right away, so when you pause before stopping the text is already there
 - Floating pill while recording: a level meter on a -50 to -10 dBFS scale with 30 ms attack / 160 ms release smoothing
 - Text is pasted only if the app that had focus when you started still has it; otherwise it is kept in history
 - History window (`⌘H` from the menu): every dictation with its recording, grouped by day, with play, copy, delete, and word count / WPM stats
@@ -87,17 +87,32 @@ engine uses to cut long audio at pauses. FluidAudio's export leaves it out, so
 (SiLU after `proj` and `ctx`, no residual) follows parakeet.cpp's published analysis, since
 moondream does not document the head; it gives one speech probability per 80 ms frame.
 
-Recordings longer than 15 s are cut at the last pause inside each 13 s window, or at the least
-speech-like frame near the window end when no pause qualifies. Each segment is encoded with about
-a second of neighbouring audio on both sides, tokens are emitted only for the segment itself and a
-word straddling the cut is finished before the next segment resumes, and the decoder state is
-carried across. Recordings of 15 s or less are decoded in one pass, identical to FluidAudio.
+A `Session` segments the recording while it is still going. Every 0.24 s it runs the VAD head
+over the newest audio; a silence of 0.8 s ends the segment before it, which is then encoded and
+decoded right away on the otherwise idle ANE and CPU. Speech with no such pause is cut when a 13 s
+window fills, at the last shorter pause or the least speech-like frame near its end. Each segment
+is encoded with about a second of neighbouring audio on both sides, tokens are emitted only for the
+segment itself, and a word straddling a cut is finished before the next segment resumes. At stop
+only the audio after the last cut is left: nothing if you paused, otherwise one short encoder pass.
 
-A `Session` does this while the recording is still going: a cut is placed as soon as a second of
-audio past the window has arrived, and the segment before it is transcribed right away on the
-otherwise idle ANE and CPU. The decision looks only at audio up to that point, so feeding a file in
-100 ms chunks gives the same text as feeding it whole (`paraketto-cli --chunk-ms 100`), and at stop
-only the tail remains: at most one encoder pass, 40 to 100 ms, however long the recording.
+A segment after a pause starts the decoder fresh, as moondream's runtime does; one after a window
+cut keeps the decoder state, since it continues a sentence. Carrying the state across every cut
+looked like free language context, but over a few minutes of speech it drifts until whole segments
+decode to blanks, while a fresh state at a window cut loses the sentence in progress.
+`tests/make_longform.py` joins the LibriSpeech clips into one to three minute files with 0.3 to
+1 s gaps to test this. On those files, fed in 100 ms chunks:
+
+| Setting | Long files, word errors of 994 | Short clips, identical to FluidAudio |
+|---|---|---|
+| state carried across every cut, 13 s windows only (before) | 90 | 15 of 17 |
+| fresh state at every cut, 0.8 s pause commits | 12 | 13 of 17 |
+| fresh after pauses, carried across window cuts, 0.48 s pause commits | 76 | 13 of 17 |
+| fresh after pauses, carried across window cuts, 0.8 s pause commits | 13 | 15 of 17 |
+
+The last row is the default. Shorter commit pauses cut at breaths inside sentences; 0.8 s cuts
+between them. Pause decisions are made on the audio heard so far, so feeding a whole file at once
+can place cuts differently from the app, which feeds 100 ms chunks; `make compare` and
+`make longform` use the app's chunked mode.
 
 ### Faster than the stock export
 

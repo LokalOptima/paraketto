@@ -20,7 +20,7 @@ SIGN_NAME     ?= Paraketto Dev
 SIGN_IDENTITY ?= $(or $(shell security find-identity -p codesigning 2>/dev/null | grep -F '"$(SIGN_NAME)"' | head -1 | awk '{print $$2}'),-)
 SIGN_IDENTITY := $(SIGN_IDENTITY)
 
-.PHONY: all build bundle run trust vad cli compare vad-export encoder-export decoder-export clean
+.PHONY: all build bundle run trust vad cli compare longform vad-export encoder-export decoder-export clean
 
 MODELS_DIR    := $(HOME)/Library/Application Support/Paraketto/models
 
@@ -69,7 +69,12 @@ cli: build vad
 
 # Transcribes the LibriSpeech clips and checks every transcript against FluidAudio's.
 compare: cli
-	$(CLI) --vad $(VAD_COMPILED) --compare $(FIXTURES) $(CLIPS)
+	$(CLI) --vad $(VAD_COMPILED) --chunk-ms 100 --compare $(FIXTURES) $(CLIPS)
+
+# Joins the clips into one to three minute files and scores the recording-time segmentation on them.
+longform: cli
+	cd tools/export && uv run python ../../tests/make_longform.py --clips "$(abspath $(dir $(firstword $(wildcard $(CLIPS)))))" --out ../../.build/longform
+	$(CLI) --vad $(VAD_COMPILED) --chunk-ms 100 --compare .build/longform/reference.tsv .build/longform/gap*.wav
 
 # Re-exports the VAD head from moondream/parakeet-ultra (needs uv; fetches ~9 MB of weights).
 vad-export:

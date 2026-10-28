@@ -16,6 +16,7 @@ var showTokens = false
 var showPlan = false
 var encoderPath: String?
 var chunkMilliseconds = 0  // > 0 feeds each file to a session in chunks, as the app does while recording
+var pauseSeconds = 0.8     // silence that commits a segment while recording; 0 = window fill only
 var useFused = true
 var fusedPath: String?
 var arguments = Array(CommandLine.arguments.dropFirst())
@@ -29,6 +30,7 @@ while !arguments.isEmpty {
     case "--plan": showPlan = true
     case "--encoder": encoderPath = arguments.removeFirst()
     case "--chunk-ms": chunkMilliseconds = Int(arguments.removeFirst()) ?? 0
+    case "--pause": pauseSeconds = Double(arguments.removeFirst()) ?? 0.8
     case "--fused":
         let value = arguments.removeFirst()
         useFused = value != "off"
@@ -127,7 +129,26 @@ let fusedURL = useFused ? (fusedPath.map { URL(fileURLWithPath: $0) } ?? ModelSt
 let models = try ParakeetModels(directory: directory, vadModel: vadPath.map { URL(fileURLWithPath: $0) }, encoderModel: encoderURL, fusedDecoder: fusedURL)
 FileHandle.standardError.write(Data("fused decoder step: \(fusedURL == nil ? "off" : "on")\n".utf8))
 FileHandle.standardError.write(Data("encoder: \(encoderURL?.path ?? "FluidAudio 15 s") windows \(models.encoder.variants.map(\.melFrames))\n".utf8))
-let transcriber = try ParakeetTranscriber(models: models)
+let transcriber = try ParakeetTranscriber(models: models, commitPauseSeconds: pauseSeconds)
+FileHandle.standardError.write(Data("commit pause: \(pauseSeconds) s\n".utf8))
+
+/// Word-level edit distance between two transcripts, ignoring case and punctuation.
+func wordErrors(_ hypothesis: String, _ reference: String) -> (errors: Int, words: Int) {
+    func words(_ s: String) -> [Substring] {
+        s.lowercased().unicodeScalars.map { CharacterSet.alphanumerics.contains($0) || $0 == " " ? Character($0) : " " }
+            .reduce(into: "") { $0.append($1) }.split(separator: " ")
+    }
+    let h = words(hypothesis), r = words(reference)
+    var previous = Array(0...h.count)
+    for i in 1...max(r.count, 1) where i <= r.count {
+        var current = [i] + [Int](repeating: 0, count: h.count)
+        for j in 1...max(h.count, 1) where j <= h.count {
+            current[j] = min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + (r[i - 1] == h[j - 1] ? 0 : 1))
+        }
+        previous = current
+    }
+    return (previous[h.count], r.count)
+}
 FileHandle.standardError.write(Data(String(format: "models loaded in %.0f ms from %@\n", Date().timeIntervalSince(started) * 1000, directory.path).utf8))
 
 var reference: [String: String] = [:]
@@ -142,6 +163,7 @@ if let comparePath {
 if let first = files.first { _ = try transcriber.transcribe(try loadSamples(first)) }
 
 var mismatches = 0
+var totalErrors = 0, totalWords = 0
 var totalAudio = 0.0
 var totalTime = 0.0
 for path in files {
@@ -173,7 +195,9 @@ for path in files {
     totalTime += elapsed
     var status = ""
     if let expected = reference[name] {
-        status = expected == result.text ? "  [match]" : "  [DIFF]"
+        let (errors, words) = wordErrors(result.text, expected)
+        totalErrors += errors; totalWords += words
+        status = expected == result.text ? "  [match]" : "  [DIFF \(errors) word(s)]"
         if expected != result.text {
             mismatches += 1
             print("  expected: \(expected)")
@@ -187,6 +211,6 @@ for path in files {
 }
 if !vadProbe {
     print(String(format: "TOTAL %.1fs audio in %.0f ms = %.0fx RTFx", totalAudio, totalTime * 1000, totalAudio / totalTime))
-    if comparePath != nil { print("mismatches: \(mismatches) of \(files.count)") }
+    if comparePath != nil { print("mismatches: \(mismatches) of \(files.count); \(totalErrors) word errors in \(totalWords) reference words") }
 }
 exit(mismatches == 0 ? 0 : 1)

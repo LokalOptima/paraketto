@@ -1,8 +1,7 @@
 import CoreML
 import Foundation
 
-/// LSTM state of the prediction network plus the last emitted token. Carried across
-/// segments of one recording so the language context survives a cut.
+/// LSTM state of the prediction network plus the last emitted token, for one segment.
 public struct DecoderState {
     let hidden: MLMultiArray
     let cell: MLMultiArray

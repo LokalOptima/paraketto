@@ -16,10 +16,12 @@ public struct Transcription {
 /// Recordings longer than the encoder's 15 s window are cut at pauses found by the
 /// model's VAD head. Each segment is encoded with about a second of neighbouring audio on
 /// both sides so the boundary is heard in context, tokens are emitted only for the segment
-/// itself, and the decoder state is carried from segment to segment.
+/// itself. A segment that follows a pause starts the decoder fresh, as moondream's runtime does: an
+/// LSTM state carried over minutes of speech drifts until whole segments decode to nothing. A segment
+/// that follows a cut through continuous speech keeps the state, since it continues a sentence.
 ///
 /// A `Session` accepts audio while it is being recorded and transcribes each segment as soon
-/// as the cut after it can be decided, so at the end only the last partial segment is left.
+/// as a pause ends it, so at the end only the speech after the last pause is left.
 /// `transcribe(_:)` is the same thing with all the audio appended at once.
 public final class ParakeetTranscriber {
     /// Acoustic context added on each side of a segment, in encoder frames (~1 s).
@@ -32,12 +34,14 @@ public final class ParakeetTranscriber {
     let segmenter: Segmenter
     private let audioBuffer = try! MLMultiArray.float32([1, ParakeetConstants.windowSamples])
 
-    public init(models: ParakeetModels) throws {
+    /// - Parameter commitPauseSeconds: silence that ends a segment while recording (0 waits for the window to fill).
+    public init(models: ParakeetModels, commitPauseSeconds: Double = 0.8) throws {
         self.models = models
         let vocabulary = models.vocabulary
         decoder = TdtDecoder(decoder: models.decoder, joint: models.joint, fusedStep: models.fusedStep, isWordStart: { vocabulary.isWordStart($0) })
         var segmenter = Segmenter()
         segmenter.maximumSegmentFrames = Self.windowFrames - 2 * Self.contextFrames
+        segmenter.commitPauseFrames = Int((commitPauseSeconds / 0.08).rounded())
         self.segmenter = segmenter
     }
 
@@ -86,16 +90,19 @@ public final class ParakeetTranscriber {
         private var segmentStart = 0
         /// Global frame where the previous segment stopped emitting (may run past its cut to finish a word).
         private var resumeFrame = 0
-        private var state: DecoderState
         private var tokens: [Int] = []
         private var emitted: [(id: Int, frame: Int)] = []
         private var segments = 0
         private var finished = false
+        /// Frames available when the VAD was last consulted; it is re-run every `vadCadenceFrames` of new audio.
+        private var vadCheckedFrames = 0
+        /// Decoder state of the previous segment, kept only when that segment ended in a window cut.
+        private var carried: DecoderState?
+        private static let vadCadenceFrames = 3  // 0.24 s
         private var melSeconds = 0.0, encodeSeconds = 0.0, decodeSeconds = 0.0, vadSeconds = 0.0
 
         init(transcriber: ParakeetTranscriber) {
             self.transcriber = transcriber
-            state = try! DecoderState()
             DecodeProfile.reset()
         }
 
@@ -132,18 +139,36 @@ public final class ParakeetTranscriber {
                     if remaining + min(context, segmentStart) <= ParakeetTranscriber.windowFrames {
                         guard remaining > 0 else { return }
                         let tailHasSpeech = try segmentStart == 0 || segmenter.hasSpeech(probabilities(upTo: total)[segmentStart..<total])
-                        if tailHasSpeech { try process(segmentStart..<total) }
+                        if tailHasSpeech { try process(segmentStart..<total, continuing: carried) }
                         return
                     }
-                } else if total < segmentStart + segmenter.maximumSegmentFrames + context {
-                    return  // not enough audio yet to place the cut and hear its right context
+                } else if total < segmentStart + segmenter.minimumSegmentFrames + segmenter.commitPauseFrames
+                            || (total - vadCheckedFrames < Self.vadCadenceFrames && total < segmentStart + segmenter.maximumSegmentFrames + context) {
+                    return  // too little new audio to look for a pause, and the window is not full
                 }
                 let windowEnd = segmentStart + segmenter.maximumSegmentFrames
                 let probabilities = try probabilities(upTo: min(total, windowEnd + context))
+                vadCheckedFrames = total
+                // A pause ends the segment before it right away; silence is all the right context it needs.
+                if let cut = segmenter.pauseCut(in: probabilities, from: segmentStart), cut <= windowEnd {
+                    try commit(segmentStart..<cut, probabilities: probabilities, reason: "pause")
+                    continue
+                }
+                guard total >= windowEnd + context else { return }  // no pause yet; wait for the window to fill
                 let cut = segmenter.cut(in: probabilities, from: segmentStart, windowEnd: windowEnd)
-                if segmenter.hasSpeech(probabilities[segmentStart..<cut]) { try process(segmentStart..<cut) }
-                segmentStart = cut
+                try commit(segmentStart..<cut, probabilities: probabilities, reason: "window")
             }
+        }
+
+        private func commit(_ range: Range<Int>, probabilities: [Float], reason: String) throws {
+            let speech = transcriber.segmenter.hasSpeech(probabilities[range])
+            let before = tokens.count
+            if speech { try process(range, continuing: carried) }
+            carried = reason == "window" ? carried : nil
+            if TdtDecoder.debug {
+                FileHandle.standardError.write(Data("segment \(range) (\(reason)) speech=\(speech) resume=\(resumeFrame) tokens+\(tokens.count - before)\n".utf8))
+            }
+            segmentStart = range.upperBound
         }
 
         /// Speech probabilities for frames `0..<limit`: cached whole blocks, plus the current partial
@@ -164,8 +189,8 @@ public final class ParakeetTranscriber {
             return result
         }
 
-        /// Encodes `range` with context on both sides and decodes it, carrying the decoder state.
-        private func process(_ range: Range<Int>) throws {
+        /// Encodes `range` with context on both sides and decodes it, starting from `continuing` or fresh.
+        private func process(_ range: Range<Int>, continuing: DecoderState? = nil) throws {
             let context = ParakeetTranscriber.contextFrames
             let startFrame = max(range.lowerBound, resumeFrame)
             guard startFrame < range.upperBound else { return }
@@ -181,6 +206,7 @@ public final class ParakeetTranscriber {
             let t1 = Date()
             let frames = try transcriber.encode(mel)
             let t2 = Date()
+            var state = try continuing ?? DecoderState()
             let result = try transcriber.decoder.decode(frames: frames, range: lead..<(lead + range.upperBound - startFrame), state: &state)
             let t3 = Date()
             melSeconds += t1.timeIntervalSince(t0); encodeSeconds += t2.timeIntervalSince(t1); decodeSeconds += t3.timeIntervalSince(t2)
@@ -192,6 +218,7 @@ public final class ParakeetTranscriber {
             emitted += zip(result.tokens, result.frames).dropFirst(overlap).map { (id: $0.0, frame: windowStart + $0.1) }
             resumeFrame = windowStart + result.stopFrame
             segments += 1
+            carried = state
         }
     }
 
