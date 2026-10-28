@@ -38,6 +38,11 @@ bundle: build vad
 	codesign --force --sign "$(SIGN_IDENTITY)" \
 		--entitlements Resources/$(APP_NAME).entitlements \
 		--options runtime $(BUNDLE)
+	codesign --verify --deep --strict $(BUNDLE)
+ifneq ($(SIGN_IDENTITY),-)
+	@codesign -dvv $(BUNDLE) 2>&1 | grep -q '^Authority=$(SIGN_IDENTITY)$$' \
+		|| { echo "error: $(BUNDLE) is not signed by $(SIGN_IDENTITY); removing it"; rm -rf $(BUNDLE); exit 1; }
+endif
 	@echo "signed with: $(SIGN_IDENTITY)"
 
 run: bundle
