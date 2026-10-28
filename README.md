@@ -89,32 +89,38 @@ moondream does not document the head; it gives one speech probability per 80 ms 
 
 A `Session` segments the recording while it is still going. Every 0.24 s it runs the VAD head
 over the newest audio; a silence of 0.8 s ends the segment before it, which is then encoded and
-decoded right away on the otherwise idle ANE and CPU. Speech with no such pause is cut when a 13 s
-window fills, at the last shorter pause or the least speech-like frame near its end. Each segment
-is encoded with about a second of neighbouring audio on both sides, tokens are emitted only for the
-segment itself, and a word straddling a cut is finished before the next segment resumes. At stop
-only the audio after the last cut is left: nothing if you paused, otherwise one short encoder pass.
+decoded right away on the otherwise idle ANE and CPU. At stop only the audio after the last cut is
+left: nothing if you paused, otherwise one short encoder pass.
 
-A segment after a pause starts the decoder fresh, as moondream's runtime does; one after a window
-cut keeps the decoder state, since it continues a sentence. Carrying the state across every cut
-looked like free language context, but over a few minutes of speech it drifts until whole segments
-decode to blanks, while a fresh state at a window cut loses the sentence in progress.
-`tests/make_longform.py` joins the LibriSpeech clips into one to three minute files with 0.3 to
-1 s gaps to test this. On those files, fed in 100 ms chunks:
+Every segment is decoded with a fresh decoder, as moondream's runtime does. Carrying the LSTM state
+from segment to segment looked like free language context, but over a few minutes of speech it
+drifts until whole segments decode to blanks.
 
-| Setting | Long files, word errors of 994 (hand count) | Short clips, identical to FluidAudio |
+- **Cuts at pauses** lie in silence, so each side keeps the tokens on its side of the cut, with about
+  a second of audio around it for the encoder.
+- **Cuts through speech**, when 11 s pass without a 0.8 s pause, overlap: both segments encode the
+  2 s on each side of the cut, their tokens there are aligned with a longest common subsequence
+  (same token at nearly the same frame), and the text is joined at the matched token nearest the
+  cut. If the two sides do not agree, the one that heard more of the overlap wins. This is the
+  scheme NVIDIA uses for long audio with Parakeet; it replaced a one-second context plus exact
+  dedupe that doubled or dropped a word at about a third of such cuts.
+- **Empty windows are retried.** The model sometimes returns nothing at all for a window that
+  starts mid-word (FluidAudio's own models do the same), so a window with speech that decodes
+  empty is decoded again from a later start.
+
+`tests/make_longform.py` joins the LibriSpeech clips into one to three minute files with 0.3 to 1 s
+gaps, and `tests/score.py` computes word error rate the Open ASR Leaderboard way: Whisper's
+EnglishTextNormalizer on both sides, then `jiwer`. `make compare` and `make longform` feed audio in
+100 ms chunks like the app:
+
+| Version | Long files | Short clips |
 |---|---|---|
-| state carried across every cut, 13 s windows only (before) | 90 | 15 of 17 |
-| fresh state at every cut, 0.8 s pause commits | 12 | 13 of 17 |
-| fresh after pauses, carried across window cuts, 0.48 s pause commits | 76 | 13 of 17 |
-| fresh after pauses, carried across window cuts, 0.8 s pause commits | 13 | 15 of 17 |
+| state carried across cuts, 13 s windows | about 9% (counted before the scorer existed) | 0.20% |
+| pause commits, overlap join, fresh decoder | 0.20% | 0.20% |
 
-The last row is the default. Shorter commit pauses cut at breaths inside sentences; 0.8 s cuts
-between them. Pause decisions are made on the audio heard so far, so feeding a whole file at once
-can place cuts differently from the app, which feeds 100 ms chunks; `make compare` and
-`make longform` use the app's chunked mode and score word error rate with `tests/score.py`: Whisper's
-EnglishTextNormalizer on both sides, then `jiwer`, as the Open ASR Leaderboard does. Current result:
-0.20% on the short clips (one "colourists"), 1.21% on the long files.
+The remaining errors are the model's own ("bade fare" for "bade fair", "Murcheston"). Pause
+decisions use only the audio heard so far, so feeding a whole file at once can cut differently
+(0.40% on the long files).
 
 ### Faster than the stock export
 

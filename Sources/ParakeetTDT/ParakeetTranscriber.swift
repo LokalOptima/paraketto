@@ -14,18 +14,15 @@ public struct Transcription {
 /// Pipeline per segment: 16 kHz samples → Preprocessor (mel) → Encoder (ANE, int8)
 /// → greedy TDT decode with the LSTM decoder and joint network → SentencePiece text.
 /// Recordings longer than the encoder's 15 s window are cut at pauses found by the
-/// model's VAD head. Each segment is encoded with about a second of neighbouring audio on
-/// both sides so the boundary is heard in context, tokens are emitted only for the segment
-/// itself. A segment that follows a pause starts the decoder fresh, as moondream's runtime does: an
-/// LSTM state carried over minutes of speech drifts until whole segments decode to nothing. A segment
-/// that follows a cut through continuous speech keeps the state, since it continues a sentence.
+/// model's VAD head. Each segment is encoded with 2 s of its neighbours' audio on both sides and
+/// decoded with a fresh decoder, as moondream's runtime does (an LSTM state carried over minutes of
+/// speech drifts until whole segments decode to nothing), and neighbours are joined where their
+/// transcripts of the shared audio agree.
 ///
 /// A `Session` accepts audio while it is being recorded and transcribes each segment as soon
 /// as a pause ends it, so at the end only the speech after the last pause is left.
 /// `transcribe(_:)` is the same thing with all the audio appended at once.
 public final class ParakeetTranscriber {
-    /// Acoustic context added on each side of a segment, in encoder frames (~1 s).
-    static let contextFrames = 12
     static let windowFrames = ParakeetConstants.windowSamples / ParakeetConstants.samplesPerFrame
     static let timing = ProcessInfo.processInfo.environment["PARAKEET_TIMING"] != nil
 
@@ -40,7 +37,7 @@ public final class ParakeetTranscriber {
         let vocabulary = models.vocabulary
         decoder = TdtDecoder(decoder: models.decoder, joint: models.joint, fusedStep: models.fusedStep, isWordStart: { vocabulary.isWordStart($0) })
         var segmenter = Segmenter()
-        segmenter.maximumSegmentFrames = Self.windowFrames - 2 * Self.contextFrames
+        segmenter.maximumSegmentFrames = Self.windowFrames - 2 * Self.overlapFrames
         segmenter.commitPauseFrames = Int((commitPauseSeconds / 0.08).rounded())
         self.segmenter = segmenter
     }
@@ -80,6 +77,13 @@ public final class ParakeetTranscriber {
     // MARK: Session
 
     /// One recording, transcribed incrementally. Not thread-safe: call from one actor or queue.
+    ///
+    /// Every segment is decoded whole with a fresh decoder. A cut at a pause lies in silence, so each
+    /// side keeps the tokens on its side of it, with `contextFrames` of audio around for the encoder.
+    /// A cut through speech (the window filled) is instead overlapped by `overlapFrames` on each side:
+    /// both segments transcribe the audio around it, their tokens there are aligned with a longest
+    /// common subsequence and joined at the matched token nearest the cut, so a word is neither lost
+    /// nor repeated and the text near each window edge, where the encoder hears worst, is the other side's.
     public final class Session {
         private let transcriber: ParakeetTranscriber
         private var samples: [Float] = []
@@ -88,16 +92,17 @@ public final class ParakeetTranscriber {
         private var cachedBlocks = 0
         /// Global frame where the next segment starts.
         private var segmentStart = 0
-        /// Global frame where the previous segment stopped emitting (may run past its cut to finish a word).
-        private var resumeFrame = 0
-        private var tokens: [Int] = []
-        private var emitted: [(id: Int, frame: Int)] = []
+        /// Final tokens with their global frames.
+        private var committed: [Token] = []
+        /// Tokens of the last segment from `overlapFrames` before its end on; settled by the next segment.
+        private var provisional: [Token] = []
+        /// End frame of the previous segment, and whether it ended in a cut through speech.
+        private var boundary = 0
+        private var boundaryIsOverlapped = false
         private var segments = 0
         private var finished = false
         /// Frames available when the VAD was last consulted; it is re-run every `vadCadenceFrames` of new audio.
         private var vadCheckedFrames = 0
-        /// Decoder state of the previous segment, kept only when that segment ended in a window cut.
-        private var carried: DecoderState?
         private static let vadCadenceFrames = 3  // 0.24 s
         private var melSeconds = 0.0, encodeSeconds = 0.0, decodeSeconds = 0.0, vadSeconds = 0.0
 
@@ -120,53 +125,61 @@ public final class ParakeetTranscriber {
             precondition(!finished, "session already finished")
             finished = true
             if samples.count >= ParakeetConstants.minimumSamples { try advance(final: true) }
+            let tokens = committed + provisional
             if ParakeetTranscriber.timing {
                 let ms = { (s: Double) in Int(s * 1000) }
                 FileHandle.standardError.write(Data("timing: vad \(ms(vadSeconds)) ms, \(segments) segments: mel \(ms(melSeconds)) ms, encoder \(ms(encodeSeconds)) ms, decode \(ms(decodeSeconds)) ms over \(totalFrames) frames, \(tokens.count) tokens; \(DecodeProfile.summary)\n".utf8))
             }
-            return Transcription(text: transcriber.models.vocabulary.text(for: tokens), segments: segments, tokens: emitted)
+            return Transcription(text: transcriber.models.vocabulary.text(for: tokens.map(\.id)), segments: segments, tokens: tokens.map { (id: $0.id, frame: $0.frame) })
         }
 
         private func advance(final: Bool) throws {
             let segmenter = transcriber.segmenter
-            let context = ParakeetTranscriber.contextFrames
+            let overlap = ParakeetTranscriber.overlapFrames
             while true {
+                let leftContext = boundaryIsOverlapped ? overlap : ParakeetTranscriber.contextFrames
                 let total = totalFrames
                 let remaining = total - segmentStart
                 if final {
-                    // The tail is decoded in one pass when it fits the window with its lead context.
+                    // The tail is decoded in one pass when it fits the window with its left overlap.
                     // A recording that fits whole is decoded exactly as FluidAudio does, without VAD.
-                    if remaining + min(context, segmentStart) <= ParakeetTranscriber.windowFrames {
+                    if remaining + min(leftContext, segmentStart) <= ParakeetTranscriber.windowFrames {
                         guard remaining > 0 else { return }
                         let tailHasSpeech = try segmentStart == 0 || segmenter.hasSpeech(probabilities(upTo: total)[segmentStart..<total])
-                        if tailHasSpeech { try process(segmentStart..<total, continuing: carried) }
+                        if tailHasSpeech { try process(segmentStart..<total) }
                         return
                     }
                 } else if total < segmentStart + segmenter.minimumSegmentFrames + segmenter.commitPauseFrames
-                            || (total - vadCheckedFrames < Self.vadCadenceFrames && total < segmentStart + segmenter.maximumSegmentFrames + context) {
+                            || (total - vadCheckedFrames < Self.vadCadenceFrames && total < segmentStart + segmenter.maximumSegmentFrames + overlap) {
                     return  // too little new audio to look for a pause, and the window is not full
                 }
                 let windowEnd = segmentStart + segmenter.maximumSegmentFrames
-                let probabilities = try probabilities(upTo: min(total, windowEnd + context))
+                let probabilities = try probabilities(upTo: min(total, windowEnd + overlap))
                 vadCheckedFrames = total
-                // A pause ends the segment before it right away; silence is all the right context it needs.
+                // A pause ends the segment before it right away; its right overlap is whatever silence has been heard.
                 if let cut = segmenter.pauseCut(in: probabilities, from: segmentStart), cut <= windowEnd {
-                    try commit(segmentStart..<cut, probabilities: probabilities, reason: "pause")
+                    try commit(segmentStart..<cut, probabilities: probabilities, overlapped: false)
                     continue
                 }
-                guard total >= windowEnd + context else { return }  // no pause yet; wait for the window to fill
+                guard total >= windowEnd + overlap else { return }  // no pause yet; wait for the window and its overlap
                 let cut = segmenter.cut(in: probabilities, from: segmentStart, windowEnd: windowEnd)
-                try commit(segmentStart..<cut, probabilities: probabilities, reason: "window")
+                try commit(segmentStart..<cut, probabilities: probabilities, overlapped: true)
             }
         }
 
-        private func commit(_ range: Range<Int>, probabilities: [Float], reason: String) throws {
+        private func commit(_ range: Range<Int>, probabilities: [Float], overlapped: Bool) throws {
             let speech = transcriber.segmenter.hasSpeech(probabilities[range])
-            let before = tokens.count
-            if speech { try process(range, continuing: carried) }
-            carried = reason == "window" ? carried : nil
+            if speech {
+                try process(range, overlapped: overlapped)
+            } else {
+                // Nothing to reconcile with across a silent stretch.
+                committed += provisional
+                provisional = []
+                boundary = range.upperBound
+                boundaryIsOverlapped = false
+            }
             if TdtDecoder.debug {
-                FileHandle.standardError.write(Data("segment \(range) (\(reason)) speech=\(speech) resume=\(resumeFrame) tokens+\(tokens.count - before)\n".utf8))
+                FileHandle.standardError.write(Data("segment \(range) (\(overlapped ? "window" : "pause")) speech=\(speech) committed=\(committed.count) provisional=\(provisional.count)\n".utf8))
             }
             segmentStart = range.upperBound
         }
@@ -189,46 +202,112 @@ public final class ParakeetTranscriber {
             return result
         }
 
-        /// Encodes `range` with context on both sides and decodes it, starting from `continuing` or fresh.
-        private func process(_ range: Range<Int>, continuing: DecoderState? = nil) throws {
-            let context = ParakeetTranscriber.contextFrames
-            let startFrame = max(range.lowerBound, resumeFrame)
-            guard startFrame < range.upperBound else { return }
-            let lead = min(context, startFrame)
-            let tail = min(context, totalFrames - range.upperBound)
-            let windowStart = startFrame - lead
-            let start = windowStart * ParakeetConstants.samplesPerFrame
-            let end = min((range.upperBound + tail) * ParakeetConstants.samplesPerFrame, samples.count)
-            guard end - start >= ParakeetConstants.minimumSamples else { return }
+        /// Encodes `range` with its neighbours' audio, decodes the whole window, and joins the result
+        /// to the previous segment. `overlapped`: the segment ends in a cut through speech.
+        private func process(_ range: Range<Int>, overlapped: Bool = false) throws {
+            let overlap = ParakeetTranscriber.overlapFrames, context = ParakeetTranscriber.contextFrames
+            let windowEnd = min(totalFrames, range.upperBound + (overlapped ? overlap : context))
+            // The model occasionally returns nothing at all for a window that starts in the middle of a
+            // word, so a window with speech that decodes empty is tried again from a later start.
+            let starts = [boundaryIsOverlapped ? overlap : context, context, 0].map { max(0, range.lowerBound - $0) }
+            var tokens: [Token] = []
+            var windowStart = starts[0]
+            for candidate in Array(NSOrderedSet(array: starts)) as! [Int] {
+                windowStart = candidate
+                tokens = try decodeWindow(candidate..<windowEnd)
+                if !tokens.isEmpty { break }
+            }
+            if TdtDecoder.debug, boundaryIsOverlapped {
+                FileHandle.standardError.write(Data("join at \(boundary): previous \(provisional.map { "\($0.id)@\($0.frame)" }) next \(tokens.prefix(40).map { "\($0.id)@\($0.frame)" })\n".utf8))
+            }
+            if boundaryIsOverlapped {
+                let joined = ParakeetTranscriber.join(previous: provisional, next: tokens, boundary: boundary, nextStart: windowStart)
+                committed += joined.settled
+                tokens = joined.rest
+            } else {
+                tokens = tokens.filter { $0.frame >= range.lowerBound }
+            }
+            if overlapped {
+                let split = tokens.firstIndex { $0.frame >= range.upperBound - overlap } ?? tokens.count
+                committed += tokens[..<split]
+                provisional = Array(tokens[split...])
+            } else {
+                committed += tokens.filter { $0.frame < range.upperBound }
+                provisional = []
+            }
+            boundary = range.upperBound
+            boundaryIsOverlapped = overlapped
+            segments += 1
+        }
 
+        /// Encodes and greedily decodes the audio of `frames` with a fresh decoder; tokens carry global frames.
+        private func decodeWindow(_ frames: Range<Int>) throws -> [Token] {
+            let start = frames.lowerBound * ParakeetConstants.samplesPerFrame
+            let end = min(frames.upperBound * ParakeetConstants.samplesPerFrame, samples.count)
+            guard end - start >= ParakeetConstants.minimumSamples else { return [] }
             let t0 = Date()
             let mel = try transcriber.preprocess(samples[start..<end])
             let t1 = Date()
-            let frames = try transcriber.encode(mel)
+            let encoded = try transcriber.encode(mel)
             let t2 = Date()
-            var state = try continuing ?? DecoderState()
-            let result = try transcriber.decoder.decode(frames: frames, range: lead..<(lead + range.upperBound - startFrame), state: &state)
-            let t3 = Date()
-            melSeconds += t1.timeIntervalSince(t0); encodeSeconds += t2.timeIntervalSince(t1); decodeSeconds += t3.timeIntervalSince(t2)
-
-            // Emission timing shifts a little with context, so a segment can start by re-emitting the
-            // words the previous one ended with. Drop that overlap.
-            let overlap = ParakeetTranscriber.overlap(tail: tokens, head: result.tokens)
-            tokens += result.tokens.dropFirst(overlap)
-            emitted += zip(result.tokens, result.frames).dropFirst(overlap).map { (id: $0.0, frame: windowStart + $0.1) }
-            resumeFrame = windowStart + result.stopFrame
-            segments += 1
-            carried = state
+            var state = try DecoderState()
+            let result = try transcriber.decoder.decode(frames: encoded, range: 0..<encoded.count, state: &state)
+            melSeconds += t1.timeIntervalSince(t0); encodeSeconds += t2.timeIntervalSince(t1); decodeSeconds += Date().timeIntervalSince(t2)
+            return zip(result.tokens, result.frames).map { Token(id: $0.0, frame: frames.lowerBound + $0.1) }
         }
     }
 
-    /// Longest suffix of `tail` (up to 8 tokens) that `head` begins with.
-    static func overlap(tail: [Int], head: [Int]) -> Int {
-        for length in stride(from: min(8, tail.count, head.count), through: 1, by: -1)
-        where Array(tail.suffix(length)) == Array(head.prefix(length)) {
-            return length
+    struct Token: Equatable {
+        let id: Int
+        let frame: Int
+    }
+
+    /// Overlap shared by neighbouring segments on each side of a cut through speech, in encoder frames (2 s).
+    static let overlapFrames = 25
+    /// Audio added on each side of a cut at a pause, for the encoder only, in encoder frames (~1 s).
+    static let contextFrames = 12
+    /// Tokens on both sides count as the same emission when their frames differ by at most this much.
+    static let joinFrameTolerance = 4
+
+    /// Joins the tail of one segment (`previous`, from `overlapFrames` before `boundary`) to the next
+    /// segment's tokens. The longest common subsequence of the two in the overlap, matching ids at
+    /// nearby frames, says where they agree; the join is at the matched pair nearest the boundary.
+    /// Without agreement, each side keeps the tokens on its side of the boundary.
+    static func join(previous: [Token], next: [Token], boundary: Int, nextStart: Int) -> (settled: [Token], rest: [Token]) {
+        let head = next.prefix { $0.frame < boundary + overlapFrames }
+        let a = previous, b = Array(head)
+        var lengths = [[Int]](repeating: [Int](repeating: 0, count: b.count + 1), count: a.count + 1)
+        for i in stride(from: a.count - 1, through: 0, by: -1) {
+            for j in stride(from: b.count - 1, through: 0, by: -1) {
+                let same = a[i].id == b[j].id && abs(a[i].frame - b[j].frame) <= joinFrameTolerance
+                lengths[i][j] = same ? lengths[i + 1][j + 1] + 1 : max(lengths[i + 1][j], lengths[i][j + 1])
+            }
         }
-        return 0
+        var pairs: [(Int, Int)] = []
+        var i = 0, j = 0
+        while i < a.count, j < b.count {
+            if a[i].id == b[j].id && abs(a[i].frame - b[j].frame) <= joinFrameTolerance && lengths[i][j] == lengths[i + 1][j + 1] + 1 {
+                pairs.append((i, j)); i += 1; j += 1
+            } else if lengths[i + 1][j] >= lengths[i][j + 1] {
+                i += 1
+            } else {
+                j += 1
+            }
+        }
+        // A lone match far from the cut is more likely chance than agreement.
+        if let (pi, pj) = pairs.min(by: { abs(a[$0.0].frame - boundary) < abs(a[$1.0].frame - boundary) }),
+           abs(a[pi].frame - boundary) <= overlapFrames / 2 {
+            return (Array(a[...pi]), Array(next[(pj + 1)...]))
+        }
+        // No agreement. If the next segment started too late to hear the overlap, or heard much less of
+        // it than the previous one did, the previous one's words stand and the next continues after them.
+        let previousPast = a.filter { $0.frame >= boundary }
+        let nextBefore = head.filter { $0.frame >= nextStart }
+        if nextStart >= boundary || nextBefore.count * 2 < previousPast.count {
+            let last = a.last?.frame ?? boundary
+            return (a, next.filter { $0.frame > last })
+        }
+        return (a.filter { $0.frame < boundary }, next.filter { $0.frame >= boundary })
     }
 
     // MARK: Models
