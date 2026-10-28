@@ -7,6 +7,7 @@ Neural Engine with Core ML. Nothing leaves the Mac.
 
 - Menu bar only, no Dock icon
 - Shortcut: tap `Right ⌥` to start and stop a recording, `Esc` discards it. A tap is a press and release under 0.6 s with no other key in between, so Option+letter typing is unaffected. Change it in Settings (`⌘,` from the menu) by tapping another modifier key or pressing any key combination
+- Transcription runs while you speak: long recordings are cut at pauses and each segment is decoded as soon as its cut is known, so stopping costs only the last segment (40 to 100 ms)
 - Floating pill while recording: a level meter on a -50 to -10 dBFS scale with 30 ms attack / 160 ms release smoothing
 - Text is pasted only if the app that had focus when you started still has it; otherwise it is kept in history
 - History window (`⌘H` from the menu): every dictation with its recording, grouped by day, with play, copy, delete, and word count / WPM stats
@@ -67,9 +68,9 @@ is not trusted and text is only copied. Two ways out:
 |---|---|
 | `ModelStore.swift` | finds the models or downloads them from `FluidInference/parakeet-ultra-coreml` |
 | `ParakeetModels.swift` | loads the four Core ML models (preprocessor on CPU, the rest on the ANE), the VAD head and the vocabulary |
-| `ParakeetTranscriber.swift` | mel → encoder → decode per segment, 15 s windows with 1 s of acoustic context on each side |
+| `ParakeetTranscriber.swift` | `Session`: audio in, segments decoded as their cuts become known; mel → encoder → decode with 1 s of context on each side |
 | `TdtDecoder.swift` | greedy Token-and-Duration Transducer loop with the 2-layer LSTM state |
-| `VoiceActivity.swift` | cuts long recordings at pauses found by the model's own VAD head |
+| `VoiceActivity.swift` | places cuts at pauses found by the model's own VAD head |
 | `EncoderSet.swift` | picks the shortest encoder window that holds a segment |
 | `MultiArray.swift` | small `MLMultiArray` helpers |
 
@@ -86,11 +87,17 @@ engine uses to cut long audio at pauses. FluidAudio's export leaves it out, so
 (SiLU after `proj` and `ctx`, no residual) follows parakeet.cpp's published analysis, since
 moondream does not document the head; it gives one speech probability per 80 ms frame.
 
-Recordings longer than 15 s are cut at the last pause inside each window, or at the least
+Recordings longer than 15 s are cut at the last pause inside each 13 s window, or at the least
 speech-like frame near the window end when no pause qualifies. Each segment is encoded with about
 a second of neighbouring audio on both sides, tokens are emitted only for the segment itself and a
 word straddling the cut is finished before the next segment resumes, and the decoder state is
 carried across. Recordings of 15 s or less are decoded in one pass, identical to FluidAudio.
+
+A `Session` does this while the recording is still going: a cut is placed as soon as a second of
+audio past the window has arrived, and the segment before it is transcribed right away on the
+otherwise idle ANE and CPU. The decision looks only at audio up to that point, so feeding a file in
+100 ms chunks gives the same text as feeding it whole (`paraketto-cli --chunk-ms 100`), and at stop
+only the tail remains: at most one encoder pass, 40 to 100 ms, however long the recording.
 
 ### Faster than the stock export
 
@@ -129,7 +136,8 @@ utterance is below perception, so it was removed in favour of the framework path
   CPU, GPU and ANE, and which operators force the CPU.
 - `PARAKEET_TIMING=1` prints mel, encoder and decode time per recording, with the number and total
   time of fused, joint and decoder Core ML calls; `--fused <model>` swaps in another fused step
-  export for A/B timing; `--tokens` prints each
+  export for A/B timing; `--chunk-ms N` feeds each file to a session in N ms chunks like the app
+  and reports the time spent after the last chunk; `--tokens` prints each
   token with its frame; `--vad-probe` prints the VAD strip; `PARAKEET_DEBUG=1` logs every joint decision.
 
 ### Checking against FluidAudio

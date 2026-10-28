@@ -14,6 +14,8 @@ actor Transcriber {
     static let minimumSamples = ParakeetConstants.minimumSamples
 
     private var transcriber: ParakeetTranscriber?
+    private var session: ParakeetTranscriber.Session?
+    private var sessionError: Error?
 
     /// Downloads the models on first run (about 613 MB), then loads them. Subsequent
     /// launches load from Application Support in well under a second.
@@ -24,12 +26,33 @@ actor Transcriber {
         if vadModel == nil { Log.info("VadHead.mlmodelc not bundled; long recordings fall back to fixed windows") }
         let models = try ParakeetModels(directory: directory, vadModel: vadModel, encoderModel: ModelStore.ownEncoderURL, fusedDecoder: ModelStore.ownFusedDecoderURL)
         Log.info("encoder windows (mel frames): \(models.encoder.variants.map(\.melFrames))")
-        transcriber = try ParakeetTranscriber(models: models)
+        let transcriber = try ParakeetTranscriber(models: models)
+        try transcriber.warmUp()
+        self.transcriber = transcriber
     }
 
-    func transcribe(_ samples: [Float]) async throws -> String {
+    /// Opens a recording. Audio is fed with `append` while it is captured; segments are transcribed
+    /// as soon as their cut is known, so `finish` only has the tail left to do.
+    func startSession() throws {
         guard let transcriber else { throw TranscriberError.notLoaded }
-        return try transcriber.transcribe(samples).text
+        session = transcriber.startSession()
+        sessionError = nil
+    }
+
+    func append(_ samples: [Float]) {
+        guard let session, sessionError == nil else { return }
+        do { try session.append(samples) } catch { sessionError = error }
+    }
+
+    func finish() throws -> String {
+        guard let session else { throw TranscriberError.notLoaded }
+        defer { self.session = nil }
+        if let sessionError { throw sessionError }
+        return try session.finish().text
+    }
+
+    func discard() {
+        session = nil
     }
 
     enum TranscriberError: LocalizedError {

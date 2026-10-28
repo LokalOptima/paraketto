@@ -8,6 +8,8 @@ final class AudioRecorder {
 
     /// Linear RMS amplitude relative to full scale, per captured buffer. Called off the main thread.
     var onRMS: ((Float) -> Void)?
+    /// Each converted 16 kHz chunk as it arrives, in order. Called off the main thread.
+    var onSamples: (([Float]) -> Void)?
 
     private let engine = AVAudioEngine()
     private let targetFormat = AVAudioFormat(
@@ -80,6 +82,7 @@ final class AudioRecorder {
         guard let channel = output.floatChannelData?[0] else { return }
         let converted = Array(UnsafeBufferPointer(start: channel, count: Int(output.frameLength)))
         lock.withLock { samples.append(contentsOf: converted) }
+        onSamples?(converted)
         onRMS?(Self.rms(of: converted))
     }
 

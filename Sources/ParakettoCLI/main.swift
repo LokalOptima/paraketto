@@ -15,6 +15,7 @@ var vadProbe = false
 var showTokens = false
 var showPlan = false
 var encoderPath: String?
+var chunkMilliseconds = 0  // > 0 feeds each file to a session in chunks, as the app does while recording
 var useFused = true
 var fusedPath: String?
 var arguments = Array(CommandLine.arguments.dropFirst())
@@ -27,6 +28,7 @@ while !arguments.isEmpty {
     case "--tokens": showTokens = true
     case "--plan": showPlan = true
     case "--encoder": encoderPath = arguments.removeFirst()
+    case "--chunk-ms": chunkMilliseconds = Int(arguments.removeFirst()) ?? 0
     case "--fused":
         let value = arguments.removeFirst()
         useFused = value != "off"
@@ -151,7 +153,20 @@ for path in files {
         continue
     }
     let clock = Date()
-    let result = try transcriber.transcribe(samples)
+    let result: Transcription
+    var finishElapsed = 0.0
+    if chunkMilliseconds > 0 {
+        let session = transcriber.startSession()
+        let chunk = chunkMilliseconds * 16
+        for start in stride(from: 0, to: samples.count, by: chunk) {
+            try session.append(Array(samples[start..<min(start + chunk, samples.count)]))
+        }
+        let finishClock = Date()
+        result = try session.finish()
+        finishElapsed = Date().timeIntervalSince(finishClock)
+    } else {
+        result = try transcriber.transcribe(samples)
+    }
     let elapsed = Date().timeIntervalSince(clock)
     let seconds = Double(samples.count) / 16_000
     totalAudio += seconds
@@ -164,7 +179,8 @@ for path in files {
             print("  expected: \(expected)")
         }
     }
-    print(String(format: "%@\t%.1fs audio, %.0f ms, %.0fx, %d segment(s)%@\n\t%@", name, seconds, elapsed * 1000, seconds / elapsed, result.segments, status, result.text))
+    let finishNote = chunkMilliseconds > 0 ? String(format: " (%.0f ms after the last chunk)", finishElapsed * 1000) : ""
+    print(String(format: "%@\t%.1fs audio, %.0f ms%@, %.0fx, %d segment(s)%@\n\t%@", name, seconds, elapsed * 1000, finishNote, seconds / elapsed, result.segments, status, result.text))
     if showTokens {
         print("\t" + result.tokens.map { "\($0.id)@\($0.frame)" }.joined(separator: " "))
     }

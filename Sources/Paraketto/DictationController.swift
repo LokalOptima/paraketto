@@ -73,6 +73,9 @@ final class DictationController: ObservableObject {
     private var meterTask: Task<Void, Never>?
     private var recordingStarted = Date()
     private var transcription: Task<Void, Never>?
+    /// Carries captured audio from the recorder's thread to the transcriber, in order.
+    private var audioStream: AsyncStream<[Float]>.Continuation?
+    private var feeder: Task<Void, Never>?
 
     var lastTranscript: String? { history.entries.first?.text }
 
@@ -144,6 +147,10 @@ final class DictationController: ObservableObject {
         transcription?.cancel()
         transcription = nil
         if state == .recording { _ = recorder.stop() }
+        audioStream?.finish()
+        audioStream = nil
+        Task { [transcriber, feeder] in await feeder?.value; await transcriber.discard() }
+        feeder = nil
         finishSession()
         state = .idle
         overlay?.hide()
@@ -185,8 +192,16 @@ final class DictationController: ObservableObject {
                 return
             }
             guard state.canStartRecording else { return }
+            await feeder?.value  // a cancelled recording may still be draining into the old session
             do {
                 destination = Destination.frontmost
+                try await transcriber.startSession()
+                let (stream, continuation) = AsyncStream<[Float]>.makeStream()
+                audioStream = continuation
+                recorder.onSamples = { continuation.yield($0) }
+                feeder = Task { [transcriber] in
+                    for await chunk in stream { await transcriber.append(chunk) }
+                }
                 try recorder.start()
                 startSession()
                 state = .recording
@@ -201,7 +216,11 @@ final class DictationController: ObservableObject {
     private func stopRecording() {
         guard state == .recording else { return }
         let samples = recorder.stop()
+        audioStream?.finish()
+        audioStream = nil
         guard samples.count >= Transcriber.minimumSamples else {
+            Task { [transcriber, feeder] in await feeder?.value; await transcriber.discard() }
+            feeder = nil
             finishSession()
             state = .idle
             overlay?.hide()
@@ -211,11 +230,13 @@ final class DictationController: ObservableObject {
         transcription = Task {
             let started = Date()
             do {
-                let text = try await transcriber.transcribe(samples)
+                await feeder?.value
+                feeder = nil
+                let text = try await transcriber.finish()
                 guard !Task.isCancelled else { return }
                 let inferenceMilliseconds = Int(Date().timeIntervalSince(started) * 1000)
                 let duration = Double(samples.count) / AudioRecorder.sampleRate
-                Log.info("transcribed \(String(format: "%.1f", duration))s audio in \(inferenceMilliseconds) ms, \(text.count) characters")
+                Log.info("finished \(String(format: "%.1f", duration))s recording \(inferenceMilliseconds) ms after stop, \(text.count) characters")
                 finishSession()
                 guard !text.isEmpty else {
                     state = .idle
