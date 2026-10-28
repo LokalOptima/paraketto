@@ -2,11 +2,22 @@ import AppKit
 import ApplicationServices
 import Carbon.HIToolbox
 
-/// Delivers text into the frontmost app: pasteboard write, synthetic Cmd+V,
-/// then the previous pasteboard contents are restored once the target has had time to read it.
-enum Paster {
-    private static let restoreDelay: Duration = .seconds(1)
+/// The app that had focus when recording started, and therefore should receive the text.
+struct Destination: Equatable {
+    let name: String
+    let bundleIdentifier: String?
 
+    @MainActor
+    static var frontmost: Destination? {
+        guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
+        return Destination(name: app.localizedName ?? "Unknown app", bundleIdentifier: app.bundleIdentifier)
+    }
+}
+
+/// Delivers text into the destination app: pasteboard write, then a synthetic Cmd+V.
+/// The transcript stays on the pasteboard afterwards; restoring the previous contents on a
+/// timer races slow readers, and the old contents are one undo away in most apps anyway.
+enum Paster {
     static var isAccessibilityTrusted: Bool {
         AXIsProcessTrusted()
     }
@@ -25,29 +36,25 @@ enum Paster {
 
     enum Outcome {
         case pasted
+        /// Accessibility is not granted; the text is on the clipboard.
         case copiedOnly
+        /// Focus moved to another app since recording started; nothing was pasted.
+        case destinationChanged
     }
 
     @MainActor
-    static func deliver(_ text: String) async -> Outcome {
+    static func deliver(_ text: String, to destination: Destination?) async -> Outcome {
         let pasteboard = NSPasteboard.general
-        let previous = snapshot(pasteboard)
-
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
-        let ourChangeCount = pasteboard.changeCount
 
+        if let destination, let current = Destination.frontmost, current != destination {
+            return .destinationChanged
+        }
         guard isAccessibilityTrusted else { return .copiedOnly }
 
         await waitForModifiersReleased()
         sendCommandV()
-
-        Task {
-            try? await Task.sleep(for: restoreDelay)
-            // Leave the pasteboard alone if the user or another app wrote to it in the meantime.
-            guard pasteboard.changeCount == ourChangeCount else { return }
-            restore(previous, to: pasteboard)
-        }
         return .pasted
     }
 
@@ -75,26 +82,5 @@ enum Paster {
         }
         down.post(tap: .cghidEventTap)
         up.post(tap: .cghidEventTap)
-    }
-
-    private static func snapshot(_ pasteboard: NSPasteboard) -> [[NSPasteboard.PasteboardType: Data]] {
-        (pasteboard.pasteboardItems ?? []).map { item in
-            var entry: [NSPasteboard.PasteboardType: Data] = [:]
-            for type in item.types {
-                if let data = item.data(forType: type) { entry[type] = data }
-            }
-            return entry
-        }
-    }
-
-    private static func restore(_ items: [[NSPasteboard.PasteboardType: Data]], to pasteboard: NSPasteboard) {
-        pasteboard.clearContents()
-        guard !items.isEmpty else { return }
-        let restored = items.map { entry -> NSPasteboardItem in
-            let item = NSPasteboardItem()
-            for (type, data) in entry { item.setData(data, forType: type) }
-            return item
-        }
-        pasteboard.writeObjects(restored)
     }
 }

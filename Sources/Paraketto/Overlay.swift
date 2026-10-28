@@ -2,18 +2,22 @@ import AppKit
 import SwiftUI
 
 /// A floating, click-through pill above the Dock on the screen the cursor is on.
-/// Shows the input level while recording and an error message when something fails.
+/// While recording it shows only a scrolling level meter; notices and errors share the same card.
+///
+/// The panel has a fixed, transparent size and the pill draws centred inside it, so
+/// state changes never resize the window.
 @MainActor
 final class Overlay {
+    static let panelSize = NSSize(width: 420, height: 84)
+    /// The visible card never changes size; text inside it is truncated instead.
+    static let pillSize = CGSize(width: 160, height: 40)
+
     private let panel: NSPanel
     private var hideTask: Task<Void, Never>?
-    private var resizeObserver: NSObjectProtocol?
 
     init(controller: DictationController) {
-        let hostingView = NSHostingView(rootView: PillView(controller: controller))
-        hostingView.sizingOptions = [.preferredContentSize]
         panel = NSPanel(
-            contentRect: NSRect(origin: .zero, size: hostingView.fittingSize),
+            contentRect: NSRect(origin: .zero, size: Self.panelSize),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -21,18 +25,14 @@ final class Overlay {
         panel.level = .floating
         panel.isOpaque = false
         panel.backgroundColor = .clear
-        panel.hasShadow = true
+        panel.hasShadow = false
         panel.ignoresMouseEvents = true
         panel.hidesOnDeactivate = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        let hostingView = NSHostingView(rootView: PillView(controller: controller))
+        hostingView.frame = NSRect(origin: .zero, size: Self.panelSize)
+        hostingView.autoresizingMask = [.width, .height]
         panel.contentView = hostingView
-
-        // SwiftUI resizes the panel to its content; keep it centred when that happens.
-        resizeObserver = NotificationCenter.default.addObserver(
-            forName: NSWindow.didResizeNotification, object: panel, queue: .main
-        ) { [weak self] _ in
-            MainActor.assumeIsolated { self?.position() }
-        }
     }
 
     func show() {
@@ -58,8 +58,7 @@ final class Overlay {
         let mouse = NSEvent.mouseLocation
         let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? NSScreen.main
         guard let visible = screen?.visibleFrame else { return }
-        let size = panel.frame.size
-        panel.setFrameOrigin(NSPoint(x: visible.midX - size.width / 2, y: visible.minY + 16))
+        panel.setFrameOrigin(NSPoint(x: visible.midX - Self.panelSize.width / 2, y: visible.minY + 12))
     }
 }
 
@@ -67,32 +66,42 @@ private struct PillView: View {
     @ObservedObject var controller: DictationController
 
     var body: some View {
-        HStack(spacing: 10) {
-            switch controller.state {
-            case .recording, .transcribing:
-                SpectrumMeter(level: controller.inputLevel)
-                    .opacity(controller.state == .recording ? 1 : 0.5)
-            case .failed(let message):
-                Image(systemName: "exclamationmark.triangle.fill")
-                Text(message)
-                    .lineLimit(1)
-                    .frame(maxWidth: 260, alignment: .leading)
-            case .idle, .downloadingModel, .loadingModel:
-                Text(controller.state.label)
-            }
-        }
-        .font(.system(size: 13, weight: .medium))
-        .foregroundStyle(Color.white.opacity(0.95))
-        .padding(EdgeInsets(top: 10, leading: 14, bottom: 10, trailing: 14))
-        .background(PillBackground())
-        .fixedSize()
-        .padding(12)
+        content
+            .font(.system(size: 13, weight: .medium))
+            .foregroundStyle(PillStyle.text)
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .padding(.horizontal, 14)
+            .frame(width: Overlay.pillSize.width, height: Overlay.pillSize.height)
+            .background(PillBackground())
+            .shadow(color: .black.opacity(0.3), radius: 10, y: 3)
+            .frame(width: Overlay.panelSize.width, height: Overlay.panelSize.height)
     }
+
+    @ViewBuilder
+    private var content: some View {
+        switch controller.state {
+        case .recording, .transcribing:
+            SpectrumMeter(level: controller.inputLevel)
+                .opacity(controller.state == .recording ? 1 : 0.4)
+        case .failed(let message):
+            Label(message, systemImage: "exclamationmark.triangle.fill")
+                .foregroundStyle(PillStyle.error)
+        case .notice(let message):
+            Label(message, systemImage: "doc.on.clipboard")
+        case .idle, .downloadingModel, .loadingModel:
+            Text(controller.state.label)
+        }
+    }
+
 }
 
 enum PillStyle {
     static let fill = Color(red: 0.078, green: 0.078, blue: 0.11).opacity(0.82)
+    static let text = Color.white.opacity(0.95)
+    static let dimText = Color.white.opacity(0.5)
     static let bar = Color.white.opacity(0.92)
+    static let error = Color(red: 1.0, green: 0.42, blue: 0.42)
 }
 
 /// Dark capsule with a hairline border.
@@ -104,12 +113,12 @@ private struct PillBackground: View {
     }
 }
 
-/// 24 thin white bars. Each new level pushes the history left,
+/// Thin white bars. Each new level pushes the history left,
 /// so the meter scrolls like a waveform rather than bouncing in place.
 private struct SpectrumMeter: View {
     let level: Float
 
-    private static let barCount = 24
+    private static let barCount = 36
     private static let barWidth: CGFloat = 2
     private static let spacing: CGFloat = 1.5
     private static let silenceFraction: CGFloat = 0.14

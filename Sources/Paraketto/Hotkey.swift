@@ -1,33 +1,40 @@
 import Carbon.HIToolbox
 import Foundation
 
-/// A system-wide push-to-talk hotkey built on Carbon's RegisterEventHotKey.
-/// Delivers both press and release so the caller can record while the key is held.
+/// A system-wide hotkey built on Carbon's RegisterEventHotKey.
+/// Delivers press and release; the dictation shortcut only uses the press.
 final class Hotkey {
     struct Binding {
         let keyCode: UInt32
         let carbonModifiers: UInt32
         let label: String
 
-        /// Control + Option + Space.
-        static let `default` = Binding(
-            keyCode: UInt32(kVK_Space),
-            carbonModifiers: UInt32(controlKey | optionKey),
-            label: "⌃⌥Space"
-        )
+        init(keyCode: UInt32, carbonModifiers: UInt32, label: String) {
+            self.keyCode = keyCode
+            self.carbonModifiers = carbonModifiers
+            self.label = label
+        }
+
+        init(_ chord: Chord) {
+            self.init(keyCode: UInt32(chord.keyCode), carbonModifiers: chord.carbonModifiers, label: chord.label)
+        }
     }
 
     /// Non-nil when the system refused the registration, typically because another app owns the chord.
     private(set) var registrationError: OSStatus?
 
+    private static var nextID: UInt32 = 1
+    private let id: UInt32
     private var hotKeyRef: EventHotKeyRef?
     private var handlerRef: EventHandlerRef?
     private let onPress: () -> Void
     private let onRelease: () -> Void
 
-    init(binding: Binding = .default, onPress: @escaping () -> Void, onRelease: @escaping () -> Void) {
+    init(binding: Binding, onPress: @escaping () -> Void, onRelease: @escaping () -> Void = {}) {
         self.onPress = onPress
         self.onRelease = onRelease
+        id = Self.nextID
+        Self.nextID += 1
         installHandler()
         register(binding)
     }
@@ -48,6 +55,13 @@ final class Hotkey {
             { _, event, userData in
                 guard let event, let userData else { return noErr }
                 let hotkey = Unmanaged<Hotkey>.fromOpaque(userData).takeUnretainedValue()
+                // Every handler sees every hotkey event; act only on this instance's own id.
+                var hotKeyID = EventHotKeyID()
+                GetEventParameter(
+                    event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
+                    nil, MemoryLayout<EventHotKeyID>.size, nil, &hotKeyID
+                )
+                guard hotKeyID.id == hotkey.id else { return noErr }
                 switch GetEventKind(event) {
                 case UInt32(kEventHotKeyPressed): hotkey.onPress()
                 case UInt32(kEventHotKeyReleased): hotkey.onRelease()
@@ -66,7 +80,7 @@ final class Hotkey {
     }
 
     private func register(_ binding: Binding) {
-        let hotKeyID = EventHotKeyID(signature: fourCharCode("PKTU"), id: 1)
+        let hotKeyID = EventHotKeyID(signature: fourCharCode("PKTU"), id: id)
         let status = RegisterEventHotKey(
             binding.keyCode, binding.carbonModifiers, hotKeyID,
             GetApplicationEventTarget(), 0, &hotKeyRef

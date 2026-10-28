@@ -2,11 +2,12 @@ import AVFoundation
 import Foundation
 
 /// Captures the default microphone and accumulates 16 kHz mono Float32 samples,
-/// the format Parakeet expects. Reports a smoothed input level for the overlay.
+/// the format Parakeet expects. Reports the raw RMS of each buffer for the level meter.
 final class AudioRecorder {
     static let sampleRate: Double = 16_000
 
-    var onLevel: ((Float) -> Void)?
+    /// Linear RMS amplitude relative to full scale, per captured buffer. Called off the main thread.
+    var onRMS: ((Float) -> Void)?
 
     private let engine = AVAudioEngine()
     private let targetFormat = AVAudioFormat(
@@ -39,7 +40,7 @@ final class AudioRecorder {
         try engine.start()
         // Installed only after the engine is running, so a failed start never leaves a tap
         // behind (a second tap on the same bus is a fatal AVFoundation exception).
-        input.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
+        input.installTap(onBus: 0, bufferSize: 2048, format: inputFormat) { [weak self] buffer, _ in
             self?.append(buffer)
         }
         Log.info("Recording started: \(Int(inputFormat.sampleRate)) Hz, \(inputFormat.channelCount) ch")
@@ -79,15 +80,12 @@ final class AudioRecorder {
         guard let channel = output.floatChannelData?[0] else { return }
         let converted = Array(UnsafeBufferPointer(start: channel, count: Int(output.frameLength)))
         lock.withLock { samples.append(contentsOf: converted) }
-        onLevel?(Self.level(of: converted))
+        onRMS?(Self.rms(of: converted))
     }
 
-    /// Root mean square mapped to 0...1 on a rough decibel scale so quiet speech still moves the meter.
-    private static func level(of samples: [Float]) -> Float {
+    private static func rms(of samples: [Float]) -> Float {
         guard !samples.isEmpty else { return 0 }
-        let meanSquare = samples.reduce(0) { $0 + $1 * $1 } / Float(samples.count)
-        let decibels = 10 * log10(max(meanSquare, 1e-10))
-        return min(max((decibels + 50) / 50, 0), 1)
+        return (samples.reduce(0) { $0 + $1 * $1 } / Float(samples.count)).squareRoot()
     }
 
     enum RecorderError: LocalizedError {
@@ -98,5 +96,34 @@ final class AudioRecorder {
             case .noInputDevice: return "No microphone input device is available."
             }
         }
+    }
+}
+
+/// Maps raw RMS to a display level on a logarithmic scale (-50 to -10 dBFS) with a fast
+/// attack and slow release, so quiet speech is visible and loud speech keeps its dynamics.
+struct LevelSmoother {
+    private static let floorDecibels: Float = -50
+    private static let ceilingDecibels: Float = -10
+    private static let attackSeconds: Float = 0.03
+    private static let releaseSeconds: Float = 0.16
+
+    private(set) var level: Float = 0
+    private var target: Float = 0
+
+    mutating func update(rms: Float) {
+        let decibels = 20 * log10(max(rms, 1e-6))
+        target = min(max((decibels - Self.floorDecibels) / (Self.ceilingDecibels - Self.floorDecibels), 0), 1)
+    }
+
+    /// Advances the smoothed level by `interval` seconds toward the latest target.
+    mutating func tick(interval: Float) {
+        let tau = target > level ? Self.attackSeconds : Self.releaseSeconds
+        let coefficient = 1 - exp(-interval / tau)
+        level += (target - level) * coefficient
+    }
+
+    mutating func reset() {
+        level = 0
+        target = 0
     }
 }
