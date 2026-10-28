@@ -2,3 +2,6 @@
 *.app/
 .DS_Store
 .swiftpm/
+tools/export/.venv/
+tools/export/cache/
+__pycache__/

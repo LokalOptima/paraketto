@@ -3,24 +3,38 @@ BUNDLE_ID     := io.lfrati.paraketto
 BUNDLE        := $(APP_NAME).app
 CONFIG        ?= release
 BINARY        := .build/$(CONFIG)/$(APP_NAME)
+CLI           := .build/$(CONFIG)/paraketto-cli
 CONTENTS      := $(BUNDLE)/Contents
+VAD_PACKAGE   := Resources/VadHead.mlpackage
+VAD_COMPILED  := .build/VadHead.mlmodelc
+FIXTURES      := tests/fixtures/librispeech_fluidaudio.tsv
+CLIPS         ?= ../paraketto/data/librispeech/*.wav
 # Uses the "Paraketto Dev" self-signed certificate when it exists (see README), otherwise
 # ad-hoc. Ad-hoc signatures change on every build, which invalidates the Accessibility grant.
 SIGN_IDENTITY ?= $(if $(shell security find-identity -p codesigning 2>/dev/null | grep -o '"Paraketto Dev"'),Paraketto Dev,-)
 
-.PHONY: all build bundle run trust clean
+.PHONY: all build bundle run trust vad cli compare vad-export encoder-export decoder-export clean
+
+MODELS_DIR    := $(HOME)/Library/Application Support/Paraketto/models
 
 all: bundle
 
 build:
 	swift build -c $(CONFIG)
 
-bundle: build
+# Compiles the VAD head once; the .mlpackage in Resources is the source of truth.
+vad: $(VAD_COMPILED)
+
+$(VAD_COMPILED): $(VAD_PACKAGE)
+	rm -rf $(VAD_COMPILED)
+	xcrun coremlcompiler compile $(VAD_PACKAGE) .build
+
+bundle: build vad
 	rm -rf $(BUNDLE)
 	mkdir -p $(CONTENTS)/MacOS $(CONTENTS)/Resources
 	cp $(BINARY) $(CONTENTS)/MacOS/$(APP_NAME)
 	cp Resources/Info.plist $(CONTENTS)/Info.plist
-	cp -R .build/$(CONFIG)/*.bundle $(CONTENTS)/Resources/ 2>/dev/null || true
+	cp -R $(VAD_COMPILED) $(CONTENTS)/Resources/
 	codesign --force --sign "$(SIGN_IDENTITY)" \
 		--entitlements Resources/$(APP_NAME).entitlements \
 		--options runtime $(BUNDLE)
@@ -34,6 +48,29 @@ run: bundle
 trust:
 	tccutil reset Accessibility $(BUNDLE_ID)
 	open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+
+cli: build vad
+
+# Transcribes the LibriSpeech clips and checks every transcript against FluidAudio's.
+compare: cli
+	$(CLI) --vad $(VAD_COMPILED) --compare $(FIXTURES) $(CLIPS)
+
+# Re-exports the VAD head from moondream/parakeet-ultra (needs uv; fetches ~9 MB of weights).
+vad-export:
+	cd tools/export && uv run python export_vad_head.py --out ../../$(VAD_PACKAGE)
+
+# Exports the encoder with 5 s, 10 s and 15 s windows (needs uv; downloads the 1.2 GB checkpoint once)
+# and compiles it where the app and CLI pick it up automatically.
+encoder-export:
+	cd tools/export && uv run python export_encoder.py --out "$(MODELS_DIR)/parakeet-ultra-encoder/Encoder.mlpackage"
+	rm -rf "$(MODELS_DIR)/parakeet-ultra-encoder/Encoder.mlmodelc"
+	xcrun coremlcompiler compile "$(MODELS_DIR)/parakeet-ultra-encoder/Encoder.mlpackage" "$(MODELS_DIR)/parakeet-ultra-encoder"
+
+# Exports the fused decoder+joint step model (needs uv; fetches ~36 MB of weights) and compiles it.
+decoder-export:
+	cd tools/export && uv run python export_fused_decoder.py --out "$(MODELS_DIR)/parakeet-ultra-decoder/DecoderJoint.mlpackage"
+	rm -rf "$(MODELS_DIR)/parakeet-ultra-decoder/DecoderJoint.mlmodelc"
+	xcrun coremlcompiler compile "$(MODELS_DIR)/parakeet-ultra-decoder/DecoderJoint.mlpackage" "$(MODELS_DIR)/parakeet-ultra-decoder"
 
 clean:
 	rm -rf $(BUNDLE) .build

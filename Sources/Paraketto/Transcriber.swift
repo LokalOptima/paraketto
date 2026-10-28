@@ -1,7 +1,7 @@
-import FluidAudio
 import Foundation
+import ParakeetTDT
 
-/// Parakeet Ultra on the Apple Neural Engine via FluidAudio's Core ML models.
+/// Parakeet Ultra on the Apple Neural Engine through the ParakeetTDT library.
 actor Transcriber {
     enum LoadPhase: Equatable {
         /// Fetching model files from Hugging Face; `fraction` is 0...1 of the download.
@@ -10,32 +10,26 @@ actor Transcriber {
         case loading
     }
 
-    /// Recordings shorter than this are rejected by FluidAudio, so callers skip them up front.
-    static let minimumSamples = ASRConstants.minimumRequiredSamples(forSampleRate: Int(AudioRecorder.sampleRate))
+    /// Recordings shorter than this have nothing to decode, so callers skip them up front.
+    static let minimumSamples = ParakeetConstants.minimumSamples
 
-    private var manager: AsrManager?
+    private var transcriber: ParakeetTranscriber?
 
     /// Downloads the models on first run (about 613 MB), then loads them. Subsequent
-    /// launches load from ~/Library/Application Support/FluidAudio/Models in well under a second.
+    /// launches load from Application Support in well under a second.
     func load(progress: @escaping @Sendable (LoadPhase) -> Void) async throws {
-        let models = try await AsrModels.downloadAndLoad(version: .ultra) { update in
-            switch update.phase {
-            case .listing: progress(.downloading(fraction: 0))
-            case .downloading: progress(.downloading(fraction: update.fractionCompleted))
-            case .compiling: progress(.loading)
-            }
-        }
+        let directory = try await ModelStore.locate { fraction in progress(.downloading(fraction: fraction)) }
         progress(.loading)
-        let manager = AsrManager(config: .default)
-        try await manager.loadModels(models)
-        self.manager = manager
+        let vadModel = Bundle.main.url(forResource: "VadHead", withExtension: "mlmodelc")
+        if vadModel == nil { Log.info("VadHead.mlmodelc not bundled; long recordings fall back to fixed windows") }
+        let models = try ParakeetModels(directory: directory, vadModel: vadModel, encoderModel: ModelStore.ownEncoderURL, fusedDecoder: ModelStore.ownFusedDecoderURL)
+        Log.info("encoder windows (mel frames): \(models.encoder.variants.map(\.melFrames))")
+        transcriber = try ParakeetTranscriber(models: models)
     }
 
     func transcribe(_ samples: [Float]) async throws -> String {
-        guard let manager else { throw TranscriberError.notLoaded }
-        var state = TdtDecoderState.make(decoderLayers: await manager.decoderLayerCount)
-        let result = try await manager.transcribe(samples, decoderState: &state)
-        return result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let transcriber else { throw TranscriberError.notLoaded }
+        return try transcriber.transcribe(samples).text
     }
 
     enum TranscriberError: LocalizedError {

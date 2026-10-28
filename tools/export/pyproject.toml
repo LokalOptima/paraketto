@@ -1,0 +1,13 @@
+[project]
+name = "vad-export"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.12"
+dependencies = [
+    "coremltools>=9.0",
+    "numpy>=2.5.4",
+    "safetensors>=0.8.0",
+    "soundfile>=0.14.0",
+    "torch>=2.14.1",
+    "transformers>=5.21.0",
+]
