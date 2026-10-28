@@ -14,7 +14,7 @@ var comparePath: String?
 var vadProbe = false
 var showTokens = false
 var showPlan = false
-var decoderBackend = "coreml"  // "cpu" selects the experimental Accelerate decoder
+var decoderBackend = DecoderBackend.metal  // --decoder coreml|cpu select the other loops
 var encoderPath: String?
 var useFused = true
 var fusedPath: String?
@@ -27,7 +27,13 @@ while !arguments.isEmpty {
     case "--vad-probe": vadProbe = true
     case "--tokens": showTokens = true
     case "--plan": showPlan = true
-    case "--decoder": decoderBackend = arguments.removeFirst()
+    case "--decoder":
+        let name = arguments.removeFirst()
+        guard let backend = DecoderBackend(rawValue: name) else {
+            FileHandle.standardError.write(Data("unknown decoder backend \(name); use coreml, cpu or metal\n".utf8))
+            exit(2)
+        }
+        decoderBackend = backend
     case "--encoder": encoderPath = arguments.removeFirst()
     case "--fused":
         let value = arguments.removeFirst()
@@ -128,13 +134,13 @@ let models = try ParakeetModels(directory: directory, vadModel: vadPath.map { UR
 FileHandle.standardError.write(Data("fused decoder step: \(fusedURL == nil ? "off" : "on")\n".utf8))
 FileHandle.standardError.write(Data("encoder: \(encoderURL?.path ?? "FluidAudio 15 s") windows \(models.encoder.variants.map(\.melFrames))\n".utf8))
 var decoderWeights: URL?
-if decoderBackend == "cpu" {
+if decoderBackend != .coreML {
     decoderWeights = try await ModelStore.locateDecoderWeights { fraction in
         FileHandle.standardError.write(Data(String(format: "fetching decoder weights %.0f%%\n", fraction * 100).utf8))
     }
 }
-let transcriber = try ParakeetTranscriber(models: models, decoderWeights: decoderWeights)
-FileHandle.standardError.write(Data("decoder: \(decoderBackend)\n".utf8))
+let transcriber = try ParakeetTranscriber(models: models, decoderWeights: decoderWeights, backend: decoderBackend)
+FileHandle.standardError.write(Data("decoder: \(decoderBackend.rawValue)\n".utf8))
 FileHandle.standardError.write(Data(String(format: "models loaded in %.0f ms from %@\n", Date().timeIntervalSince(started) * 1000, directory.path).utf8))
 
 var reference: [String: String] = [:]
