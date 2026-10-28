@@ -1,7 +1,7 @@
 import Foundation
 import ParakeetTDT
 
-/// Parakeet Ultra through the ParakeetTDT library: encoder on the Neural Engine, greedy decode on the GPU.
+/// Parakeet Ultra on the Apple Neural Engine through the ParakeetTDT library.
 actor Transcriber {
     enum LoadPhase: Equatable {
         /// Fetching model files from Hugging Face; `fraction` is 0...1 of the download.
@@ -24,16 +24,7 @@ actor Transcriber {
         if vadModel == nil { Log.info("VadHead.mlmodelc not bundled; long recordings fall back to fixed windows") }
         let models = try ParakeetModels(directory: directory, vadModel: vadModel, encoderModel: ModelStore.ownEncoderURL, fusedDecoder: ModelStore.ownFusedDecoderURL)
         Log.info("encoder windows (mel frames): \(models.encoder.variants.map(\.melFrames))")
-        // The GPU decoder needs the decoder and joint weights (36 MB, fetched once). Core ML decodes if that fails.
-        do {
-            let weights = try await ModelStore.locateDecoderWeights { fraction in progress(.downloading(fraction: fraction)) }
-            progress(.loading)
-            transcriber = try ParakeetTranscriber(models: models, decoderWeights: weights, backend: .metal)
-            Log.info("decoder: Metal")
-        } catch {
-            Log.info("Metal decoder unavailable (\(error.localizedDescription)); decoding with Core ML")
-            transcriber = try ParakeetTranscriber(models: models)
-        }
+        transcriber = try ParakeetTranscriber(models: models)
     }
 
     func transcribe(_ samples: [Float]) async throws -> String {

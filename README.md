@@ -5,14 +5,13 @@ pasted into whatever app has focus. Speech recognition is
 [Parakeet Ultra](https://huggingface.co/moondream/parakeet-ultra) running on the Apple
 Neural Engine with Core ML. Nothing leaves the Mac.
 
-- Encoder on the Neural Engine, greedy decode on the GPU; 190x real time on an M1 Max
 - Menu bar only, no Dock icon
 - Shortcut: tap `Right ⌥` to start and stop a recording, `Esc` discards it. A tap is a press and release under 0.6 s with no other key in between, so Option+letter typing is unaffected. Change it in Settings (`⌘,` from the menu) by tapping another modifier key or pressing any key combination
 - Floating pill while recording: a level meter on a -50 to -10 dBFS scale with 30 ms attack / 160 ms release smoothing
 - Text is pasted only if the app that had focus when you started still has it; otherwise it is kept in history
 - History window (`⌘H` from the menu): every dictation with its recording, grouped by day, with play, copy, delete, and word count / WPM stats
 - 25 European languages with automatic detection, punctuation and capitalization included
-- Model download on first launch (613 MB to `~/Library/Application Support/Paraketto/models/parakeet-ultra`, plus a 36 MB slice of the checkpoint for the GPU decoder; an existing FluidAudio cache is reused)
+- Model download on first launch (613 MB to `~/Library/Application Support/Paraketto/models/parakeet-ultra`; an existing FluidAudio cache is reused)
 
 The transcript also stays on the clipboard after pasting. The previous clipboard contents are not
 restored, since a timed restore races slow readers and the old contents are one undo away.
@@ -69,13 +68,10 @@ is not trusted and text is only copied. Two ways out:
 | `ModelStore.swift` | finds the models or downloads them from `FluidInference/parakeet-ultra-coreml` |
 | `ParakeetModels.swift` | loads the four Core ML models (preprocessor on CPU, the rest on the ANE), the VAD head and the vocabulary |
 | `ParakeetTranscriber.swift` | mel → encoder → decode per segment, 15 s windows with 1 s of acoustic context on each side |
-| `MetalTdtDecoder.swift` | the greedy Token-and-Duration Transducer loop on the GPU: five Metal kernels, one command buffer per 48 steps |
-| `TdtDecoder.swift` | the same loop with the Core ML decoder and joint models (`--decoder coreml`) |
+| `TdtDecoder.swift` | greedy Token-and-Duration Transducer loop with the 2-layer LSTM state |
 | `VoiceActivity.swift` | cuts long recordings at pauses found by the model's own VAD head |
 | `EncoderSet.swift` | picks the shortest encoder window that holds a segment |
 | `MultiArray.swift` | small `MLMultiArray` helpers |
-| `SafeTensors.swift` | reads the decoder and joint tensors for the GPU and CPU decoders |
-| `CPUDecoder.swift`, `CPUTdtDecoder.swift` | experimental Accelerate decoder (`--decoder cpu`), kept for measurement |
 
 The model files are FluidAudio's Core ML conversion (Apache 2.0) of moondream's checkpoint
 (CC-BY-4.0): a fixed 15 s preprocessor and int8 encoder, an LSTM decoder, and a joint network
@@ -96,17 +92,6 @@ a second of neighbouring audio on both sides, tokens are emitted only for the se
 word straddling the cut is finished before the next segment resumes, and the decoder state is
 carried across. Recordings of 15 s or less are decoded in one pass, identical to FluidAudio.
 
-### Decoding on the GPU
-
-The sequential part of decoding, one LSTM step and one joint evaluation per token, is bound by
-streaming about 26 MB of weights per token. Core ML runs it on one CPU core in fp32 at 0.73 ms a
-token. `MetalTdtDecoder` runs the whole greedy loop on the GPU instead: the argmax kernel picks the
-token, applies the duration rule, advances the frame pointer and gathers the next embedding, so a
-command buffer of 48 steps runs with no CPU round trip, and kernels of blank or finished steps exit
-in a few µs. With fp16 weights served from the system cache a token costs about 60 µs. The weights
-are the checkpoint's own (`ModelStore.locateDecoderWeights` fetches the 36 MB slice once), and
-numerics match the Core ML models to the same 15 of 17 identical transcripts.
-
 ### Faster than the stock export
 
 Two optional exports, built locally with `uv` (they are too large for the repo) and picked up
@@ -126,13 +111,14 @@ Measured on the 17 LibriSpeech clips on an M1 Max, same transcripts in every con
 | FluidAudio models, two-call decode | 80x |
 | + fused decoder step | 93x |
 | + multi-window encoder | 124x |
-| + Metal decoder | 190x |
 
-Of the remaining time, about three quarters is the encoder on the ANE (17 to 55 ms depending on
-window), the rest mel, VAD and the GPU decode (8 ms for a 10 s clip). For the record, the Core ML
-decode step was bound by streaming fp32 weights through one core: Core ML's per-call floor is only
-35 µs, int8 or 4-bit weights do not change its time because the CPU path expands them at load,
-and an Accelerate reimplementation (`--decoder cpu`) was not faster either.
+The remaining time is split between the encoder on the ANE (17 to 55 ms depending on window) and
+the sequential decode on the CPU: 0.73 ms per emitted token inside the fused step, bound by
+streaming the fp32 LSTM and joint weights through one core (Core ML's per-call floor is 35 µs, and
+smaller weights do not help because the CPU path expands them at load). A Metal decoder that ran
+the greedy loop on the GPU reached 182x with identical transcripts (commit `89c4e5e`), but hand-written
+kernels failed silently twice on the way there, and for dictation the 30 ms it saves on a 10 s
+utterance is below perception, so it was removed in favour of the framework path.
 
 ### Measuring
 
@@ -142,8 +128,8 @@ and an Accelerate reimplementation (`--decoder cpu`) was not faster either.
 - `paraketto-cli --plan` prints each model's operation count, how Core ML assigns operations to
   CPU, GPU and ANE, and which operators force the CPU.
 - `PARAKEET_TIMING=1` prints mel, encoder and decode time per recording, with the number and total
-  time of Core ML decoder calls or Metal command buffers; `--decoder coreml|cpu|metal` picks the
-  decode loop; `--fused <model>` swaps in another fused step export for A/B timing; `--tokens` prints each
+  time of fused, joint and decoder Core ML calls; `--fused <model>` swaps in another fused step
+  export for A/B timing; `--tokens` prints each
   token with its frame; `--vad-probe` prints the VAD strip; `PARAKEET_DEBUG=1` logs every joint decision.
 
 ### Checking against FluidAudio

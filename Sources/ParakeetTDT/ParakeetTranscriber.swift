@@ -17,16 +17,6 @@ public struct Transcription {
 /// model's VAD head. Each segment is encoded with about a second of neighbouring audio on
 /// both sides so the boundary is heard in context, tokens are emitted only for the segment
 /// itself, and the decoder state is carried from segment to segment.
-/// Which implementation runs the sequential prediction-network and joint loop.
-public enum DecoderBackend: String, Sendable {
-    /// Core ML decoder and joint models (and the fused step when exported). No extra weights needed.
-    case coreML = "coreml"
-    /// Accelerate on the CPU; a measured negative result kept for comparison.
-    case cpu
-    /// The greedy loop on the GPU with Metal.
-    case metal
-}
-
 public final class ParakeetTranscriber {
     /// Acoustic context added on each side of a segment, in encoder frames (~1 s).
     static let contextFrames = 12
@@ -34,35 +24,13 @@ public final class ParakeetTranscriber {
 
     private let models: ParakeetModels
     private let decoder: TdtDecoder
-    /// Accelerate-based prediction network and joint; used instead of the Core ML models when present.
-    private let cpuDecoder: CPUTdtDecoder?
-    private let metalDecoder: MetalTdtDecoder?
     private let segmenter: Segmenter
     private let audioBuffer = try! MLMultiArray.float32([1, ParakeetConstants.windowSamples])
 
-    /// - Parameters:
-    ///   - decoderWeights: safetensors with the decoder/joint tensors (see `ModelStore.locateDecoderWeights`),
-    ///     required by the `cpu` and `metal` backends.
-    ///   - backend: falls back to Core ML when its weights are missing.
-    public init(models: ParakeetModels, decoderWeights: URL? = nil, backend: DecoderBackend = .coreML) throws {
+    public init(models: ParakeetModels) throws {
         self.models = models
         let vocabulary = models.vocabulary
         decoder = TdtDecoder(decoder: models.decoder, joint: models.joint, fusedStep: models.fusedStep, isWordStart: { vocabulary.isWordStart($0) })
-        var cpuDecoder: CPUTdtDecoder?
-        var metalDecoder: MetalTdtDecoder?
-        if let decoderWeights {
-            switch backend {
-            case .cpu:
-                let network = try CPUDecoder(weights: try SafeTensors(url: decoderWeights))
-                cpuDecoder = CPUTdtDecoder(network: network, isWordStart: { vocabulary.isWordStart($0) })
-            case .metal:
-                metalDecoder = try MetalTdtDecoder(weights: try SafeTensors(url: decoderWeights), isWordStart: { vocabulary.isWordStart($0) })
-            case .coreML:
-                break
-            }
-        }
-        self.cpuDecoder = cpuDecoder
-        self.metalDecoder = metalDecoder
         var segmenter = Segmenter()
         segmenter.maximumSegmentFrames = Self.windowFrames - 2 * Self.contextFrames
         self.segmenter = segmenter
@@ -74,7 +42,7 @@ public final class ParakeetTranscriber {
         // A recording that fits one window is decoded whole, exactly as FluidAudio does.
         guard samples.count > ParakeetConstants.windowSamples else {
             var state = try DecoderState()
-            resetDecoders()
+            DecodeProfile.reset()
             let t0 = Date()
             let mel = try preprocess(samples[...])
             let t1 = Date()
@@ -84,7 +52,6 @@ public final class ParakeetTranscriber {
             if ProcessInfo.processInfo.environment["PARAKEET_TIMING"] != nil {
                 let ms = { (a: Date, b: Date) in Int(b.timeIntervalSince(a) * 1000) }
                 FileHandle.standardError.write(Data("timing: mel \(ms(t0, t1)) ms, encoder \(ms(t1, t2)) ms, decode \(ms(t2, Date())) ms over \(frames.count) frames, \(result.tokens.count) tokens; \(DecodeProfile.summary)\n".utf8))
-                if let summary = alternateTimingSummary { FileHandle.standardError.write(Data(summary.utf8 + [10])) }
             }
             return Transcription(
                 text: models.vocabulary.text(for: result.tokens), segments: 1,
@@ -93,7 +60,7 @@ public final class ParakeetTranscriber {
         }
 
         var state = try DecoderState()
-        resetDecoders()
+        DecodeProfile.reset()
         let timing = ProcessInfo.processInfo.environment["PARAKEET_TIMING"] != nil
         let t0 = Date()
         var melNanos = 0.0, encodeNanos = 0.0, decodeNanos = 0.0
@@ -129,7 +96,6 @@ public final class ParakeetTranscriber {
         if timing {
             let ms = { (s: Double) in Int(s * 1000) }
             FileHandle.standardError.write(Data("timing: vad+mel \(ms(tVad.timeIntervalSince(t0))) ms, \(segments.count) segments: mel \(ms(melNanos)) ms, encoder \(ms(encodeNanos)) ms, decode \(ms(decodeNanos)) ms over \(totalFrames) frames, \(tokens.count) tokens; \(DecodeProfile.summary)\n".utf8))
-            if let summary = alternateTimingSummary { FileHandle.standardError.write(Data(summary.utf8 + [10])) }
         }
         return Transcription(text: models.vocabulary.text(for: tokens), segments: segments.count, tokens: emitted)
     }
@@ -148,19 +114,8 @@ public final class ParakeetTranscriber {
     }
 
     private func decode(frames: EncoderFrames, range: Range<Int>, state: inout DecoderState) throws -> TdtDecoder.Result {
-        if let metalDecoder { return metalDecoder.decode(frames: frames, range: range) }
-        if let cpuDecoder { return cpuDecoder.decode(frames: frames, range: range) }
-        return try decoder.decode(frames: frames, range: range, state: &state)
+        try decoder.decode(frames: frames, range: range, state: &state)
     }
-
-    private func resetDecoders() {
-        cpuDecoder?.reset()
-        metalDecoder?.reset()
-        metalDecoder?.resetTiming()
-        DecodeProfile.reset()
-    }
-
-    private var alternateTimingSummary: String? { metalDecoder?.timingSummary ?? cpuDecoder?.timingSummary }
 
     /// Longest suffix of `tail` (up to 8 tokens, starting at a word boundary) that `head` begins with.
     static func overlap(tail: [Int], head: [Int], isWordStart: ((Int) -> Bool)? = nil) -> Int {

@@ -49,62 +49,6 @@ public enum ModelStore {
         return FileManager.default.fileExists(atPath: url.path) ? url : nil
     }
 
-    // MARK: Decoder weights for the CPU decoder
-
-    public static let checkpointRepository = "moondream/parakeet-ultra"
-    static let checkpointURL = URL(string: "https://huggingface.co/\(checkpointRepository)/resolve/main/model.safetensors")!
-    static let decoderTensorPrefixes = ["decoder.", "joint.", "encoder_projector"]
-
-    public static var decoderWeightsURL: URL {
-        ownDirectory.deletingLastPathComponent().appendingPathComponent("parakeet-ultra-decoder.safetensors")
-    }
-
-    /// Returns a local safetensors file holding only the prediction network, projections and joint head
-    /// (about 36 MB), fetched once from the 1.2 GB checkpoint with HTTP range requests.
-    public static func locateDecoderWeights(progress: @escaping @Sendable (Double) -> Void) async throws -> URL {
-        let destination = decoderWeightsURL
-        if FileManager.default.fileExists(atPath: destination.path) { return destination }
-        try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
-
-        let headerLength = Int(try await fetch(range: 0..<8).withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) })
-        let header = try JSONSerialization.jsonObject(with: try await fetch(range: 8..<(8 + headerLength))) as? [String: Any] ?? [:]
-        let base = 8 + headerLength
-        var selected: [(name: String, entry: [String: Any], offsets: [Int])] = []
-        for (name, value) in header where name != "__metadata__" && decoderTensorPrefixes.contains(where: name.hasPrefix) {
-            guard let entry = value as? [String: Any], let offsets = entry["data_offsets"] as? [Int] else { continue }
-            selected.append((name, entry, offsets))
-        }
-        selected.sort { $0.offsets[0] < $1.offsets[0] }
-        let totalBytes = Double(selected.reduce(0) { $0 + $1.offsets[1] - $1.offsets[0] })
-
-        var outHeader: [String: Any] = [:]
-        var blobs = Data()
-        for (name, entry, offsets) in selected {
-            let blob = try await fetch(range: (base + offsets[0])..<(base + offsets[1]))
-            outHeader[name] = ["dtype": entry["dtype"]!, "shape": entry["shape"]!, "data_offsets": [blobs.count, blobs.count + blob.count]]
-            blobs.append(blob)
-            progress(Double(blobs.count) / totalBytes)
-        }
-        var encoded = try JSONSerialization.data(withJSONObject: outHeader)
-        encoded.append(Data(repeating: 0x20, count: (8 - encoded.count % 8) % 8))
-        var file = Data()
-        file.append(withUnsafeBytes(of: UInt64(encoded.count).littleEndian) { Data($0) })
-        file.append(encoded)
-        file.append(blobs)
-        try file.write(to: destination, options: .atomic)
-        return destination
-    }
-
-    private static func fetch(range: Range<Int>) async throws -> Data {
-        var request = URLRequest(url: checkpointURL)
-        request.setValue("bytes=\(range.lowerBound)-\(range.upperBound - 1)", forHTTPHeaderField: "Range")
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard (response as? HTTPURLResponse)?.statusCode == 206, data.count == range.count else {
-            throw ParakeetError.download("Range request to \(checkpointRepository) failed")
-        }
-        return data
-    }
-
     private struct Sibling: Decodable {
         let rfilename: String
         let size: Int?
