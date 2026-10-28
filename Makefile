@@ -9,9 +9,16 @@ VAD_PACKAGE   := Resources/VadHead.mlpackage
 VAD_COMPILED  := .build/VadHead.mlmodelc
 FIXTURES      := tests/fixtures/librispeech_fluidaudio.tsv
 CLIPS         ?= ../paraketto/data/librispeech/*.wav
-# Uses the "Paraketto Dev" self-signed certificate when it exists (see README), otherwise
-# ad-hoc. Ad-hoc signatures change on every build, which invalidates the Accessibility grant.
-SIGN_IDENTITY ?= $(if $(shell security find-identity -p codesigning 2>/dev/null | grep -o '"Paraketto Dev"'),Paraketto Dev,-)
+# Signing. macOS ties the Accessibility grant to the app's signature. With the "Paraketto Dev"
+# self-signed certificate in the login keychain (see README) every build carries the same
+# signature and the grant survives; without it codesign falls back to ad-hoc ("-"), whose
+# signature changes on every build. The certificate is selected by the SHA-1 hash that
+# `security find-identity` prints, so a certificate imported twice is not "ambiguous" to codesign.
+# Override with SIGN_IDENTITY=<hash or name>; the bundle target then checks the signature
+# against SIGN_NAME, so set that too for a differently named certificate.
+SIGN_NAME     ?= Paraketto Dev
+SIGN_IDENTITY ?= $(or $(shell security find-identity -p codesigning 2>/dev/null | grep -F '"$(SIGN_NAME)"' | head -1 | awk '{print $$2}'),-)
+SIGN_IDENTITY := $(SIGN_IDENTITY)
 
 .PHONY: all build bundle run trust vad cli compare vad-export encoder-export decoder-export clean
 
@@ -35,15 +42,19 @@ bundle: build vad
 	cp $(BINARY) $(CONTENTS)/MacOS/$(APP_NAME)
 	cp Resources/Info.plist $(CONTENTS)/Info.plist
 	cp -R $(VAD_COMPILED) $(CONTENTS)/Resources/
+# The first codesign with a new key blocks on a keychain dialog until "Always Allow" is clicked.
 	codesign --force --sign "$(SIGN_IDENTITY)" \
 		--entitlements Resources/$(APP_NAME).entitlements \
 		--options runtime $(BUNDLE)
 	codesign --verify --deep --strict $(BUNDLE)
 ifneq ($(SIGN_IDENTITY),-)
-	@codesign -dvv $(BUNDLE) 2>&1 | grep -q '^Authority=$(SIGN_IDENTITY)$$' \
-		|| { echo "error: $(BUNDLE) is not signed by $(SIGN_IDENTITY); removing it"; rm -rf $(BUNDLE); exit 1; }
+# An ad-hoc build would look fine but lose the Accessibility grant, so refuse to keep one.
+	@codesign -dvv $(BUNDLE) 2>&1 | grep -q '^Authority=$(SIGN_NAME)$$' \
+		|| { echo "error: $(BUNDLE) is not signed by $(SIGN_NAME); removing it"; rm -rf $(BUNDLE); exit 1; }
+	@echo "signed with: $(SIGN_NAME) ($(SIGN_IDENTITY))"
+else
+	@echo "signed ad-hoc: no $(SIGN_NAME) certificate found, the Accessibility grant will not survive rebuilds"
 endif
-	@echo "signed with: $(SIGN_IDENTITY)"
 
 run: bundle
 	open $(BUNDLE)
