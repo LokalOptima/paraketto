@@ -36,7 +36,7 @@ enum Paster {
 
     enum Outcome {
         case pasted
-        /// Accessibility is not granted; the text is on the clipboard.
+        /// Automatic delivery is unavailable; the text is on the clipboard.
         case copiedOnly
         /// Focus moved to another app since recording started; nothing was pasted.
         case destinationChanged
@@ -54,7 +54,7 @@ enum Paster {
         guard isAccessibilityTrusted else { return .copiedOnly }
 
         await waitForModifiersReleased()
-        sendCommandV()
+        guard sendCommandV() else { return .copiedOnly }
         return .pasted
     }
 
@@ -68,19 +68,19 @@ enum Paster {
         }
     }
 
-    private static func sendCommandV() {
+    private static func sendCommandV() -> Bool {
         let source = CGEventSource(stateID: .combinedSessionState)
         let keyV = CGKeyCode(kVK_ANSI_V)
         guard let down = CGEvent(keyboardEventSource: source, virtualKey: keyV, keyDown: true),
               let up = CGEvent(keyboardEventSource: source, virtualKey: keyV, keyDown: false)
-        else { return }
-        // Carry the character explicitly so non-ANSI layouts (Dvorak, Colemak…) still see Cmd+V.
-        var character: [UniChar] = [0x76]
+        else { return false }
+        // Leave character translation to macOS for shortcuts. Forcing Unicode "v" breaks
+        // Cmd+V in Notes and Signal.
         for event in [down, up] {
             event.flags = .maskCommand
-            event.keyboardSetUnicodeString(stringLength: 1, unicodeString: &character)
         }
         down.post(tap: .cghidEventTap)
         up.post(tap: .cghidEventTap)
+        return true
     }
 }
