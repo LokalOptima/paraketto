@@ -1,460 +1,194 @@
-<p align="center">
-  <img src="paraketto.png" width="256" alt="parakettő">
-</p>
+# Paraketto
 
-# parakettő
+Minimal dictation for macOS. Tap Right Option, speak, tap it again: the text is
+pasted into whatever app has focus. Speech recognition is
+[Parakeet Ultra](https://huggingface.co/moondream/parakeet-ultra) running on the Apple
+Neural Engine with Core ML. Nothing leaves the Mac.
 
-Speech-to-text inference for NVIDIA's [Parakeet TDT 0.6B](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2), written in C++ with custom CUDA kernels. No frameworks, no Python at runtime.
+- Menu bar only, no Dock icon
+- Shortcut: tap `Right ⌥` to start and stop a recording, `Esc` discards it. A tap is a press and release under 0.6 s with no other key in between, so Option+letter typing is unaffected. Change it in Settings (`⌘,` from the menu) by tapping another modifier key or pressing any key combination
+- Transcription runs while you speak: every pause of 0.8 s ends a segment and it is transcribed right away, so when you pause before stopping the text is already there
+- Floating pill while recording: a level meter on a -50 to -10 dBFS scale with 30 ms attack / 160 ms release smoothing
+- Text is pasted only if the app that had focus when you started still has it; otherwise it is kept in history
+- History window (`⌘H` from the menu): every dictation with its recording, grouped by day, with play, copy, delete, and word count / WPM stats
+- 25 European languages with automatic detection, punctuation and capitalization included
+- Model download on first launch (613 MB to `~/Library/Application Support/Paraketto/models/parakeet-ultra`; an existing FluidAudio cache is reused)
 
-- **V2** (English) and **V3** (25 EU languages, auto-detect) — `--model v3`
-- Batch 1, 1200x–1400x real-time — fast on a single WAV
-- Custom CUDA/CUTLASS kernels — only `libcudart.so`
-- Long audio support — files >120s auto-split at silence boundaries
-- Low VRAM: approximately 1.8 GB
-- ~240ms warm startup
-- Builtin HTTP server with web UI (microphone + file upload)
+The transcript also stays on the clipboard after pasting. The previous clipboard contents are not
+restored, since a timed restore races slow readers and the old contents are one undo away.
 
-```
-WAV (16kHz/24kHz mono) → mel spectrogram → conformer encoder → TDT greedy decoder → text
-```
+## Build and run
 
-## Performance
-
-RTX 5070 Ti, batch size 1. Two FP16 GEMM backends: **CUTLASS** (zero dependencies beyond `libcudart.so`) and **cuBLAS** (requires `libcublas.so`). Everything else — FFT, mel filterbank, LayerNorm, convolutions, SiLU, GLU, LSTM, greedy decoding — runs on custom CUDA kernels in all backends.
-
-```
-                 CUTLASS (cudart only)          cuBLAS (+ libcublas)
-              ────────────────────────────   ────────────────────────────
-               RTFx    WER    Audio  Time     RTFx    WER    Audio  Time
-librispeech   1109x   1.38%   896s  808ms    1048x   1.38%   896s  854ms
-earnings22     957x  11.37%   253s  264ms     973x  11.37%   253s  260ms
-long          1355x   1.64%  5578s  4.12s    1356x   1.63%  5578s  4.11s
-difficult     1189x  20.99%   509s  428ms    1223x  21.07%   509s  416ms
-              ────────────────────────────   ────────────────────────────
-Total         1288x          7236s  5.62s    1282x          7236s  5.64s
-```
-
-### Startup time
-
-Time from process start to first inference, measured with `tests/bench_startup.py`:
-
-```
-                startup (cold / warm)
-CUTLASS:       600ms / 240ms      paraketto-fp16.bin (1.2 GB)
-cuBLAS:        620ms / 240ms      paraketto-fp16.bin (1.2 GB)
-```
-
-Cold = weight files not in OS page cache. Warm = cached.
-
-### Test machine
-
-```
-┌───────────┬────────────────────────────────────────────────────────────────┐
-│ CPU       │ Intel Core i7-12700 — 2.1 GHz base / 4.9 GHz boost, 25 MB L3   │
-│ RAM       │ Corsair Vengeance LPX 32 GB DDR4-3200 CL16, dual ch, 51.2 GB/s │
-│ GPU       │ NVIDIA GeForce RTX 5070 Ti — 16 GB GDDR7, 896 GB/s, 2452 MHz   │
-│ Storage   │ Samsung 970 EVO 1 TB NVMe — PCIe 3.0 x4, 3400/2500 MB/s r/w    │
-└───────────┴────────────────────────────────────────────────────────────────┘
-```
-
-## Backends
-
-Two FP16 CUDA backends, same driver and weight loader. Both support V2 (English) and V3 (multilingual) via `--model v2|v3`:
-
-| Binary | GEMM backend | Weights | Notes |
-|--------|-------------|---------|-------|
-| `paraketto.cuda` | CUTLASS FP16 (custom-tuned) | `paraketto-fp16.bin` (1.2 GB) | default, no cuBLAS dep |
-| `paraketto.cublas` | cuBLAS/cublasLt FP16 | `paraketto-fp16.bin` (1.2 GB) | |
-
-V3 weights: `paraketto-v3-fp16.bin` (1.2 GB), auto-downloaded on the first `--model v3` run.
-
-FP8 inference, quantization, calibration, and kernel experiments are preserved
-on the separate `fp8-ultra` branch. The main branch uses FP16.
-
-## Quick start
-
-### Prerequisites
-
-- Linux, NVIDIA GPU (Ampere or newer), CUDA toolkit 12+
-- `curl` (for auto-downloading weights at runtime)
-- `wget` (for Makefile benchmark data downloads)
-- Python 3.10+ with [uv](https://docs.astral.sh/uv/) (for benchmarks only — not needed at runtime)
-
-### Build & run
+Requires macOS 14+, Apple Silicon, and Xcode 16 or later.
 
 ```bash
-git clone --recurse-submodules https://github.com/LokalOptima/paraketto
-# or, in an existing clone: git submodule update --init third_party/cutlass
-make paraketto.cuda              # CUTLASS backend (cudart only)
-./paraketto.cuda audio.wav       # auto-downloads weights on first run (~1.2 GB)
+make run
 ```
 
-The FP16 GEMMs come from the [CUTLASS](https://github.com/NVIDIA/cutlass) submodule at `third_party/cutlass` (header-only — nothing to build). The GPU architecture is auto-detected via `nvidia-smi`; override with `make ARCH=sm_XX` if cross-compiling. The optional LLM corrector additionally needs the `vendor/llama.cpp` submodule.
+This builds with SwiftPM, compiles the VAD model, assembles `Paraketto.app`, signs it, and launches it.
 
-Weights are downloaded from [HuggingFace](https://huggingface.co/localoptima/paraketto) to `~/.cache/paraketto/` on first run. Use `--weights FILE` to override with a local file.
+## Permissions
 
-### Multilingual (V3)
+- **Microphone**: prompted on the first recording.
+- **Accessibility**: needed to send the Cmd+V keystroke. Prompted at launch, granted in
+  System Settings → Privacy & Security → Accessibility. Without it the transcript is only
+  copied to the clipboard.
 
-```bash
-./paraketto.cuda --model v3 audio.wav   # 25 EU languages, auto-detect
-./paraketto.cublas --model v3 audio.wav # same model, cuBLAS backend
-```
+### Accessibility and rebuilds
 
-Supports: bg, cs, da, de, el, en, es, et, fi, fr, hr, hu, it, lt, lv, mt, nl, pl, pt, ro, ru, sk, sl, sv, uk.
+macOS ties the Accessibility grant to the app's code signature. With ad-hoc signing every
+rebuild is a different signature, so the toggle in System Settings looks on but the new build
+is not trusted and text is only copied. Two ways out:
 
-### Parakeet Ultra
+- **Per build:** `make trust` removes the stale entry and opens the Accessibility pane. Grant
+  the app again.
+- **Once:** create a self-signed code-signing certificate named `Paraketto Dev`. The Makefile
+  picks it up automatically and the grant survives rebuilds.
 
-[Moondream Parakeet Ultra](https://huggingface.co/moondream/parakeet-ultra) is a
-fine-tuned V3 checkpoint with the same architecture and vocabulary. Convert its
-Safetensors checkpoint to our V3 binary format, then use either FP16 backend:
+  ```bash
+  openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -keyout key.pem -out cert.pem \
+    -subj "/CN=Paraketto Dev" \
+    -addext "keyUsage=critical,digitalSignature" \
+    -addext "extendedKeyUsage=critical,codeSigning" \
+    -addext "basicConstraints=critical,CA:false"
+  openssl pkcs12 -export -legacy -out dev.p12 -inkey key.pem -in cert.pem -passout pass:x -name "Paraketto Dev"
+  security import dev.p12 -k ~/Library/Keychains/login.keychain-db -P x -T /usr/bin/codesign
+  rm key.pem cert.pem dev.p12
+  make trust   # one last re-grant for the newly signed build
+  ```
 
-```bash
-uvx hf download moondream/parakeet-ultra \
-  --revision 73175eb7aeb0d82f1e2a6b53b3aabc10a90bcd0b \
-  --local-dir scratch/parakeet-ultra
-uv run python scripts/export_ultra_weights.py scratch/parakeet-ultra
-./paraketto.cuda --model v3 --weights paraketto-ultra-fp16.bin audio.wav
-```
+  The first `codesign` with the new key may show a keychain dialog; choose "Always Allow".
 
-The converter checks the configuration, every tensor shape, and the vocabulary;
-transposes linear weights; folds convolution batch normalization; and reorders
-the LSTM gates. It needs no PyTorch or NeMo. Output is approximately 1.25 GB.
-The binary identifies this as V3; the weights path distinguishes Ultra.
+## Speech recognition
 
-Ultra uses our existing decoder and silence-based long-audio chunking. Its
-auxiliary VAD head is not imported, so this does not reproduce Photon's exact
-inference pipeline. FP16 needs no calibration.
+`Sources/ParakeetTDT` is a self-contained Core ML runner for the Parakeet TDT 0.6B v3 family
+(v3, Ultra, Redux, Phonon-2 share one contract), about 600 lines with no dependencies:
 
-Compare against the original V3 weights on the same local benchmark clips:
-
-```bash
-uv run python tests/bench_weights.py \
-  --weights paraketto-ultra-fp16.bin \
-  --baseline ~/.cache/paraketto/paraketto-v3-fp16.bin \
-  --output scratch/ultra-benchmark.json
-```
-
-The default comparison uses the existing English and de/it/fr benchmark sets.
-`--datasets` selects other local manifests, including `fleurs_german`,
-`fleurs_italian`, `fleurs_french`, and `cv_{de,it,fr}_heldout` when available.
-The JSON includes transcripts, WER, empty-output counts, and weight checksums.
-
-FP16 comparison on RTX 5070 Ti, 2026-10-27 (WER %, lower is better):
-
-| Local dataset | Clips | V3 | Ultra |
-|---|---:|---:|---:|
-| LibriSpeech | 100 | 1.94 | 1.64 |
-| Earnings22 | 40 | 12.41 | 10.49 |
-| Long audio | 50 | 1.92 | 1.78 |
-| Difficult | 50 | 20.74 | 18.56 |
-| FLEURS German | 347 | 6.99 | 6.43 |
-| FLEURS Italian | 346 | 4.97 | 4.19 |
-| FLEURS French | 332 | 6.95 | 6.63 |
-| Common Voice German, held out | 25 | 0.46 | 0.46 |
-| Common Voice Italian, held out | 25 | 2.90 | 2.49 |
-| Common Voice French, held out | 25 | 3.77 | 3.77 |
-
-Both models produced zero empty transcripts across 1,340 clips (5.85 hours).
-Aggregate throughput was 1,152× real time for V3 and 1,150× for Ultra in a
-single warmed pass; this is not a statistical speed comparison. Multilingual
-WER uses the HF Open ASR Leaderboard normalizer with `num2words` expansion.
-
-## Usage
-
-```bash
-./paraketto.cuda audio.wav               # single file
-./paraketto.cuda *.wav                   # multiple files
-./paraketto.cuda --weights FILE audio.wav  # custom weights path
-```
-
-### Server mode
-
-```bash
-./paraketto.cuda --server                    # listen on 0.0.0.0:8080
-./paraketto.cuda --server :5001              # custom port
-./paraketto.cuda --server 127.0.0.1:5001     # bind to localhost
-```
-
-All backends support the same server mode. Open `http://localhost:8080` in a browser for a web UI with microphone recording and file upload.
-
-Recordings and uploads stay in a stack, newest first, with playback and a copy
-button on each transcript. History lasts until you refresh or close the page.
-
-### Linux desktop dictation
-
-The optional native app connects to a persistent local Ultra FP16 service. Its window follows
-the desktop theme and text scale. History fills the window, grouped by day, with
-service controls and quiet stats in the footer. Transcripts initially show at
-most four visual lines; a small chevron expands or collapses longer entries.
-Playback, delete, and copy stay beside each entry, and Copy always uses the full
-transcript. The shortcut is shown as **Ctrl+Alt+Space**. The server row uses bold yellow **Sleeping**, green **Ready**,
-and **Loading…** while the model loads; the service does not report loading progress.
-Status, VRAM, and action columns keep their positions across state changes.
-The padded, monospaced VRAM display shows
-**process usage / GPU capacity** in GiB, including zero usage when unloaded;
-hover over it for device-wide usage while the server is running.
-The stats pane shows total words in saved transcriptions and whole-number WPM
-(total words divided by their total recording time in minutes).
-
-The service starts with the model **Sleeping**, with no model GPU allocation.
-Recording starts immediately and loads the model in the background. By default,
-the service unloads it after **5 minutes without activity**. Preferences provides
-the idle timeout and **Keep loaded between recordings**. **Load**, **Unload**,
-and **Retry** are available in the server row; unloading is disabled
-during recording or transcription by any client. Unloading stops the private
-GPU worker, releasing its CUDA context as well as model allocations. The API
-stays available while the model sleeps or fails to load. It prefers
-`http://127.0.0.1:8080` and automatically chooses a free port if 8080 is occupied.
-The desktop discovers the address, including after a service restart, and never
-starts or stops the service itself. Preferences shows the current address.
-
-A failed load shows a simple red **Couldn’t load model** message in the window
-and active dictation overlay. Recording stops, any retained audio stays in
-history, and details are written to the server log. The error overlay stays
-until dismissed or another dictation is started.
-
-Build dependencies on Ubuntu/Debian (these install system packages):
-
-```bash
-sudo apt install libgtk-3-dev libgstreamer1.0-dev \
-  libgstreamer-plugins-base1.0-dev libjson-glib-dev libxdo-dev
-make desktop
-make install-service
-./paraketto-desktop --install-desktop
-./paraketto-desktop
-```
-
-`make install-service` installs and starts a **user systemd service**, configured
-to start with your login session. It needs no sudo. Its executable remains in
-this checkout; rerun the installer if you move the checkout. For a foreground
-service instead, run `./paraketto-service` in another terminal.
-
-`--install-desktop` adds a launcher to your user applications directory and a
-GNOME **Ctrl+Alt+Space** shortcut, preserving existing custom shortcuts. It does
-not enable autostart. Change the binding in GNOME Settings → Keyboard → Custom
-Shortcuts, or use Preferences to enable the default binding again.
-
-Focus a text field and press the shortcut to record. A floating audio-level
-indicator shows elapsed time and the destination's desktop application name
-(for example, **Ghostty**) without taking keyboard focus. Press the same
-shortcut to stop; the transcript is inserted when recognition finishes. The
-indicator's round × button beside the waveform cancels recording or pending insertion. The main window's
-Record button records directly into history.
-
-Insertion uses the clipboard and the application's paste shortcut: Ctrl+V for
-ordinary windows, Ctrl+Shift+V for recognized terminals including Ghostty. It
-leaves the full transcript on the clipboard and does not change the input method.
-Switching application windows during recording or recognition retains the result
-in history for manual copying. This guard tracks windows, not individual text
-fields or tmux panes; keep the intended cursor in place. “Paste sent” reports the
-shortcut being sent, not confirmation that the target accepted the text. Initial
-desktop support targets GNOME on X11; Wayland insertion is not implemented.
-
-History and WAV recordings persist in `~/.local/share/paraketto/history/`
-(`$XDG_DATA_HOME/paraketto/history/` when set). Use a recording's trash button to delete both.
-The service owns memory preferences in `~/.local/share/paraketto/preferences.ini`;
-existing preferences are preserved. Desktop preferences update them through the API.
-The server log is `~/.local/share/paraketto/server.log`. Closing the window
-keeps dictation available; choose **Quit Paraketto** from the menu, or run
-`./paraketto-desktop --quit`, to stop the app. The service and other clients keep
-working. Stop the service with `systemctl --user stop paraketto.service`;
-start it again with `systemctl --user start paraketto.service`.
-
-Weights default to `paraketto-ultra-fp16.bin` beside the executable, then
-`~/.cache/paraketto/paraketto-ultra-fp16.bin`. The **service** accepts `--weights FILE`,
-`--worker-binary FILE`, `--data-dir DIRECTORY`, `--port PORT`, and `--load-timeout SECONDS`
-(default 120). An explicit `--port PORT` pins the address and fails if that port
-is occupied; `--port 0` always requests a free port. The **desktop** accepts
-`--service-url URL` to override discovery and `--data-dir DIRECTORY` for its
-history and local service discovery. When using a custom service data directory,
-give both processes the same `--data-dir`, or supply the desktop's `--service-url`.
-The menu can import existing mono 16/24 kHz WAV recordings.
-
-The app reuses GTK, GStreamer, libxdo, and the existing cpp-httplib server.
-[Speech Note](https://github.com/mkiol/dsnote), with its maintained stable 4.x
-releases, was the main desktop-integration reference; its
-[active-window implementation](https://github.com/mkiol/dsnote/blob/main/src/fake_keyboard.cpp)
-uses native X11 input and clipboard fallbacks. We also reviewed
-[Nerd Dictation](https://github.com/ideasman42/nerd-dictation)'s recording/input
-separation. The desktop code lives in `src/desktop/`; no Python is needed at
-runtime. The service lives in `src/service/` and only needs GIO and JSON-GLib,
-without GTK or CUDA linkage. CMake users can opt in with
-`-DPARAKETTO_BUILD_DESKTOP=ON` (includes the service) or `-DPARAKETTO_BUILD_SERVICE=ON`.
-
-`make test-desktop` checks recording, persistent history, clipboard insertion
-(including long Unicode text and terminal paste bindings), focus changes, and
-private-worker cleanup in a private X11/D-Bus session. It also requires the `xvfb`
-package. The test session does not touch the active desktop's clipboard, input
-focus, or keyboard shortcuts.
-
-`make test-service` checks API availability while unloaded, multiple clients,
-bounded queues, idle/manual unloading, recording reservations, persisted settings,
-failed loads, worker crashes, startup deadlines, port collisions, and shutdown. `make test-desktop-lifecycle`
-checks the real desktop's API integration, recording reservations, quitting the
-UI during another client's request, discovery after a port change, stale-address
-rejection, and recovery after a service restart. Both
-use `uv` and a Python HTTP fixture; they do not load a GPU model.
-
-### Local service API
-
-The persistent service binds **only to loopback**. This milestone does not configure
-remote access or authentication. Browser requests from other origins are rejected,
-and process shutdown is controlled by systemd/signals rather than an HTTP endpoint.
-The existing standalone `paraketto.cuda --server` mode remains available separately.
-
-The service atomically publishes its port and PID in
-`~/.local/share/paraketto/service.json` (or its `--data-dir`), readable only by
-the current user, and removes it on clean shutdown. The desktop checks service
-identity, API version, and PID before sending audio or control requests, so a
-stale discovery file cannot silently select another service instance. An explicit
-`--service-url` checks identity/version without depending on the discovery file.
-
-| Endpoint | Behaviour |
+| File | Role |
 |---|---|
-| `GET /health` | Service identity and API version, independent of model readiness |
-| `GET /status` | Model state, GPU memory, active/queued requests, recording reservations, idle countdown, and settings |
-| `GET /info` | Last known model/backend metadata; available without loading the model |
-| `POST /transcribe` | Multipart `file` containing a WAV; loads automatically and returns the existing transcription JSON |
-| `POST /model/load` | Preload asynchronously; returns `202` |
-| `POST /model/unload` | Unload or cancel an idle load; `409` if a client is recording or work is queued/active |
-| `PATCH /settings` | JSON `idle_seconds` (1–86400) and/or boolean `keep_loaded`, persisted by the service |
-| `POST /model/release` | Release the caller's recording reservation |
+| `ModelStore.swift` | finds the models or downloads them from `FluidInference/parakeet-ultra-coreml` |
+| `ParakeetModels.swift` | loads the four Core ML models (preprocessor on CPU, the rest on the ANE), the VAD head and the vocabulary |
+| `ParakeetTranscriber.swift` | `Session`: audio in, segments decoded as their cuts become known; mel → encoder → decode with 1 s of context on each side |
+| `TdtDecoder.swift` | greedy Token-and-Duration Transducer loop with the 2-layer LSTM state |
+| `VoiceActivity.swift` | places cuts at pauses found by the model's own VAD head |
+| `EncoderSet.swift` | picks the shortest encoder window that holds a segment |
+| `MultiArray.swift` | small `MLMultiArray` helpers |
 
-States are `sleeping`, `loading`, `ready`, `busy`, `unloading`, `error`, and `stopping`.
-An offline service is a separate client-side condition. Status includes
-`service: "paraketto"` and integer `api_version: 1`. Errors use JSON `error` messages.
-Requests share one GPU worker and are serialized, with a maximum of four accepted
-transcriptions (including the active request); excess requests receive `429`.
-The upload limit is 64 MiB. Model-load failure returns `503` without stopping the API.
+The model files are FluidAudio's Core ML conversion (Apache 2.0) of moondream's checkpoint
+(CC-BY-4.0): a fixed 15 s preprocessor and int8 encoder, an LSTM decoder, and a joint network
+that returns token, probability and duration bin directly.
 
-Recording clients may pass `{"lease_id":"<UUID>"}` to `POST /model/load` and renew
-it while recording. Reservations expire after 10 seconds unless renewed; the
-desktop renews every 2 seconds and releases after cancellation/delivery. Send
-the same JSON to `POST /model/release` when finished. This prevents idle eviction
-while recording and permits recovery if a client crashes. Transcription requests
-protect the model automatically and do not require a reservation.
+### Voice-activity head
 
-Use the address shown in Preferences; these examples assume port 8080:
+Parakeet Ultra's weights carry a small VAD head on the encoder's subsampler, which moondream's
+engine uses to cut long audio at pauses. FluidAudio's export leaves it out, so
+`tools/export/export_vad_head.py` exports subsampler plus head to `Resources/VadHead.mlpackage`
+(8.7 MB), fetching only the 9 MB of needed tensors from the safetensors file. The wiring
+(SiLU after `proj` and `ctx`, no residual) follows parakeet.cpp's published analysis, since
+moondream does not document the head; it gives one speech probability per 80 ms frame.
 
-```bash
-curl http://127.0.0.1:8080/status
-curl -F file=@recording.wav http://127.0.0.1:8080/transcribe
-curl -X POST http://127.0.0.1:8080/model/unload
-```
+A `Session` segments the recording while it is still going. Every 0.24 s it runs the VAD head
+over the newest audio; a silence of 0.8 s ends the segment before it, which is then encoded and
+decoded right away on the otherwise idle ANE and CPU. At stop only the audio after the last cut is
+left: nothing if you paused, otherwise one short encoder pass.
 
-### LLM text correction (optional)
+Every segment is decoded with a fresh decoder, as moondream's runtime does. Carrying the LSTM state
+from segment to segment looked like free language context, but over a few minutes of speech it
+drifts until whole segments decode to blanks.
 
-Build with `WITH_CORRECTOR=1` to enable post-transcription text correction via an embedded LLM (OLMoE-1B-7B). Removes filler words, fixes capitalization/punctuation.
+- **Cuts at pauses** lie in silence, so each side keeps the tokens on its side of the cut, with about
+  a second of audio around it for the encoder.
+- **Cuts through speech**, when 11 s pass without a 0.8 s pause, overlap: both segments encode the
+  2 s on each side of the cut, their tokens there are aligned with a longest common subsequence
+  (same token at nearly the same frame), and the text is joined at the matched token nearest the
+  cut. If the two sides do not agree, the one that heard more of the overlap wins. This is the
+  scheme NVIDIA uses for long audio with Parakeet; it replaced a one-second context plus exact
+  dedupe that doubled or dropped a word at about a third of such cuts.
+- **Empty windows are retried.** The model sometimes returns nothing at all for a window that
+  starts mid-word (FluidAudio's own models do the same), so a window with speech that decodes
+  empty is decoded again from a later start.
 
-```bash
-make paraketto.cuda WITH_CORRECTOR=1    # build with llama.cpp integration
-./paraketto.cuda --correct audio.wav    # enable correction in CLI mode
-./paraketto.cuda --server               # correction auto-enabled in server mode
-```
+`tests/make_longform.py` joins the LibriSpeech clips into one to three minute files with 0.3 to 1 s
+gaps, and `tests/score.py` computes word error rate the Open ASR Leaderboard way: Whisper's
+EnglishTextNormalizer on both sides, then `jiwer`. `make compare` and `make longform` feed audio in
+100 ms chunks like the app:
 
-Requires the llama.cpp git submodule (`git submodule update --init`).
+| Version | Long files | Short clips |
+|---|---|---|
+| state carried across cuts, 13 s windows | about 9% (counted before the scorer existed) | 0.20% |
+| pause commits, overlap join, fresh decoder | 0.20% | 0.20% |
 
-### Embedding as a library (CMake)
+The remaining errors are the model's own ("bade fare" for "bade fair", "Murcheston"). Pause
+decisions use only the audio heard so far, so feeding a whole file at once can cut differently
+(0.40% on the long files).
 
-The Makefile is the canonical build for the standalone binaries. A separate CMake build produces a static library (`paraketto_lib`) for embedding the engine in other projects — see the header comment in `CMakeLists.txt` for options (`PARAKETTO_USE_CUBLAS`, `PARAKETTO_BUILD_LIB_ONLY`). The public API is `paraketto::Pipeline` in `src/paraketto.h`. The CMake build does not support the LLM corrector.
+### Faster than the stock export
 
-## HTTP API
+Two optional exports, built locally with `uv` (they are too large for the repo) and picked up
+automatically by the app and CLI from `~/Library/Application Support/Paraketto/models/`:
 
-- `GET /` — web UI (microphone recording + file upload; shows the running model/backend)
-- `GET /health` — returns `{"status":"ok"}`
-- `GET /info` — model version, backend (CUTLASS FP16/cuBLAS FP16), weights path, device, startup timing
-- `GET /status` — readiness, server PID, live server-process and device-wide VRAM (NVML; unavailable values are omitted or `null`)
-- `POST /transcribe` — multipart `file` upload, returns `{"text":"...","audio_duration_s":...,"inference_time_s":...}`
-- `POST /shutdown` — gracefully stops the server
+- `make encoder-export`: the encoder as one multi-function Core ML model with 5 s, 10 s and 15 s
+  windows (605 MB, weights shared), traced from Hugging Face `transformers`' `ParakeetForTDT` and
+  quantized to int8 per channel. A segment uses the shortest window that holds it, so a 4.5 s
+  utterance costs a 17 ms encoder pass instead of 55 ms. Needs macOS 15 for multi-function models.
+- `make decoder-export`: one Core ML model that advances the LSTM with the emitted token and
+  decides the next frame, replacing two framework calls per token step with one (35 MB).
 
-```bash
-curl localhost:8080/health
-curl localhost:8080/info
-curl localhost:8080/status
-curl -F file=@audio.wav localhost:8080/transcribe
-curl -X POST localhost:8080/shutdown
-```
+Measured on the 17 LibriSpeech clips on an M1 Max, same transcripts in every configuration:
 
-For managed clients, `--server 127.0.0.1:0` binds an available loopback port and
-prints a JSON announcement to stdout: `{"event":"ready","port":…,"pid":…}`.
-Clients should then check `/status`. Request logs remain on stderr.
+| Configuration | RTFx |
+|---|---|
+| FluidAudio models, two-call decode | 80x |
+| + fused decoder step | 93x |
+| + multi-window encoder | 124x |
 
-## Benchmarks
+The remaining time is split between the encoder on the ANE (17 to 55 ms depending on window) and
+the sequential decode on the CPU: 0.73 ms per emitted token inside the fused step, bound by
+streaming the fp32 LSTM and joint weights through one core (Core ML's per-call floor is 35 µs, and
+smaller weights do not help because the CPU path expands them at load). A Metal decoder that ran
+the greedy loop on the GPU reached 182x with identical transcripts (commit `89c4e5e`), but hand-written
+kernels failed silently twice on the way there, and for dictation the 30 ms it saves on a 10 s
+utterance is below perception, so it was removed in favour of the framework path.
 
-```bash
-make bench-cuda    # WER + RTFx (CUTLASS backend)
-make bench-cublas  # WER + RTFx (cuBLAS backend)
-make bench-all     # both FP16 backends
-make bench-v3      # WER + RTFx (V3 multilingual: de/it/fr)
+### Measuring
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  C++ CUDA · paraketto_cuda.cpp + CUTLASS FP16
+- `xcrun xctrace record --template 'Core ML' --launch -- .build/release/paraketto-cli clip.wav`
+  records every Core ML prediction and the Neural Engine's hardware intervals; export tables with
+  `xcrun xctrace export --input <trace> --toc`.
+- `paraketto-cli --plan` prints each model's operation count, how Core ML assigns operations to
+  CPU, GPU and ANE, and which operators force the CPU.
+- `PARAKEET_TIMING=1` prints mel, encoder and decode time per recording, with the number and total
+  time of fused, joint and decoder Core ML calls; `--fused <model>` swaps in another fused step
+  export for A/B timing; `--chunk-ms N` feeds each file to a session in N ms chunks like the app
+  and reports the time spent after the last chunk; `--tokens` prints each
+  token with its frame; `--vad-probe` prints the VAD strip; `PARAKEET_DEBUG=1` logs every joint decision.
 
-┌─────────────┬──────────┬─────────┬────────┬─────────┬──────────┐
-│ Dataset     │      WER │    RTFx │   Utts │   Audio │     Time │
-├─────────────┼──────────┼─────────┼────────┼─────────┼──────────┤
-│ librispeech │    1.38% │   1109x │    100 │    896s │    808ms │
-│ earnings22  │   11.37% │    957x │     40 │    253s │    264ms │
-│ long        │    1.64% │   1355x │     50 │   5578s │    4.12s │
-│ difficult   │   20.99% │   1189x │     50 │    509s │    428ms │
-├─────────────┼──────────┼─────────┼────────┼─────────┼──────────┤
-│ Total       │          │   1288x │    240 │   7236s │    5.62s │
-└─────────────┴──────────┴─────────┴────────┴─────────┴──────────┘
+### Checking against FluidAudio
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  C++ cuBLAS · paraketto_cuda.cpp + cuBLAS FP16
+`tests/fixtures/librispeech_fluidaudio.tsv` holds FluidAudio's transcripts of 17 LibriSpeech
+clips. `make compare` transcribes them (set `CLIPS=` to their location) and reports every
+difference and the real-time factor. Result at the time of writing: 15 of 17 identical. The two
+differences are a British/American spelling choice
+on a clip cut differently, and a trailing period that FluidAudio drops because it discards any
+token whose duration runs past the end of the audio, which standard TDT decoding does not.
 
-┌─────────────┬──────────┬─────────┬────────┬─────────┬──────────┐
-│ Dataset     │      WER │    RTFx │   Utts │   Audio │     Time │
-├─────────────┼──────────┼─────────┼────────┼─────────┼──────────┤
-│ librispeech │    1.38% │   1048x │    100 │    896s │    854ms │
-│ earnings22  │   11.37% │    973x │     40 │    253s │    260ms │
-│ long        │    1.63% │   1356x │     50 │   5578s │    4.11s │
-│ difficult   │   21.07% │   1223x │     50 │    509s │    416ms │
-├─────────────┼──────────┼─────────┼────────┼─────────┼──────────┤
-│ Total       │          │   1282x │    240 │   7236s │    5.64s │
-└─────────────┴──────────┴─────────┴────────┴─────────┴──────────┘
-```
+`paraketto-cli --tokens` prints each token with its emission frame, `--vad-probe` prints the
+VAD strip, and `PARAKEET_DEBUG=1` logs every joint decision.
 
-Correctness checks:
+## Layout
 
-```bash
-uv run python -m unittest discover -s tests -p test_ultra_conversion.py
-make test-cublas-fallback
-```
-
-## Project structure
-
-```
-src/paraketto_cuda.cpp    # CLI, startup, and HTTP server entry point
-src/paraketto.h           # Public pipeline API, chunking, and greedy decode
-src/model_defs.h          # Shared model constants, config, Weights struct
-src/conformer.h           # FP16 CudaModel definition
-src/conformer.cpp         # Buffer pool, FP16 encoder, LSTM and joint decoder
-src/weights.cpp           # Weight loading (shared by all backends)
-src/gemm.h                # Unified GEMM interface (backend selected at link time)
-src/cutlass_gemm.cu       # CUTLASS FP16 backend
-src/cublas_gemm.cu        # cuBLAS FP16 backend
-src/kernels.cu            # Custom kernels: FFT, LayerNorm, SiLU, GLU, conv, LSTM, ...
-src/mel.h                 # Custom 512-point FFT + mel filterbank
-src/wav.h                 # WAV file reader (16kHz/24kHz mono, int16/float32)
-src/server.h              # HTTP server + web UI (uses cpp-httplib)
-src/corrector.cpp         # Optional LLM text correction (llama.cpp integration)
-scripts/weight_format.py  # Shared FP16 tensor order and alignment
-scripts/export_weights.py # ONNX → PRKT FP16 converter (V2 / V3)
-scripts/export_ultra_weights.py # Safetensors → PRKT FP16 converter (Ultra)
-```
-
-## Acknowledgments
-
-- **[Parakeet TDT 0.6B](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2)** by NVIDIA — the original ASR model ([V2](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) English, [V3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) multilingual). This project is a from-scratch C++/CUDA reimplementation of the inference pipeline. Model weights are used under CC-BY-4.0, Copyright NVIDIA Corporation.
-- **[Parakeet Ultra](https://huggingface.co/moondream/parakeet-ultra)** by Moondream — a post-trained V3 checkpoint, also CC-BY-4.0. The optional FP16 converter preserves our V3 inference layout.
-- **[CUTLASS](https://github.com/NVIDIA/cutlass)** by NVIDIA — CUDA Templates for Linear Algebra Subroutines, used as a git submodule for FP16 GEMMs (BSD-3-Clause License, Copyright 2017-2026 NVIDIA Corporation & Affiliates)
-- **[llama.cpp](https://github.com/ggml-org/llama.cpp)** — optional LLM text correction via git submodule (MIT License, Copyright 2023-2026 The ggml authors)
-- **[cpp-httplib](https://github.com/yhirose/cpp-httplib)** by yhirose — HTTP server (MIT License)
-
-## References
-
-- [TDT paper](https://arxiv.org/abs/2304.06795) — Token-and-Duration Transducer (ICML 2023)
-- [FastConformer paper](https://arxiv.org/abs/2305.05084) — encoder architecture
-- [V3 paper](https://arxiv.org/abs/2509.14128) — Canary-1B-v2 & Parakeet-TDT-0.6B-v3
+| File | Role |
+|---|---|
+| `App.swift` | `MenuBarExtra` shell, History and Settings scenes |
+| `DictationController.swift` | record → transcribe → paste state machine, Esc cancel, meter ticker |
+| `Hotkey.swift` | Carbon global hotkey for key combinations |
+| `ModifierTap.swift` | bare modifier tap detection via global event monitors |
+| `ShortcutSettings.swift` | shortcut model (modifier tap or chord), persisted in UserDefaults |
+| `SettingsView.swift` | Settings window with the shortcut recorder |
+| `AudioRecorder.swift` | `AVAudioEngine` mic capture to 16 kHz mono Float32, dBFS level smoothing |
+| `Transcriber.swift` | thin adapter over `ParakeetTDT` |
+| `Paster.swift` | destination check, pasteboard write, synthetic Cmd+V |
+| `Overlay.swift` | floating recording pill |
+| `History.swift` | persisted entries + WAV files under `~/Library/Application Support/Paraketto/history/`, playback |
+| `HistoryWindow.swift` | history list grouped by day |
+| `Log.swift` | `~/Library/Logs/Paraketto.log`, truncated per launch, never contains transcripts |

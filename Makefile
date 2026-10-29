@@ -1,235 +1,99 @@
-# CUDA toolkit: newest /usr/local/cuda-* install, else nvcc from PATH.
-# Override with CUDA_HOME=/path/to/cuda.
-CUDA_LATEST  := $(lastword $(sort $(wildcard /usr/local/cuda-*)))
-NVCC_IN_PATH := $(shell command -v nvcc 2>/dev/null)
-CUDA_HOME    ?= $(or $(CUDA_LATEST),$(patsubst %/bin/nvcc,%,$(NVCC_IN_PATH)),/usr/local/cuda)
+APP_NAME      := Paraketto
+BUNDLE_ID     := io.lfrati.paraketto
+BUNDLE        := $(APP_NAME).app
+CONFIG        ?= release
+BINARY        := .build/$(CONFIG)/$(APP_NAME)
+CLI           := .build/$(CONFIG)/paraketto-cli
+CONTENTS      := $(BUNDLE)/Contents
+VAD_PACKAGE   := Resources/VadHead.mlpackage
+VAD_COMPILED  := .build/VadHead.mlmodelc
+FIXTURES      := tests/fixtures/librispeech_fluidaudio.tsv
+CLIPS         ?= ../paraketto/data/librispeech/*.wav
+# Signing. macOS ties the Accessibility grant to the app's signature. With the "Paraketto Dev"
+# self-signed certificate in the login keychain (see README) every build carries the same
+# signature and the grant survives; without it codesign falls back to ad-hoc ("-"), whose
+# signature changes on every build. The certificate is selected by the SHA-1 hash that
+# `security find-identity` prints, so a certificate imported twice is not "ambiguous" to codesign.
+# Override with SIGN_IDENTITY=<hash or name>; the bundle target then checks the signature
+# against SIGN_NAME, so set that too for a differently named certificate.
+SIGN_NAME     ?= Paraketto Dev
+SIGN_IDENTITY ?= $(or $(shell security find-identity -p codesigning 2>/dev/null | grep -F '"$(SIGN_NAME)"' | head -1 | awk '{print $$2}'),-)
+SIGN_IDENTITY := $(SIGN_IDENTITY)
 
-# GPU arch: auto-detected from the installed GPU (e.g. 12.0 -> sm_120).
-# Override with ARCH=sm_XX.
-GPU_CC   := $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '.')
-ARCH     ?= $(if $(GPU_CC),sm_$(GPU_CC),sm_120)
+.PHONY: all build bundle run trust vad cli compare longform vad-export encoder-export decoder-export clean
 
-CXX      = g++
-NVCC     = $(CUDA_HOME)/bin/nvcc
-NVFLAGS  = -std=c++17 -O3 -I$(CUDA_HOME)/include -Isrc --expt-relaxed-constexpr
+MODELS_DIR    := $(HOME)/Library/Application Support/Paraketto/models
 
-HF_BASE     = https://huggingface.co/localoptima/paraketto/resolve/main
-WEIGHTS_DIR = $(or $(XDG_CACHE_HOME),$(HOME)/.cache)/paraketto
-WEIGHTS     = $(WEIGHTS_DIR)/paraketto-fp16.bin
+all: bundle
 
-.DEFAULT_GOAL := paraketto.cuda
+build:
+	swift build -c $(CONFIG)
 
-.PHONY: bench-all bench-cuda bench-cublas bench-corrector bench-v3 weights weights-export download-data download-data-v3 download-weights check-weights repack clean llama-libs
+# Compiles the VAD head once; the .mlpackage in Resources is the source of truth.
+vad: $(VAD_COMPILED)
 
-# ---------------------------------------------------------------------------
-# LLM corrector (opt-in via WITH_CORRECTOR=1)
-# ---------------------------------------------------------------------------
-# Builds llama.cpp from the vendored submodule as static libraries, then links
-# them into paraketto. Only the CUDA backend is built; everything else is off.
+$(VAD_COMPILED): $(VAD_PACKAGE)
+	rm -rf $(VAD_COMPILED)
+	xcrun coremlcompiler compile $(VAD_PACKAGE) .build
 
-LLAMA_SRC    = vendor/llama.cpp
-LLAMA_BUILD  = $(LLAMA_SRC)/build
-LLAMA_LIBDIR = $(LLAMA_BUILD)/src $(LLAMA_BUILD)/ggml/src $(LLAMA_BUILD)/ggml/src/ggml-cuda $(LLAMA_BUILD)/ggml/src/ggml-cpu
-LLAMA_INC    = -I$(LLAMA_SRC)/include -I$(LLAMA_SRC)/ggml/include
-LLAMA_STAMP  = $(LLAMA_BUILD)/.stamp
-
-# Static lib build (one-time, cached)
-$(LLAMA_STAMP):
-	cmake -B $(LLAMA_BUILD) $(LLAMA_SRC) \
-		-DBUILD_SHARED_LIBS=OFF \
-		-DGGML_CUDA=ON -DCUDA_ARCHITECTURES=120 \
-		-DGGML_VULKAN=OFF -DGGML_METAL=OFF -DGGML_RPC=OFF \
-		-DGGML_BLAS=OFF -DGGML_LLAMAFILE=OFF -DGGML_OPENMP=ON \
-		-DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=OFF \
-		-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF \
-		-DLLAMA_BUILD_COMMON=OFF \
-		-DCMAKE_C_FLAGS="-ffunction-sections -fdata-sections" \
-		-DCMAKE_CXX_FLAGS="-ffunction-sections -fdata-sections" \
-		-DCMAKE_CUDA_FLAGS="-Xcompiler -ffunction-sections -Xcompiler -fdata-sections"
-	cmake --build $(LLAMA_BUILD) --target llama --parallel
-	touch $@
-
-llama-libs: $(LLAMA_STAMP)
-
-ifdef WITH_CORRECTOR
-  CORRECTOR_OBJ     = src/corrector.o
-  CORRECTOR_CFLAGS  = -DWITH_CORRECTOR $(LLAMA_INC)
-  CORRECTOR_LDFLAGS = $(foreach d,$(LLAMA_LIBDIR),-L$(d)) \
-                      -Wl,--whole-archive -lggml-cuda -Wl,--no-whole-archive \
-                      -lllama -lggml -lggml-base -lggml-cpu \
-                      -lcudart -lcublas -lcublasLt -lcuda -lgomp \
-                      -Wl,--gc-sections
-  CORRECTOR_DEP     = $(LLAMA_STAMP)
+bundle: build vad
+	rm -rf $(BUNDLE)
+	mkdir -p $(CONTENTS)/MacOS $(CONTENTS)/Resources
+	cp $(BINARY) $(CONTENTS)/MacOS/$(APP_NAME)
+	cp Resources/Info.plist $(CONTENTS)/Info.plist
+	cp -R $(VAD_COMPILED) $(CONTENTS)/Resources/
+# The first codesign with a new key blocks on a keychain dialog until "Always Allow" is clicked.
+	codesign --force --sign "$(SIGN_IDENTITY)" \
+		--entitlements Resources/$(APP_NAME).entitlements \
+		--options runtime $(BUNDLE)
+	codesign --verify --deep --strict $(BUNDLE)
+ifneq ($(SIGN_IDENTITY),-)
+# An ad-hoc build would look fine but lose the Accessibility grant, so refuse to keep one.
+	@codesign -dvv $(BUNDLE) 2>&1 | grep -q '^Authority=$(SIGN_NAME)$$' \
+		|| { echo "error: $(BUNDLE) is not signed by $(SIGN_NAME); removing it"; rm -rf $(BUNDLE); exit 1; }
+	@echo "signed with: $(SIGN_NAME) ($(SIGN_IDENTITY))"
+else
+	@echo "signed ad-hoc: no $(SIGN_NAME) certificate found, the Accessibility grant will not survive rebuilds"
 endif
 
-# Verify paraketto-fp16.bin is the expected format (PRKT v2)
-check-weights: $(WEIGHTS)
-	@v=$$(od -An -td4 -N4 -j4 $(WEIGHTS) | tr -d ' '); \
-	if [ "$$v" != "2" ]; then \
-		echo "ERROR: paraketto-fp16.bin is version $$v, expected 2. Run: uv run python scripts/repack_weights.py"; \
-		exit 1; \
-	fi
+run: bundle
+	open $(BUNDLE)
 
-# Download benchmark data from HuggingFace
-data/librispeech/manifest.json:
-	@echo "Downloading benchmark data..."
-	@wget -q --show-progress -O bench-data.tar.gz $(HF_BASE)/bench-data.tar.gz && \
-		tar xzf bench-data.tar.gz && \
-		rm bench-data.tar.gz && \
-		echo "Downloaded $$(find data/ -name '*.wav' | wc -l) wav files"
+# Drops the stale Accessibility entry left by a previous (ad-hoc) build and opens the
+# Accessibility pane so the running build can be granted again.
+trust:
+	tccutil reset Accessibility $(BUNDLE_ID)
+	open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
 
-data/german/manifest.json:
-	@echo "Downloading V3 benchmark data..."
-	@wget -q --show-progress -O bench-data-v3.tar.gz $(HF_BASE)/bench-data-v3.tar.gz && \
-		tar xzf bench-data-v3.tar.gz && \
-		rm bench-data-v3.tar.gz && \
-		echo "Downloaded $$(find data/german data/italian data/french -name '*.wav' | wc -l) wav files"
+cli: build vad
 
-download-data: data/librispeech/manifest.json
-download-data-v3: data/german/manifest.json
+# Transcribes the LibriSpeech clips and checks every transcript against FluidAudio's.
+compare: cli
+	$(CLI) --vad $(VAD_COMPILED) --chunk-ms 100 --compare $(FIXTURES) --hypotheses .build/hypotheses.tsv $(CLIPS) | tail -2
+	cd tools/export && uv run python ../../tests/score.py ../../$(FIXTURES) ../../.build/hypotheses.tsv
 
-# Download weights from HuggingFace
-$(WEIGHTS):
-	@mkdir -p $(WEIGHTS_DIR)
-	@echo "Downloading paraketto-fp16.bin..."
-	@wget -q --show-progress -O $@ $(HF_BASE)/paraketto-fp16.bin
-	@echo "Downloaded $@ ($$(du -h $@ | cut -f1))"
+# Joins the clips into one to three minute files and scores the recording-time segmentation on them.
+longform: cli
+	cd tools/export && uv run python ../../tests/make_longform.py --clips "$(abspath $(dir $(firstword $(wildcard $(CLIPS)))))" --out ../../.build/longform
+	$(CLI) --vad $(VAD_COMPILED) --chunk-ms 100 --compare .build/longform/reference.tsv --hypotheses .build/longform/hypotheses.tsv .build/longform/gap*.wav | tail -2
+	cd tools/export && uv run python ../../tests/score.py ../../.build/longform/reference.tsv ../../.build/longform/hypotheses.tsv
 
-download-weights: $(WEIGHTS)
-weights: $(WEIGHTS)
+# Re-exports the VAD head from moondream/parakeet-ultra (needs uv; fetches ~9 MB of weights).
+vad-export:
+	cd tools/export && uv run python export_vad_head.py --out ../../$(VAD_PACKAGE)
 
-BENCH_SEP = @printf '\n%s\n%s\n%s\n' '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━' '  $(1)'
+# Exports the encoder with 5 s, 10 s and 15 s windows (needs uv; downloads the 1.2 GB checkpoint once)
+# and compiles it where the app and CLI pick it up automatically.
+encoder-export:
+	cd tools/export && uv run python export_encoder.py --out "$(MODELS_DIR)/parakeet-ultra-encoder/Encoder.mlpackage"
+	rm -rf "$(MODELS_DIR)/parakeet-ultra-encoder/Encoder.mlmodelc"
+	xcrun coremlcompiler compile "$(MODELS_DIR)/parakeet-ultra-encoder/Encoder.mlpackage" "$(MODELS_DIR)/parakeet-ultra-encoder"
 
-bench-all: paraketto.cuda paraketto.cublas data/librispeech/manifest.json $(WEIGHTS) check-weights
-	$(call BENCH_SEP,C++ CUDA · paraketto_cuda.cpp + CUTLASS FP16)
-	@uv run python tests/bench_native.py paraketto.cuda
-	$(call BENCH_SEP,C++ cuBLAS · paraketto_cuda.cpp + cuBLAS FP16)
-	@uv run python tests/bench_native.py paraketto.cublas
-
-bench-cuda: paraketto.cuda data/librispeech/manifest.json $(WEIGHTS) check-weights
-	uv run python tests/bench_native.py paraketto.cuda
-
-bench-cublas: paraketto.cublas data/librispeech/manifest.json $(WEIGHTS) check-weights
-	uv run python tests/bench_native.py paraketto.cublas
-
-bench-corrector: paraketto.cuda data/librispeech/manifest.json $(WEIGHTS)
-	uv run python tests/bench_corrector.py paraketto.cuda
-
-bench-v3: paraketto.cuda data/german/manifest.json
-	uv run python tests/test_v3_multilingual.py paraketto.cuda
-
-# Re-generate weights from ONNX (only needed if export script changes)
-weights-export: scripts/export_weights.py
-	uv run python scripts/export_weights.py
-
-# C++ / CUDA build
-src/kernels.o: src/kernels.cu src/kernels.h src/common.h
-	$(NVCC) $(NVFLAGS) -arch=$(ARCH) -c $< -o $@
-
-SHARED_HEADERS = src/paraketto.h src/common.h src/wav.h src/mel.h src/vocab.h src/server.h src/web_ui.h src/gpu_status.h
-
-# Shared CUDA backend flags
-CUDA_CXXFLAGS = -std=c++17 -O3 -march=native -flto=auto -Wno-deprecated-declarations -I$(CUDA_HOME)/include -Ithird_party -Isrc
-CUDA_LDFLAGS  = -flto=auto -L$(CUDA_HOME)/lib64 -lcudart -lpthread -ldl
-CUTLASS_INC   = -Ithird_party/cutlass/include -Ithird_party/cutlass/tools/util/include
-
-# Friendly error when the CUTLASS submodule hasn't been initialized
-third_party/cutlass/include:
-	@echo "ERROR: CUTLASS submodule missing. Run: git submodule update --init third_party/cutlass"; exit 1
-src/weights.o: src/weights.cpp src/model_defs.h src/common.h
-	$(CXX) $(CUDA_CXXFLAGS) -I$(CUDA_HOME)/include -c $< -o $@
-
-ifdef WITH_CORRECTOR
-src/corrector.o: src/corrector.cpp src/corrector.h $(CORRECTOR_DEP)
-	$(CXX) $(CUDA_CXXFLAGS) $(CORRECTOR_CFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
-endif
-
-CONFORMER_DEPS = src/paraketto_cuda.cpp src/conformer.cpp src/conformer.h src/model_defs.h src/kernels.h src/gemm.h $(SHARED_HEADERS)
-
-# CUTLASS GEMM backend (default — no cuBLAS dependency, cudart only)
-src/cutlass_gemm.o: src/cutlass_gemm.cu src/gemm.h src/kernels.h src/common.h | third_party/cutlass/include
-	$(NVCC) $(NVFLAGS) -arch=$(ARCH) $(CUTLASS_INC) -c $< -o $@
-
-paraketto.cuda: $(CONFORMER_DEPS) src/weights.o src/kernels.o src/cutlass_gemm.o $(CORRECTOR_OBJ)
-	$(CXX) $(CUDA_CXXFLAGS) $(CORRECTOR_CFLAGS) -DBACKEND_NAME='"CUTLASS FP16"' src/paraketto_cuda.cpp src/conformer.cpp src/weights.o src/kernels.o src/cutlass_gemm.o $(CORRECTOR_OBJ) $(CUDA_LDFLAGS) $(CORRECTOR_LDFLAGS) -o $@
-
-# cuBLAS GEMM backend (faster on some shapes, requires libcublas)
-src/cublas_gemm.o: src/cublas_gemm.cu src/gemm.h src/kernels.h src/common.h
-	$(NVCC) $(NVFLAGS) -arch=$(ARCH) -c $< -o $@
-
-paraketto.cublas: $(CONFORMER_DEPS) src/weights.o src/kernels.o src/cublas_gemm.o $(CORRECTOR_OBJ)
-	$(CXX) $(CUDA_CXXFLAGS) $(CORRECTOR_CFLAGS) -DBACKEND_NAME='"cuBLAS FP16"' src/paraketto_cuda.cpp src/conformer.cpp src/weights.o src/kernels.o src/cublas_gemm.o $(CORRECTOR_OBJ) $(CUDA_LDFLAGS) -lcublas -lcublasLt $(CORRECTOR_LDFLAGS) -o $@
-
-# Convert existing weight files to current format (run once after updating)
-repack: $(WEIGHTS)
-	uv run python scripts/repack_weights.py $(WEIGHTS)
-
-bench_gemm: tests/bench_gemm.cu
-	$(NVCC) $(NVFLAGS) -arch=$(ARCH) $(CUTLASS_INC) tests/bench_gemm.cu -lcublas -lcublasLt -o $@
-
-bench_splitk: tests/bench_splitk.cu
-	$(NVCC) $(NVFLAGS) -arch=$(ARCH) $(CUTLASS_INC) tests/bench_splitk.cu -lcublas -lcublasLt -o $@
-
-bench_tiles: tests/bench_tiles.cu
-	$(NVCC) $(NVFLAGS) -arch=$(ARCH) $(CUTLASS_INC) tests/bench_tiles.cu -lcublas -lcublasLt -o $@
-
-bench_ff2: tests/bench_ff2.cu
-	$(NVCC) $(NVFLAGS) -arch=$(ARCH) $(CUTLASS_INC) tests/bench_ff2.cu -lcublas -lcublasLt -o $@
-
-.PHONY: test-cublas-fallback
-test-cublas-fallback: scratch/test_cublas_fallback
-	./scratch/test_cublas_fallback
-
-scratch/test_cublas_fallback: tests/test_cublas_fallback.cpp src/cublas_gemm.o src/kernels.o src/gemm.h src/common.h
-	mkdir -p scratch
-	$(CXX) $(CUDA_CXXFLAGS) $< src/cublas_gemm.o src/kernels.o $(CUDA_LDFLAGS) -lcublas -lcublasLt -Wl,--wrap=cublasLtMatmulAlgoGetHeuristic -o $@
+# Exports the fused decoder+joint step model (needs uv; fetches ~36 MB of weights) and compiles it.
+decoder-export:
+	cd tools/export && uv run python export_fused_decoder.py --out "$(MODELS_DIR)/parakeet-ultra-decoder/DecoderJoint.mlpackage"
+	rm -rf "$(MODELS_DIR)/parakeet-ultra-decoder/DecoderJoint.mlmodelc"
+	xcrun coremlcompiler compile "$(MODELS_DIR)/parakeet-ultra-decoder/DecoderJoint.mlpackage" "$(MODELS_DIR)/parakeet-ultra-decoder"
 
 clean:
-	rm -f paraketto.cuda paraketto.cublas
-	rm -f bench_ff2 bench_gemm bench_splitk bench_tiles
-	rm -f src/*.o
-	rm -f scratch/test_cublas_fallback scratch/test_desktop
-	rm -f paraketto-desktop paraketto-service
-
-# Optional native Linux app. The inference builds do not need these libraries.
-DESKTOP_PKGS = gtk+-3.0 gio-unix-2.0 gstreamer-app-1.0 json-glib-1.0 x11
-DESKTOP_SOURCES = src/desktop/app.cpp src/desktop/audio.cpp src/desktop/backend.cpp src/desktop/history.cpp src/desktop/input.cpp
-APP_HEADERS = src/app_common.h src/model_settings.h src/service/api.h
-DESKTOP_HEADERS = $(wildcard src/desktop/*.h) $(APP_HEADERS) src/wav.h
-SERVICE_SOURCES = src/service/main.cpp src/service/worker.cpp
-SERVICE_PKGS = gio-unix-2.0 json-glib-1.0
-
-paraketto-service: $(SERVICE_SOURCES) src/service/worker.h $(APP_HEADERS) src/web_ui.h
-	pkg-config --exists $(SERVICE_PKGS)
-	$(CXX) -std=c++17 -O2 -Wall -Wextra -Ithird_party -Isrc \
-		$(SERVICE_SOURCES) $$(pkg-config --cflags --libs $(SERVICE_PKGS)) -pthread -o $@
-
-.PHONY: desktop
-desktop: paraketto.cuda paraketto-service paraketto-desktop
-
-.PHONY: install-service
-install-service: paraketto-service
-	uv run --no-project python scripts/install_service.py
-
-paraketto-desktop: $(DESKTOP_SOURCES) $(DESKTOP_HEADERS)
-	pkg-config --exists $(DESKTOP_PKGS)
-	$(CXX) -std=c++17 -O2 -Wall -Wextra -Wno-deprecated-declarations -Ithird_party -Isrc \
-		$(DESKTOP_SOURCES) $$(pkg-config --cflags --libs $(DESKTOP_PKGS)) -lxdo -pthread -o $@
-
-.PHONY: test-desktop
-test-desktop: scratch/test_desktop
-	sh tests/run_desktop_tests.sh
-
-.PHONY: test-desktop-lifecycle
-test-desktop-lifecycle: paraketto-desktop paraketto-service
-	sh tests/run_desktop_tests.sh uv run --no-project python tests/test_desktop_lifecycle.py
-
-.PHONY: test-service
-test-service: paraketto-service
-	uv run --no-project python tests/test_service.py
-
-scratch/test_desktop: tests/test_desktop.cpp $(filter-out src/desktop/app.cpp,$(DESKTOP_SOURCES)) src/service/worker.cpp src/service/worker.h $(DESKTOP_HEADERS)
-	mkdir -p scratch
-	$(CXX) -std=c++17 -O2 -Wall -Wextra -Wno-deprecated-declarations -Ithird_party -Isrc \
-		$< $(filter-out src/desktop/app.cpp,$(DESKTOP_SOURCES)) src/service/worker.cpp \
-		$$(pkg-config --cflags --libs $(DESKTOP_PKGS)) -lxdo -pthread -o $@
+	rm -rf $(BUNDLE) .build
