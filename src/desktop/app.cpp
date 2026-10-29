@@ -727,7 +727,7 @@ private:
             guint modifiers = gdk_keymap_get_modifier_state(gdk_keymap_get_for_display(gdk_display_get_default()));
             bool released = !(modifiers & (GDK_CONTROL_MASK | GDK_SHIFT_MASK | GDK_MOD1_MASK | GDK_SUPER_MASK));
             auto elapsed = g_get_monotonic_time() - delivery_time_;
-            if ((released && input_->settled() && elapsed > 120000) || elapsed > 5000000) {
+            if ((released && elapsed > 120000) || elapsed > 5000000) {
                 finish_result(std::move(*pending_result_), released);
                 pending_result_.reset();
             }

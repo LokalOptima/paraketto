@@ -192,7 +192,7 @@ clean:
 	rm -f paraketto-desktop paraketto-service
 
 # Optional native Linux app. The inference builds do not need these libraries.
-DESKTOP_PKGS = gtk+-3.0 gio-unix-2.0 ibus-1.0 gstreamer-app-1.0 json-glib-1.0 x11
+DESKTOP_PKGS = gtk+-3.0 gio-unix-2.0 gstreamer-app-1.0 json-glib-1.0 x11
 DESKTOP_SOURCES = src/desktop/app.cpp src/desktop/audio.cpp src/desktop/backend.cpp src/desktop/history.cpp src/desktop/input.cpp
 APP_HEADERS = src/app_common.h src/model_settings.h src/service/api.h
 DESKTOP_HEADERS = $(wildcard src/desktop/*.h) $(APP_HEADERS) src/wav.h

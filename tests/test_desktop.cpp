@@ -1,4 +1,4 @@
-// Integration checks run under a private X server and private IBus session.
+// Integration checks run under a private X server and D-Bus session.
 #include "desktop/audio.h"
 #include "desktop/backend.h"
 #include "service/worker.h"
@@ -9,6 +9,7 @@
 #include "wav.h"
 #include <gdk/gdkx.h>
 #include <X11/Xatom.h>
+#include <X11/Xutil.h>
 #include <functional>
 #include <glib/gstdio.h>
 #include <signal.h>
@@ -139,96 +140,88 @@ static void backend_failure_and_shutdown() {
     g_rmdir(directory.c_str());
 }
 
-static void ibus_delivery() {
+static void clipboard_delivery() {
     auto* window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-    auto* field = gtk_entry_new();
+    auto* field = gtk_text_view_new();
+    auto* buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(field));
+    auto* clipboard = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
     gtk_container_add(GTK_CONTAINER(window), field);
     gtk_widget_show_all(window);
+    gtk_widget_grab_focus(field);
     auto* display = gdk_x11_display_get_xdisplay(gdk_display_get_default());
     Window xid = gdk_x11_window_get_xid(gtk_widget_get_window(window));
-    XSetInputFocus(display, xid, RevertToParent, CurrentTime);
     auto set_active = [&](Window target) {
+        XSetInputFocus(display, target, RevertToParent, CurrentTime);
         XChangeProperty(display, DefaultRootWindow(display), XInternAtom(display, "_NET_ACTIVE_WINDOW", False),
             XA_WINDOW, 32, PropModeReplace, reinterpret_cast<unsigned char*>(&target), 1);
         XSync(display, False);
     };
+    auto contents = [&] {
+        GtkTextIter start, end;
+        gtk_text_buffer_get_bounds(buffer, &start, &end);
+        return take_string(gtk_text_buffer_get_text(buffer, &start, &end, TRUE));
+    };
     set_active(xid);
-    ibus_init();
-    auto* bus = ibus_bus_new();
-    g_assert_true(ibus_bus_is_connected(bus));
-    auto* context = ibus_bus_create_input_context(bus, "gtk3-im:paraketto-test");
-    g_assert_nonnull(context);
-    ibus_input_context_set_capabilities(context, IBUS_CAP_FOCUS | IBUS_CAP_PREEDIT_TEXT);
-    std::string committed;
-    g_signal_connect(context, "commit-text", G_CALLBACK(+[](IBusInputContext*, IBusText* text, gpointer p) {
-        *static_cast<std::string*>(p) += ibus_text_get_text(text);
-    }), &committed);
-    {
-        TextInput input;
-        gtk_clipboard_set_text(gtk_clipboard_get(GDK_SELECTION_CLIPBOARD), "keep this clipboard", -1);
-        ibus_input_context_focus_in(context);
-        input.begin(true);
-        g_assert_true(until([&] { return input.native_target() && input.settled(); }));
-        auto delivered = input.deliver("Caffè — 日本語");
-        g_test_message("Delivery: %s", delivered.c_str());
-        g_assert_true(until([&] { return !committed.empty(); }));
-        g_assert_cmpstr(committed.c_str(), ==, "Caffè — 日本語");
-        auto clipboard = take_string(gtk_clipboard_wait_for_text(gtk_clipboard_get(GDK_SELECTION_CLIPBOARD)));
-        g_assert_cmpstr(clipboard.c_str(), ==, "keep this clipboard");
-
-        g_assert_true(until([&] {
-            auto* engine = ibus_bus_get_global_engine(bus);
-            bool restored = engine && g_strcmp0(ibus_engine_desc_get_name(engine), "paraketto-dictation");
-            if (engine) g_object_unref(engine);
-            return restored;
-        }));
-        committed.clear();
-        // A shortcut's keyboard grab temporarily removes the real IBus field.
-        // Delivery must wait for that same field to return, then work normally.
-        input.begin(true);
-        g_assert_true(until([&] { return input.native_target() && input.settled(); }));
-        ibus_input_context_focus_out(context);
-        g_assert_true(until([&] { return input.changed(); }));
-        g_assert_false(input.settled());
-        ibus_input_context_focus_in(context);
-        g_assert_true(until([&] { return !input.changed() && input.settled(); }));
-        input.deliver("After shortcut");
-        g_assert_true(until([&] { return committed == "After shortcut"; }));
-        committed.clear();
-
-        input.begin(true);
-        g_assert_true(until([&] { return input.native_target() && input.settled(); }));
-        ibus_input_context_focus_out(context);
-        g_assert_true(until([&] { return input.changed(); }));
-        auto rejected = input.deliver("must not be inserted");
-        g_assert_true(rejected.find("Focus changed") != std::string::npos);
-        g_assert_false(until([&] { return !committed.empty(); }, 150));
-
-        // Moving to a different real field remains invalid even if the user
-        // returns to the original field before recognition completes.
-        auto* other = ibus_bus_create_input_context(bus, "gtk3-im:other-field");
-        ibus_input_context_set_capabilities(other, IBUS_CAP_FOCUS | IBUS_CAP_PREEDIT_TEXT);
-        ibus_input_context_focus_in(context);
-        input.begin(true);
-        g_assert_true(until([&] { return input.native_target() && input.settled(); }));
-        ibus_input_context_focus_in(other);
-        g_assert_true(until([&] { return input.changed() && input.settled(); }));
-        ibus_input_context_focus_in(context);
-        g_assert_true(until([&] { return input.settled(); }));
-        g_assert_true(input.changed());
-        rejected = input.deliver("must not follow the focus");
-        g_assert_true(rejected.find("Focus changed") != std::string::npos);
-        g_assert_false(until([&] { return !committed.empty(); }, 150));
-        g_object_unref(other);
-
-        // A rapid cancellation must restore the user's engine even if activation
-        // was still waiting for the factory's asynchronous response.
-        ibus_input_context_focus_in(context);
-        input.begin(true); input.end();
-        g_assert_true(until([&] { return input.settled(); }));
+    g_assert_true(until([&] { return gtk_widget_has_focus(field); }));
+    // A normal GTK editor uses its built-in Ctrl+V. The terminal fixture accepts
+    // only Ctrl+Shift+V, so sending the wrong shortcut cannot pass this test.
+    bool terminal = false;
+    g_signal_connect(field, "key-press-event", G_CALLBACK(+[](GtkWidget* field, GdkEventKey* event, gpointer data) -> gboolean {
+        if (!*static_cast<bool*>(data)) return FALSE;
+        auto modifiers = event->state & gtk_accelerator_get_default_mod_mask();
+        if (gdk_keyval_to_lower(event->keyval) != GDK_KEY_v) return FALSE;
+        if (modifiers == (GDK_CONTROL_MASK | GDK_SHIFT_MASK))
+            gtk_text_buffer_paste_clipboard(gtk_text_view_get_buffer(GTK_TEXT_VIEW(field)),
+                gtk_clipboard_get(GDK_SELECTION_CLIPBOARD), nullptr, TRUE);
+        return TRUE;
+    }), &terminal);
+    std::string long_text;
+    for (int i = 0; i < 500; ++i) long_text += "Caffè — árvíztűrő 日本語 👩‍💻\nAnother paragraph.\n";
+    TextInput input;
+    for (const char* window_class : {"paraketto-test-editor", "com.mitchellh.ghostty"}) {
+        terminal = g_str_has_suffix(window_class, "ghostty");
+        XClassHint hint{const_cast<char*>(window_class), const_cast<char*>(window_class)};
+        XSetClassHint(display, xid, &hint);
+        XSync(display, False);
+        for (const auto& text : {std::string("Hallo, hallo."), std::string(378, 'a'), long_text}) {
+            gtk_text_buffer_set_text(buffer, "", 0);
+            input.begin(true);
+            g_assert_cmpuint(input.target_window(), ==, xid);
+            auto delivered = input.deliver(text);
+            g_assert_true(g_str_has_prefix(delivered.c_str(), "Paste sent to "));
+            g_assert_true(until([&] { return contents() == text; }));
+            auto copied = take_string(gtk_clipboard_wait_for_text(clipboard));
+            g_assert_cmpstr(copied.c_str(), ==, text.c_str());
+        }
     }
-    ibus_input_context_focus_out(context);
-    g_object_unref(context); g_object_unref(bus);
+
+    gtk_text_buffer_set_text(buffer, "", 0);
+    gtk_clipboard_set_text(clipboard, "keep this clipboard", -1);
+    input.begin(false);
+    auto saved = input.deliver("history only");
+    g_assert_cmpstr(saved.c_str(), ==, "Saved to history");
+    input.begin(true);
+    input.end();
+    saved = input.deliver("cancelled");
+    g_assert_cmpstr(saved.c_str(), ==, "Saved to history");
+
+    // Switching windows invalidates delivery even if the user switches back.
+    auto* other = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_widget_show_all(other);
+    Window other_xid = gdk_x11_window_get_xid(gtk_widget_get_window(other));
+    set_active(xid);
+    input.begin(true);
+    set_active(other_xid);
+    input.poll();
+    set_active(xid);
+    input.poll();
+    g_assert_true(input.changed());
+    auto rejected = input.deliver("must not follow focus");
+    g_assert_true(g_str_has_prefix(rejected.c_str(), "Focus changed"));
+    g_assert_false(until([&] { return !contents().empty(); }, 150));
+    auto copied = take_string(gtk_clipboard_wait_for_text(clipboard));
+    g_assert_cmpstr(copied.c_str(), ==, "keep this clipboard");
+    gtk_widget_destroy(other);
     gtk_widget_destroy(window);
 }
 
@@ -238,7 +231,7 @@ int main(int argc, char** argv) {
     g_test_init(&argc, &argv, nullptr);
     g_test_add_func("/desktop/recording-history", recorder_history);
     g_test_add_func("/desktop/transcript-previews", transcript_previews);
-    g_test_add_func("/desktop/ibus-delivery", ibus_delivery);
+    g_test_add_func("/desktop/clipboard-delivery", clipboard_delivery);
     g_test_add_func("/desktop/backend-failure-shutdown", backend_failure_and_shutdown);
     return g_test_run();
 }

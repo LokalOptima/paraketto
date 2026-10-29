@@ -2638,3 +2638,30 @@ identical widget bounds and VRAM decimal positions through 12 state transitions
 at both 100% and 125% text scaling, covering loading, unloading, unknown memory,
 ready/busy, connection states, and load failure. Screenshots confirmed the
 loading and ready states without using the GPU or changing live recordings.
+
+### Clipboard paste for desktop dictation
+
+A 378-byte transcript was saved correctly but disappeared when delivered to
+Ghostty 1.1.3 through IBus. Ghostty logged “not enough buffer space for input
+method commit”: its key-event IME path has a 128-byte staging buffer. Paraketto
+had reported insertion when the commit was sent, without knowing whether the
+application accepted it.
+
+Desktop insertion now uses the normal clipboard paste path, following Speech
+Note's established approach. Ordinary windows receive Ctrl+V; recognized
+terminals including Ghostty receive Ctrl+Shift+V. Removed the temporary IBus
+engine, asynchronous activation/restoration, and build dependency. Modifier
+release waiting and the destination-window guard remain. Clipboard text stays
+available for manual paste, and history now reports “Paste sent” rather than
+claiming confirmed insertion. This approach tracks windows, not individual
+fields or tmux panes, and does not query input-method password-purpose hints.
+Wayland insertion remains unsupported.
+
+Validation: Make and CMake desktop builds, the four desktop integration checks,
+and the desktop/service lifecycle suite pass. Clipboard tests cover short text,
+378-byte text, 33 KB of Unicode/multiline text, normal and terminal shortcuts,
+cancellation, history-only recording, and switching windows away and back.
+An additional private X11 session ran the installed Ghostty 1.1.3 with an
+isolated tmux server and a raw input reader: all three payloads arrived intact
+through bracketed paste (accounting for terminal newline conversion). No test
+sent input to the user's desktop or loaded a GPU model.

@@ -88,7 +88,7 @@ endif()
 
 if(PARAKETTO_BUILD_DESKTOP)
     find_package(PkgConfig REQUIRED)
-    pkg_check_modules(DESKTOP REQUIRED IMPORTED_TARGET gtk+-3.0 gio-unix-2.0 ibus-1.0 gstreamer-app-1.0 json-glib-1.0 x11)
+    pkg_check_modules(DESKTOP REQUIRED IMPORTED_TARGET gtk+-3.0 gio-unix-2.0 gstreamer-app-1.0 json-glib-1.0 x11)
     find_library(XDO_LIBRARY xdo REQUIRED)
     add_executable(paraketto-desktop
         src/desktop/app.cpp src/desktop/audio.cpp src/desktop/backend.cpp

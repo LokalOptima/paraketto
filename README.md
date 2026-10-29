@@ -216,7 +216,7 @@ until dismissed or another dictation is started.
 Build dependencies on Ubuntu/Debian (these install system packages):
 
 ```bash
-sudo apt install libgtk-3-dev libibus-1.0-dev libgstreamer1.0-dev \
+sudo apt install libgtk-3-dev libgstreamer1.0-dev \
   libgstreamer-plugins-base1.0-dev libjson-glib-dev libxdo-dev
 make desktop
 make install-service
@@ -241,13 +241,14 @@ shortcut to stop; the transcript is inserted when recognition finishes. The
 indicator's round × button beside the waveform cancels recording or pending insertion. The main window's
 Record button records directly into history.
 
-IBus support is checked for the focused input on each dictation. A temporary
-engine supplies native Unicode text delivery and then restores the previous
-engine. Applications without a confirmed IBus input use X11 clipboard/paste;
-that fallback leaves the transcript on the clipboard. A changed destination
-retains the result in history for manual copying. Native delivery tracks field
-focus; the X11 fallback can only track the application window. Initial desktop
-support targets GNOME on X11; Wayland integration is not yet validated.
+Insertion uses the clipboard and the application's paste shortcut: Ctrl+V for
+ordinary windows, Ctrl+Shift+V for recognized terminals including Ghostty. It
+leaves the full transcript on the clipboard and does not change the input method.
+Switching application windows during recording or recognition retains the result
+in history for manual copying. This guard tracks windows, not individual text
+fields or tmux panes; keep the intended cursor in place. “Paste sent” reports the
+shortcut being sent, not confirmation that the target accepted the text. Initial
+desktop support targets GNOME on X11; Wayland insertion is not implemented.
 
 History and WAV recordings persist in `~/.local/share/paraketto/history/`
 (`$XDG_DATA_HOME/paraketto/history/` when set). Use a recording's trash button to delete both.
@@ -269,7 +270,7 @@ history and local service discovery. When using a custom service data directory,
 give both processes the same `--data-dir`, or supply the desktop's `--service-url`.
 The menu can import existing mono 16/24 kHz WAV recordings.
 
-The app reuses GTK, GStreamer, IBus, libxdo, and the existing cpp-httplib server.
+The app reuses GTK, GStreamer, libxdo, and the existing cpp-httplib server.
 [Speech Note](https://github.com/mkiol/dsnote), with its maintained stable 4.x
 releases, was the main desktop-integration reference; its
 [active-window implementation](https://github.com/mkiol/dsnote/blob/main/src/fake_keyboard.cpp)
@@ -280,10 +281,11 @@ runtime. The service lives in `src/service/` and only needs GIO and JSON-GLib,
 without GTK or CUDA linkage. CMake users can opt in with
 `-DPARAKETTO_BUILD_DESKTOP=ON` (includes the service) or `-DPARAKETTO_BUILD_SERVICE=ON`.
 
-`make test-desktop` checks recording, persistent history, native IBus delivery,
-focus changes, and private-worker cleanup in a private X11/D-Bus session. It also
-requires the `xvfb` package. The test session does not change the active desktop's
-input engine or keyboard shortcuts.
+`make test-desktop` checks recording, persistent history, clipboard insertion
+(including long Unicode text and terminal paste bindings), focus changes, and
+private-worker cleanup in a private X11/D-Bus session. It also requires the `xvfb`
+package. The test session does not touch the active desktop's clipboard, input
+focus, or keyboard shortcuts.
 
 `make test-service` checks API availability while unloaded, multiple clients,
 bounded queues, idle/manual unloading, recording reservations, persisted settings,
