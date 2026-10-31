@@ -45,7 +45,7 @@ struct MenuContent: View {
                 if controller.state == .loadingModel {
                     ProgressView()
                         .controlSize(.mini)
-                        .accessibilityLabel("Loading model")
+                        .accessibilityLabel(statusLabel)
                 }
                 Text(statusLabel)
                     .fontWeight(.medium)
@@ -65,7 +65,7 @@ struct MenuContent: View {
                 HStack(spacing: 8) {
                     ProgressView(value: fraction)
                         .progressViewStyle(.linear)
-                        .accessibilityLabel("Model download")
+                        .accessibilityLabel(statusLabel)
                     Text(fraction, format: .percent.precision(.fractionLength(0)))
                         .font(.caption)
                         .monospacedDigit()
@@ -119,7 +119,11 @@ struct MenuContent: View {
     }
 
     private var statusLabel: String {
-        if case .downloadingModel = controller.state { return "Downloading…" }
-        return controller.state.label
+        let mode = controller.selectedModel.title.uppercased()
+        switch controller.state {
+        case .downloadingModel: return "Downloading \(mode)…"
+        case .loadingModel: return "Loading \(mode)…"
+        default: return controller.state.label
+        }
     }
 }
