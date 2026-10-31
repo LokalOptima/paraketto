@@ -76,10 +76,4 @@ final class HistoryStore: ObservableObject {
     // MARK: Stats
 
     var totalWords: Int { entries.reduce(0) { $0 + $1.wordCount } }
-
-    /// Words per minute of recorded speech across all entries.
-    var wordsPerMinute: Int {
-        let minutes = entries.reduce(0) { $0 + $1.duration } / 60
-        return minutes > 0 ? Int((Double(totalWords) / minutes).rounded()) : 0
-    }
 }

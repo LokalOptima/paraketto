@@ -11,7 +11,7 @@ Neural Engine with Core ML. Audio and transcripts stay on the Mac.
 - Transcription runs while you speak: every pause of 0.8 s ends a segment and it is transcribed right away, so when you pause before stopping the text is already there
 - Floating pill while recording: a level meter on a -65 to -25 dBFS scale with 30 ms attack / 160 ms release smoothing; brief peaks are retained between display updates
 - Text is pasted only if the app that had focus when you started still has it; otherwise it is kept in history
-- **Transcripts** (right-click the menu-bar icon, or choose Transcripts in its menu): recordings grouped by day, with playback, copy, delete, and word count / WPM stats. Entries show up to four lines; hover to reveal actions and expand longer text
+- **Transcripts** (right-click the menu-bar icon, or choose Transcripts in its menu): recordings grouped by day, with playback, copy, delete, and word count stats. Entries show up to four lines; hover to reveal actions and expand longer text
 - Drop an audio file onto Transcripts to transcribe it locally, including WAV, M4A and AAC files supported by macOS
 - **eng / multi** buttons in the menu: English v2 or Ultra's 25 European languages with automatic detection. Both include punctuation and capitalization
 - Models download on first use (about 464 MB for `eng`, 613 MB for `multi`); existing compatible FluidAudio caches are reused

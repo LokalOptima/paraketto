@@ -125,8 +125,6 @@ struct TranscriptsView: View {
             Text("\(store.entries.count) transcripts")
             Text("·").foregroundStyle(.tertiary)
             Text("\(store.totalWords) words")
-            Text("·").foregroundStyle(.tertiary)
-            Text("\(store.wordsPerMinute) wpm")
             Spacer()
             Text("Start and stop: \(shortcuts.shortcut.label)")
         }
