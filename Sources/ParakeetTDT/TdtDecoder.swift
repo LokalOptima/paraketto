@@ -51,6 +51,7 @@ struct TdtDecoder {
     static let debug = ProcessInfo.processInfo.environment["PARAKEET_DEBUG"] != nil
     let decoder: MLModel
     let joint: MLModel
+    let blankToken: Int
     /// Optional fused model: one call advances the LSTM with a token and decides the next frame.
     let fusedStep: MLModel?
     /// Whether a token starts a new word ("▁" prefix). Used to finish a word that straddles a segment end.
@@ -82,7 +83,7 @@ struct TdtDecoder {
         // A fresh utterance primes the prediction network with blank as start-of-sequence. A continued
         // one already holds the projection of its last token; stepping the LSTM again would drift it.
         if state.lastToken == nil {
-            try runDecoder(token: ParakeetConstants.blankToken, state: &state)
+            try runDecoder(token: blankToken, state: &state)
         }
 
         var frame = range.lowerBound
@@ -110,7 +111,7 @@ struct TdtDecoder {
                 FileHandle.standardError.write(Data("f=\(frame) tok=\(token) dur=\(duration)\n".utf8))
             }
 
-            if token == ParakeetConstants.blankToken {
+            if token == blankToken {
                 if pastRange { break }
                 frame += max(duration, 1)
                 symbolsAtFrame = 0

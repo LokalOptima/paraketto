@@ -5,3 +5,8 @@
 tools/export/.venv/
 tools/export/cache/
 __pycache__/
+data/
+# Local signing material from the development setup; never commit private keys.
+key.pem
+cert.pem
+dev.p12

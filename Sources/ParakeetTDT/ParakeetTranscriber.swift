@@ -9,7 +9,7 @@ public struct Transcription {
     public let tokens: [(id: Int, frame: Int)]
 }
 
-/// Parakeet TDT (Ultra) speech recognition on Apple silicon with Core ML.
+/// Parakeet TDT (v2 or Ultra) speech recognition on Apple silicon with Core ML.
 ///
 /// Pipeline per segment: 16 kHz samples → Preprocessor (mel) → Encoder (ANE, int8)
 /// → greedy TDT decode with the LSTM decoder and joint network → SentencePiece text.
@@ -24,6 +24,9 @@ public struct Transcription {
 /// `transcribe(_:)` is the same thing with all the audio appended at once.
 public final class ParakeetTranscriber {
     static let windowFrames = ParakeetConstants.windowSamples / ParakeetConstants.samplesPerFrame
+    // 15 s is 187.5 encoder frames. Use whole-frame VAD blocks (14.96 s) so
+    // concatenating their probabilities never shifts timestamps on long recordings.
+    static let vadBlockSamples = windowFrames * ParakeetConstants.samplesPerFrame
     static let timing = ProcessInfo.processInfo.environment["PARAKEET_TIMING"] != nil
 
     let models: ParakeetModels
@@ -35,7 +38,7 @@ public final class ParakeetTranscriber {
     public init(models: ParakeetModels, commitPauseSeconds: Double = 0.8) throws {
         self.models = models
         let vocabulary = models.vocabulary
-        decoder = TdtDecoder(decoder: models.decoder, joint: models.joint, fusedStep: models.fusedStep, isWordStart: { vocabulary.isWordStart($0) })
+        decoder = TdtDecoder(decoder: models.decoder, joint: models.joint, blankToken: models.model.blankToken, fusedStep: models.fusedStep, isWordStart: { vocabulary.isWordStart($0) })
         var segmenter = Segmenter()
         segmenter.maximumSegmentFrames = Self.windowFrames - 2 * Self.overlapFrames
         segmenter.commitPauseFrames = Int((commitPauseSeconds / 0.08).rounded())
@@ -52,22 +55,30 @@ public final class ParakeetTranscriber {
         Session(transcriber: self)
     }
 
-    /// Runs a short silent recording through every model so the first real one does not pay for
-    /// Core ML's lazy setup (about 50 ms on an M1 Max). Each encoder window is exercised.
+    /// Exercise model execution directly: normal transcription correctly skips silence.
+    /// Each encoder window is exercised without bypassing the recording's speech gate.
     public func warmUp() throws {
         for variant in models.encoder.variants {
-            let samples = [Float](repeating: 0, count: min(variant.melFrames * 160, ParakeetConstants.windowSamples))
-            _ = try transcribe(samples)
+            // Keep the padded length inside this variant, including the extra mel frame.
+            let count = min((variant.melFrames - 1) * 160, ParakeetConstants.windowSamples)
+                / ParakeetConstants.samplesPerFrame * ParakeetConstants.samplesPerFrame
+            let samples = [Float](repeating: 0, count: count)
+            let encoded = try encode(preprocess(samples[...]))
+            var state = try DecoderState()
+            _ = try decoder.decode(frames: encoded, range: 0..<encoded.count, state: &state)
         }
-        if models.vad != nil { _ = try speechProbabilities([Float](repeating: 0, count: ParakeetConstants.windowSamples)) }
+        if let vad = models.vad {
+            let mel = try preprocess([Float](repeating: 0, count: ParakeetConstants.windowSamples)[...])
+            _ = try vad.prediction(from: MLDictionaryFeatureProvider(dictionary: ["mel": MLFeatureValue(multiArray: mel.mel)]))
+        }
     }
 
-    /// Runs the VAD head over consecutive 15 s blocks and joins the per-frame probabilities.
+    /// Runs the VAD head over frame-aligned blocks and joins the per-frame probabilities.
     public func speechProbabilities(_ samples: [Float]) throws -> [Float] {
         var probabilities: [Float] = []
         var start = 0
         while start < samples.count {
-            let end = min(start + ParakeetConstants.windowSamples, samples.count)
+            let end = min(start + Self.vadBlockSamples, samples.count)
             probabilities += try speechProbabilities(block: samples[start..<end])
             start = end
         }
@@ -87,8 +98,13 @@ public final class ParakeetTranscriber {
     public final class Session {
         private let transcriber: ParakeetTranscriber
         private var samples: [Float] = []
-        /// Speech probabilities of the completed 15 s VAD blocks, one per encoder frame.
+        private var sampleOffset = 0
+        // Exposed internally for memory-bound regression tests.
+        var bufferedSampleCount: Int { samples.count }
+        private(set) var peakBufferedSampleCount = 0
+        /// Speech probabilities of completed frame-aligned VAD blocks, one per encoder frame.
         private var vadCache: [Float] = []
+        private var vadFrameOffset = 0
         private var cachedBlocks = 0
         /// Global frame where the next segment starts.
         private var segmentStart = 0
@@ -111,20 +127,27 @@ public final class ParakeetTranscriber {
             DecodeProfile.reset()
         }
 
-        private var totalFrames: Int { (samples.count + ParakeetConstants.samplesPerFrame - 1) / ParakeetConstants.samplesPerFrame }
+        private var totalSamples: Int { sampleOffset + samples.count }
+        private var totalFrames: Int { (totalSamples + ParakeetConstants.samplesPerFrame - 1) / ParakeetConstants.samplesPerFrame }
 
         /// Adds recorded audio and transcribes every segment whose cut can now be decided.
         public func append(_ newSamples: [Float]) throws {
             precondition(!finished, "session already finished")
-            samples += newSamples
-            try advance(final: false)
+            // Bound working memory even when an offline caller supplies the entire file.
+            for start in stride(from: 0, to: newSamples.count, by: 1600) {
+                samples.append(contentsOf: newSamples[start..<min(start + 1600, newSamples.count)])
+                peakBufferedSampleCount = max(peakBufferedSampleCount, samples.count)
+                try advance(final: false)
+                discardConsumedAudio()
+            }
         }
 
         /// Transcribes what is left and returns the whole recording's text.
         public func finish() throws -> Transcription {
             precondition(!finished, "session already finished")
             finished = true
-            if samples.count >= ParakeetConstants.minimumSamples { try advance(final: true) }
+            defer { samples = []; vadCache = [] }
+            if totalSamples >= ParakeetConstants.minimumSamples { try advance(final: true) }
             let tokens = committed + provisional
             if ParakeetTranscriber.timing {
                 let ms = { (s: Double) in Int(s * 1000) }
@@ -142,10 +165,11 @@ public final class ParakeetTranscriber {
                 let remaining = total - segmentStart
                 if final {
                     // The tail is decoded in one pass when it fits the window with its left overlap.
-                    // A recording that fits whole is decoded exactly as FluidAudio does, without VAD.
+                    // Check even the first short chunk: stopping before the live VAD cadence
+                    // must not send silence/noise straight into the speech decoder.
                     if remaining + min(leftContext, segmentStart) <= ParakeetTranscriber.windowFrames {
                         guard remaining > 0 else { return }
-                        let tailHasSpeech = try segmentStart == 0 || segmenter.hasSpeech(probabilities(upTo: total)[segmentStart..<total])
+                        let tailHasSpeech = try segmenter.hasSpeech(probabilities(upTo: total)[segmentStart..<total])
                         if tailHasSpeech { try process(segmentStart..<total) }
                         return
                     }
@@ -167,7 +191,7 @@ public final class ParakeetTranscriber {
             }
         }
 
-        private func commit(_ range: Range<Int>, probabilities: [Float], overlapped: Bool) throws {
+        private func commit(_ range: Range<Int>, probabilities: FrameProbabilities, overlapped: Bool) throws {
             let speech = transcriber.segmenter.hasSpeech(probabilities[range])
             if speech {
                 try process(range, overlapped: overlapped)
@@ -184,22 +208,36 @@ public final class ParakeetTranscriber {
             segmentStart = range.upperBound
         }
 
-        /// Speech probabilities for frames `0..<limit`: cached whole blocks, plus the current partial
+        /// Speech probabilities from the retained frame offset: cached blocks, plus the current partial
         /// block evaluated on the spot. Frames the VAD did not cover count as speech.
-        private func probabilities(upTo limit: Int) throws -> [Float] {
-            let block = ParakeetConstants.windowSamples
+        private func probabilities(upTo limit: Int) throws -> FrameProbabilities {
+            let block = ParakeetTranscriber.vadBlockSamples
             let t0 = Date()
-            while (cachedBlocks + 1) * block <= samples.count {
-                vadCache += try transcriber.speechProbabilities(block: samples[(cachedBlocks * block)..<((cachedBlocks + 1) * block)])
+            while (cachedBlocks + 1) * block <= totalSamples {
+                vadCache += try transcriber.speechProbabilities(block: samples[(cachedBlocks * block - sampleOffset)..<((cachedBlocks + 1) * block - sampleOffset)])
                 cachedBlocks += 1
             }
             var result = vadCache
-            if result.count < limit, cachedBlocks * block < samples.count {
-                result += try transcriber.speechProbabilities(block: samples[(cachedBlocks * block)...])
+            if vadFrameOffset + result.count < limit, cachedBlocks * block < totalSamples {
+                result += try transcriber.speechProbabilities(block: samples[(cachedBlocks * block - sampleOffset)...])
             }
             vadSeconds += Date().timeIntervalSince(t0)
-            if result.count < limit { result += Array(repeating: 1, count: limit - result.count) }
-            return result
+            if vadFrameOffset + result.count < limit { result += Array(repeating: 1, count: limit - vadFrameOffset - result.count) }
+            return FrameProbabilities(values: result, startFrame: vadFrameOffset)
+        }
+
+        private func discardConsumedAudio() {
+            // Keep left overlap for the next decode, and the incomplete VAD block so
+            // its normalization sees exactly the same audio as before compaction.
+            let decodeStart = max(0, segmentStart - ParakeetTranscriber.overlapFrames) * ParakeetConstants.samplesPerFrame
+            let keepFrom = min(decodeStart, cachedBlocks * ParakeetTranscriber.vadBlockSamples)
+            if keepFrom > sampleOffset {
+                samples.removeFirst(keepFrom - sampleOffset)
+                sampleOffset = keepFrom
+            }
+            let discardFrames = min(max(0, segmentStart - vadFrameOffset), vadCache.count)
+            vadCache.removeFirst(discardFrames)
+            vadFrameOffset += discardFrames
         }
 
         /// Encodes `range` with its neighbours' audio, decodes the whole window, and joins the result
@@ -242,8 +280,8 @@ public final class ParakeetTranscriber {
 
         /// Encodes and greedily decodes the audio of `frames` with a fresh decoder; tokens carry global frames.
         private func decodeWindow(_ frames: Range<Int>) throws -> [Token] {
-            let start = frames.lowerBound * ParakeetConstants.samplesPerFrame
-            let end = min(frames.upperBound * ParakeetConstants.samplesPerFrame, samples.count)
+            let start = frames.lowerBound * ParakeetConstants.samplesPerFrame - sampleOffset
+            let end = min(frames.upperBound * ParakeetConstants.samplesPerFrame - sampleOffset, samples.count)
             guard end - start >= ParakeetConstants.minimumSamples else { return [] }
             let t0 = Date()
             let mel = try transcriber.preprocess(samples[start..<end])
@@ -352,6 +390,9 @@ public final class ParakeetTranscriber {
     /// VAD probabilities for one block of at most 15 s; frames the block covers but the head did not report count as speech.
     func speechProbabilities(block: ArraySlice<Float>) throws -> [Float] {
         let frames = (block.count + ParakeetConstants.samplesPerFrame - 1) / ParakeetConstants.samplesPerFrame
+        // Normalizing a constant, zero-filled recording is outside the learned VAD's
+        // useful input range. Exact digital silence is unambiguously not speech.
+        if block.allSatisfy({ $0 == 0 }) { return Array(repeating: 0, count: frames) }
         guard let vad = models.vad else { return Array(repeating: 1, count: frames) }
         let mel = try preprocess(block)
         let output = try vad.prediction(from: MLDictionaryFeatureProvider(dictionary: ["mel": MLFeatureValue(multiArray: mel.mel)]))

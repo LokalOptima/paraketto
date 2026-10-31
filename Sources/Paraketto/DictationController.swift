@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import Foundation
+import ParakeetTDT
 
 /// Owns the record → transcribe → paste loop and exposes state for the menu bar, overlay and history.
 @MainActor
@@ -55,6 +56,29 @@ final class DictationController: ObservableObject {
     @Published private(set) var inputLevel: Float = 0
     @Published private(set) var elapsed: TimeInterval = 0
     @Published private(set) var destination: Destination?
+    @Published private(set) var selectedModel = ParakeetModel(rawValue: UserDefaults.standard.string(forKey: "recognitionMode") ?? "") ?? .multi
+    @Published private(set) var modelError: String?
+    @Published private(set) var isLoadingModel = true
+    @Published private(set) var isStartingRecording = false
+    private var loadedModel: ParakeetModel?
+    private var failedModel: ParakeetModel?
+    private var modelLoadID = UUID()
+
+    struct FileImportStatus {
+        let id = UUID()
+        let filename: String
+        let mode: ParakeetModel
+        var progress: Double = 0
+    }
+    @Published private(set) var fileImport: FileImportStatus?
+    @Published private(set) var importErrors: [String] = []
+    private var importTask: Task<Void, Never>?
+
+    var canImportFiles: Bool {
+        loadedModel != nil && !isLoadingModel && !isStartingRecording && state.canStartRecording && importTask == nil
+    }
+
+    var canChangeModel: Bool { !isLoadingModel && !isStartingRecording && !state.isCancellable }
 
     let history = HistoryStore()
     let shortcuts = ShortcutSettings()
@@ -73,11 +97,9 @@ final class DictationController: ObservableObject {
     private var meterTask: Task<Void, Never>?
     private var recordingStarted = Date()
     private var transcription: Task<Void, Never>?
-    /// Carries captured audio from the recorder's thread to the transcriber, in order.
-    private var audioStream: AsyncStream<[Float]>.Continuation?
+    /// Coalesces file-length notifications; audio stays on disk if inference falls behind.
+    private var audioStream: AsyncStream<Int>.Continuation?
     private var feeder: Task<Void, Never>?
-
-    var lastTranscript: String? { history.entries.first?.text }
 
     func start() {
         Log.startSession()
@@ -134,46 +156,119 @@ final class DictationController: ObservableObject {
         show(.notice("Demo finished"))
     }
 
-    func copyLastTranscript() {
-        guard let text = lastTranscript else { return }
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(text, forType: .string)
-    }
-
     /// Escape while recording or transcribing: discard the audio, paste nothing.
     func cancel() {
+        if importTask != nil { cancelFileImport(); return }
         guard state.isCancellable else { return }
         Log.info("cancelled")
         transcription?.cancel()
         transcription = nil
-        if state == .recording { _ = recorder.stop() }
+        if state == .recording { _ = try? recorder.stop() }
         audioStream?.finish()
         audioStream = nil
-        Task { [transcriber, feeder] in await feeder?.value; await transcriber.discard() }
-        feeder = nil
+        feeder?.cancel()
+        feeder = Task { [transcriber, feeder] in await feeder?.value; await transcriber.discard() }
         finishSession()
         state = .idle
         overlay?.hide()
     }
 
     private func loadModel() async {
+        let model = selectedModel
+        let loadID = UUID()
+        modelLoadID = loadID
+        isLoadingModel = true
+        modelError = nil
+        failedModel = nil
+        state = .loadingModel
+        defer { isLoadingModel = false }
         do {
+            await feeder?.value
             let started = Date()
-            try await transcriber.load { phase in
+            try await transcriber.load(model: model) { phase in
                 Task { @MainActor [weak self] in
+                    guard let self, self.isLoadingModel, self.modelLoadID == loadID else { return }
                     switch phase {
-                    case .downloading(let fraction): self?.state = .downloadingModel(fraction)
-                    case .loading: self?.state = .loadingModel
+                    case .downloading(let fraction): self.state = .downloadingModel(fraction)
+                    case .loading: self.state = .loadingModel
                     }
                 }
             }
+            loadedModel = model
+            UserDefaults.standard.set(model.rawValue, forKey: "recognitionMode")
             state = .idle
-            Log.info("Parakeet Ultra ready in \(Int(Date().timeIntervalSince(started) * 1000)) ms")
+            Log.info("\(model.title) (\(model.description)) ready in \(Int(Date().timeIntervalSince(started) * 1000)) ms")
         } catch {
-            state = .failed(error.localizedDescription)
+            failedModel = model
+            modelError = "Could not load \(model.title): \(error.localizedDescription)"
+            if let loadedModel {
+                selectedModel = loadedModel
+                state = .idle
+            } else {
+                state = .failed(error.localizedDescription)
+            }
             Log.info("Model load failed: \(error)")
         }
     }
+
+    func selectModel(_ model: ParakeetModel) {
+        guard canChangeModel, model != loadedModel || modelError != nil else { return }
+        selectedModel = model
+        // Reserve the transition synchronously, before another shortcut/menu action can run.
+        isLoadingModel = true
+        state = .loadingModel
+        overlay?.hide()
+        Task { await loadModel() }
+    }
+
+    func retryModelLoad() { selectModel(failedModel ?? selectedModel) }
+
+    /// Finder drops use the current mode and process a batch in order, sharing one loaded model.
+    @discardableResult
+    func importFiles(_ urls: [URL]) -> Bool {
+        guard canImportFiles, !urls.isEmpty, urls.allSatisfy(\.isFileURL) else { return false }
+        let mode = selectedModel
+        state = .transcribing
+        overlay?.hide()
+        importErrors = []
+        fileImport = FileImportStatus(filename: urls[0].lastPathComponent, mode: mode)
+        importTask = Task {
+            defer {
+                fileImport = nil
+                importTask = nil
+                state = .idle
+            }
+            await feeder?.value
+            for url in urls {
+                guard !Task.isCancelled else { return }
+                let status = FileImportStatus(filename: url.lastPathComponent, mode: mode)
+                fileImport = status
+                do {
+                    let result = try await transcriber.transcribeFile(url) { [weak self] fraction in
+                        Task { @MainActor in
+                            guard let self, self.fileImport?.id == status.id else { return }
+                            self.fileImport?.progress = fraction
+                        }
+                    }
+                    try Task.checkCancellation()
+                    let entry = HistoryEntry(id: UUID(), date: Date(), text: result.text,
+                                             destination: "", duration: result.recording.duration,
+                                             inferenceMilliseconds: result.inferenceMilliseconds,
+                                             delivery: .imported, sourceFilename: url.lastPathComponent)
+                    try history.add(entry, recording: result.recording)
+                } catch is CancellationError {
+                    return
+                } catch {
+                    guard !Task.isCancelled else { return }
+                    importErrors.append("\(url.lastPathComponent): \(error.localizedDescription)")
+                }
+            }
+        }
+        return true
+    }
+
+    func cancelFileImport() { importTask?.cancel() }
+    func dismissImportErrors() { importErrors = [] }
 
     /// One press starts a recording, the next press stops it and transcribes.
     private func toggleRecording() {
@@ -186,27 +281,48 @@ final class DictationController: ObservableObject {
     }
 
     private func beginRecording() {
+        guard !isLoadingModel, loadedModel != nil, !isStartingRecording else { return }
+        isStartingRecording = true
         Task {
+            defer { isStartingRecording = false }
             guard await AudioRecorder.requestMicrophoneAccess() else {
                 show(.failed("Microphone access denied"))
                 return
             }
-            guard state.canStartRecording else { return }
+            guard state.canStartRecording, !isLoadingModel else { return }
             await feeder?.value  // a cancelled recording may still be draining into the old session
             do {
                 destination = Destination.frontmost
                 try await transcriber.startSession()
-                let (stream, continuation) = AsyncStream<[Float]>.makeStream()
+                let (stream, continuation) = AsyncStream<Int>.makeStream(bufferingPolicy: .bufferingNewest(1))
                 audioStream = continuation
-                recorder.onSamples = { continuation.yield($0) }
+                recorder.onProgress = { continuation.yield($0) }
+                let recording = try recorder.start()
                 feeder = Task { [transcriber] in
-                    for await chunk in stream { await transcriber.append(chunk) }
+                    var consumed = 0
+                    do {
+                        for await available in stream {
+                            while consumed < available {
+                                try Task.checkCancellation()
+                                let count = min(1600, available - consumed)
+                                let chunk = try recording.readSamples(from: consumed, count: count)
+                                await transcriber.append(chunk)
+                                consumed += count
+                            }
+                        }
+                    } catch is CancellationError {
+                        // The cancellation path discards the recognizer session.
+                    } catch {
+                        await transcriber.fail(error)
+                    }
                 }
-                try recorder.start()
                 startSession()
                 state = .recording
                 overlay?.show()
             } catch {
+                audioStream?.finish()
+                audioStream = nil
+                await transcriber.discard()
                 Log.info("Recorder start failed: \(error)")
                 show(.failed(error.localizedDescription))
             }
@@ -215,27 +331,37 @@ final class DictationController: ObservableObject {
 
     private func stopRecording() {
         guard state == .recording else { return }
-        let samples = recorder.stop()
+        let recording: RecordingFile
+        do { recording = try recorder.stop() }
+        catch {
+            audioStream?.finish()
+            audioStream = nil
+            feeder?.cancel()
+            feeder = Task { [transcriber, feeder] in await feeder?.value; await transcriber.discard() }
+            finishSession()
+            show(.failed(error.localizedDescription))
+            return
+        }
         audioStream?.finish()
         audioStream = nil
-        guard samples.count >= Transcriber.minimumSamples else {
-            Task { [transcriber, feeder] in await feeder?.value; await transcriber.discard() }
-            feeder = nil
+        guard recording.sampleCount >= Transcriber.minimumSamples else {
+            feeder = Task { [transcriber, feeder] in await feeder?.value; await transcriber.discard() }
             finishSession()
             state = .idle
             overlay?.hide()
             return
         }
         state = .transcribing
-        transcription = Task {
+        transcription = Task { [feeder] in
             let started = Date()
             do {
                 await feeder?.value
-                feeder = nil
+                try Task.checkCancellation()
+                self.feeder = nil
                 let text = try await transcriber.finish()
                 guard !Task.isCancelled else { return }
                 let inferenceMilliseconds = Int(Date().timeIntervalSince(started) * 1000)
-                let duration = Double(samples.count) / AudioRecorder.sampleRate
+                let duration = recording.duration
                 Log.info("finished \(String(format: "%.1f", duration))s recording \(inferenceMilliseconds) ms after stop, \(text.count) characters")
                 finishSession()
                 guard !text.isEmpty else {
@@ -243,15 +369,15 @@ final class DictationController: ObservableObject {
                     overlay?.hide()
                     return
                 }
-                let outcome = await Paster.deliver(text, to: destination)
+                let outcome = try await Paster.deliver(text, to: destination)
                 Log.info("delivery: \(outcome)")
-                history.add(
+                try history.add(
                     HistoryEntry(
                         id: UUID(), date: recordingStarted, text: text,
                         destination: destination?.name ?? "", duration: duration,
                         inferenceMilliseconds: inferenceMilliseconds, delivery: delivery(for: outcome)
                     ),
-                    samples: samples
+                    recording: recording
                 )
                 switch outcome {
                 case .pasted:

@@ -1,4 +1,4 @@
-import AVFoundation
+import Combine
 import Foundation
 
 /// One dictation: transcript, where it went, and the recording that produced it.
@@ -7,6 +7,7 @@ struct HistoryEntry: Codable, Identifiable, Equatable {
         case pasted
         case copied
         case keptInHistory
+        case imported
     }
 
     let id: UUID
@@ -16,6 +17,7 @@ struct HistoryEntry: Codable, Identifiable, Equatable {
     let duration: TimeInterval
     var inferenceMilliseconds: Int
     var delivery: Delivery
+    var sourceFilename: String? = nil
 
     var wordCount: Int {
         text.split { $0.isWhitespace || $0.isNewline }.count
@@ -29,19 +31,21 @@ final class HistoryStore: ObservableObject {
 
     let directory: URL
 
-    init() {
+    init(directory: URL? = nil) {
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        directory = support.appendingPathComponent("Paraketto/history", isDirectory: true)
-        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        self.directory = directory ?? support.appendingPathComponent("Paraketto/history", isDirectory: true)
+        try? FileManager.default.createDirectory(at: self.directory, withIntermediateDirectories: true)
         entries = loadAll()
     }
 
-    func add(_ entry: HistoryEntry, samples: [Float]) {
+    func add(_ entry: HistoryEntry, recording: RecordingFile) throws {
+        let metadata = try JSONEncoder().encode(entry)
+        try recording.move(to: audioURL(for: entry))
         do {
-            try WAVFile.data(samples: samples, sampleRate: Int(AudioRecorder.sampleRate)).write(to: audioURL(for: entry))
-            try JSONEncoder().encode(entry).write(to: jsonURL(for: entry))
+            try metadata.write(to: jsonURL(for: entry), options: .atomic)
         } catch {
-            Log.info("History save failed: \(error)")
+            try? FileManager.default.removeItem(at: audioURL(for: entry))
+            throw error
         }
         entries.insert(entry, at: 0)
     }
@@ -77,61 +81,5 @@ final class HistoryStore: ObservableObject {
     var wordsPerMinute: Int {
         let minutes = entries.reduce(0) { $0 + $1.duration } / 60
         return minutes > 0 ? Int((Double(totalWords) / minutes).rounded()) : 0
-    }
-}
-
-/// Minimal PCM16 WAV writer and reader for the recorder's 16 kHz mono float samples.
-enum WAVFile {
-    static func data(samples: [Float], sampleRate: Int) -> Data {
-        let pcm = samples.map { Int16(max(-1, min(1, $0)) * Float(Int16.max)) }
-        let dataSize = UInt32(pcm.count * 2)
-        var header = Data(capacity: 44)
-        header.append(contentsOf: Array("RIFF".utf8))
-        header.append(le(36 + dataSize))
-        header.append(contentsOf: Array("WAVEfmt ".utf8))
-        header.append(le(UInt32(16)))
-        header.append(le(UInt16(1)))                       // PCM
-        header.append(le(UInt16(1)))                       // mono
-        header.append(le(UInt32(sampleRate)))
-        header.append(le(UInt32(sampleRate * 2)))          // byte rate
-        header.append(le(UInt16(2)))                       // block align
-        header.append(le(UInt16(16)))                      // bits per sample
-        header.append(contentsOf: Array("data".utf8))
-        header.append(le(dataSize))
-        return pcm.withUnsafeBufferPointer { header + Data(buffer: $0) }
-    }
-
-    private static func le<T: FixedWidthInteger>(_ value: T) -> Data {
-        withUnsafeBytes(of: value.littleEndian) { Data($0) }
-    }
-}
-
-/// Plays one history recording at a time.
-@MainActor
-final class AudioPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
-    @Published private(set) var playingID: UUID?
-    private var player: AVAudioPlayer?
-
-    func toggle(_ entry: HistoryEntry, url: URL) {
-        if playingID == entry.id {
-            stop()
-            return
-        }
-        stop()
-        guard let player = try? AVAudioPlayer(contentsOf: url) else { return }
-        player.delegate = self
-        self.player = player
-        playingID = entry.id
-        player.play()
-    }
-
-    func stop() {
-        player?.stop()
-        player = nil
-        playingID = nil
-    }
-
-    nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
-        Task { @MainActor in self.stop() }
     }
 }

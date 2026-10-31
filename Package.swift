@@ -25,5 +25,11 @@ let package = Package(
             path: "Sources/ParakettoCLI",
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
+        .testTarget(
+            name: "ParakettoTests",
+            dependencies: ["ParakeetTDT", "Paraketto"],
+            path: "tests/swift",
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
     ]
 )

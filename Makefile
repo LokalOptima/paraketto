@@ -2,13 +2,20 @@ APP_NAME      := Paraketto
 BUNDLE_ID     := io.lfrati.paraketto
 BUNDLE        := $(APP_NAME).app
 CONFIG        ?= release
+# Warm this Mac's Core ML caches through the signed app after bundling.
+# Disable for packaging on a build machine that will not run the app.
+PREPARE_MODELS ?= 1
+INSTALL_APP   ?= 1
+INSTALL_DIR   ?= /Applications
 BINARY        := .build/$(CONFIG)/$(APP_NAME)
 CLI           := .build/$(CONFIG)/paraketto-cli
 CONTENTS      := $(BUNDLE)/Contents
 VAD_PACKAGE   := Resources/VadHead.mlpackage
 VAD_COMPILED  := .build/VadHead.mlmodelc
+APP_ICON      := .build/Paraketto.icns
+ICON_SOURCE   := Resources/paraketto.png
 FIXTURES      := tests/fixtures/librispeech_fluidaudio.tsv
-CLIPS         ?= ../paraketto/data/librispeech/*.wav
+CLIPS         ?= data/librispeech/*.wav
 # Signing. macOS ties the Accessibility grant to the app's signature. With the "Paraketto Dev"
 # self-signed certificate in the login keychain (see README) every build carries the same
 # signature and the grant survives; without it codesign falls back to ad-hoc ("-"), whose
@@ -20,7 +27,7 @@ SIGN_NAME     ?= Paraketto Dev
 SIGN_IDENTITY ?= $(or $(shell security find-identity -p codesigning 2>/dev/null | grep -F '"$(SIGN_NAME)"' | head -1 | awk '{print $$2}'),-)
 SIGN_IDENTITY := $(SIGN_IDENTITY)
 
-.PHONY: all build bundle run trust vad cli compare longform vad-export encoder-export decoder-export clean
+.PHONY: all build bundle icons run prepare-models trust vad cli test test-models compare longform vad-export encoder-export decoder-export clean
 
 MODELS_DIR    := $(HOME)/Library/Application Support/Paraketto/models
 
@@ -32,15 +39,26 @@ build:
 # Compiles the VAD head once; the .mlpackage in Resources is the source of truth.
 vad: $(VAD_COMPILED)
 
-$(VAD_COMPILED): $(VAD_PACKAGE)
+$(VAD_COMPILED): $(VAD_PACKAGE)/Manifest.json $(VAD_PACKAGE)/Data/com.apple.CoreML/model.mlmodel $(VAD_PACKAGE)/Data/com.apple.CoreML/weights/weight.bin
 	rm -rf $(VAD_COMPILED)
 	xcrun coremlcompiler compile $(VAD_PACKAGE) .build
 
-bundle: build vad
+.build/make-icon: tools/make_icon.swift
+	mkdir -p .build
+	swiftc -parse-as-library tools/make_icon.swift -o .build/make-icon
+
+# Regenerate both outputs together, including when either generated file was removed.
+icons: .build/make-icon $(ICON_SOURCE)
+	.build/make-icon $(ICON_SOURCE) .build/Paraketto.iconset
+	iconutil -c icns .build/Paraketto.iconset -o $(APP_ICON)
+
+bundle: build vad icons
 	rm -rf $(BUNDLE)
 	mkdir -p $(CONTENTS)/MacOS $(CONTENTS)/Resources
 	cp $(BINARY) $(CONTENTS)/MacOS/$(APP_NAME)
 	cp Resources/Info.plist $(CONTENTS)/Info.plist
+	cp $(APP_ICON) $(CONTENTS)/Resources/
+	cp .build/ParakettoMenu.png $(CONTENTS)/Resources/
 	cp -R $(VAD_COMPILED) $(CONTENTS)/Resources/
 # The first codesign with a new key blocks on a keychain dialog until "Always Allow" is clicked.
 	codesign --force --sign "$(SIGN_IDENTITY)" \
@@ -55,9 +73,25 @@ ifneq ($(SIGN_IDENTITY),-)
 else
 	@echo "signed ad-hoc: no $(SIGN_NAME) certificate found, the Accessibility grant will not survive rebuilds"
 endif
+ifeq ($(PREPARE_MODELS),1)
+	$(CONTENTS)/MacOS/$(APP_NAME) --prepare-models --cached-only
+endif
+ifeq ($(INSTALL_APP),1)
+	mkdir -p "$(INSTALL_DIR)"
+	/usr/bin/rsync -aE --delete "$(BUNDLE)/" "$(INSTALL_DIR)/$(BUNDLE)/"
+	codesign --verify --deep --strict "$(INSTALL_DIR)/$(BUNDLE)"
+endif
+
+# Explicitly download and prepare both modes; bundle alone only prepares installed models.
+prepare-models: bundle
+	$(CONTENTS)/MacOS/$(APP_NAME) --prepare-models
 
 run: bundle
+ifeq ($(INSTALL_APP),1)
+	open "$(INSTALL_DIR)/$(BUNDLE)"
+else
 	open $(BUNDLE)
+endif
 
 # Drops the stale Accessibility entry left by a previous (ad-hoc) build and opens the
 # Accessibility pane so the running build can be granted again.
@@ -66,6 +100,12 @@ trust:
 	open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
 
 cli: build vad
+
+test: vad
+	swift test -c $(CONFIG)
+
+test-models: vad
+	PARAKETTO_MODEL_TESTS=1 swift test -c $(CONFIG)
 
 # Transcribes the LibriSpeech clips and checks every transcript against FluidAudio's.
 compare: cli

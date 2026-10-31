@@ -9,6 +9,7 @@ import ParakeetTDT
 ///   paraketto-cli [--vad VadHead.mlmodelc] [--compare reference.tsv] [--vad-probe] file.wav ...
 
 var files: [String] = []
+var model: ParakeetModel = .multi
 var vadPath: String?
 var comparePath: String?
 var vadProbe = false
@@ -21,36 +22,63 @@ var hypothesesPath: String?  // writes file<TAB>text per file, for tests/score.p
 var useFused = true
 var fusedPath: String?
 var arguments = Array(CommandLine.arguments.dropFirst())
+
+func argumentError(_ message: String) -> Never {
+    FileHandle.standardError.write(Data((message + "\n").utf8))
+    exit(2)
+}
+
+func argumentValue(for option: String) -> String {
+    guard let value = arguments.first, !value.hasPrefix("--") else {
+        argumentError("\(option) requires a value")
+    }
+    return arguments.removeFirst()
+}
+
 while !arguments.isEmpty {
     let argument = arguments.removeFirst()
     switch argument {
-    case "--vad": vadPath = arguments.removeFirst()
-    case "--compare": comparePath = arguments.removeFirst()
+    case "--model":
+        guard let choice = ParakeetModel(rawValue: argumentValue(for: argument)) else { argumentError("--model expects eng or multi") }
+        model = choice
+    case "--vad": vadPath = argumentValue(for: argument)
+    case "--compare": comparePath = argumentValue(for: argument)
     case "--vad-probe": vadProbe = true
     case "--tokens": showTokens = true
     case "--plan": showPlan = true
-    case "--encoder": encoderPath = arguments.removeFirst()
-    case "--chunk-ms": chunkMilliseconds = Int(arguments.removeFirst()) ?? 0
-    case "--pause": pauseSeconds = Double(arguments.removeFirst()) ?? 0.8
-    case "--hypotheses": hypothesesPath = arguments.removeFirst()
+    case "--encoder": encoderPath = argumentValue(for: argument)
+    case "--chunk-ms":
+        guard let value = Int(argumentValue(for: argument)), value >= 0, value <= Int.max / 16 else {
+            argumentError("--chunk-ms expects a nonnegative number of milliseconds")
+        }
+        chunkMilliseconds = value
+    case "--pause":
+        guard let value = Double(argumentValue(for: argument)), value.isFinite, value >= 0, value <= 15 else {
+            argumentError("--pause expects a number of seconds between 0 and 15")
+        }
+        pauseSeconds = value
+    case "--hypotheses": hypothesesPath = argumentValue(for: argument)
     case "--fused":
-        let value = arguments.removeFirst()
+        let value = argumentValue(for: argument)
         useFused = value != "off"
         fusedPath = ["on", "off"].contains(value) ? nil : value
-    default: files.append(argument)
+    default:
+        if argument.hasPrefix("--") { argumentError("Unknown option: \(argument)") }
+        files.append(argument)
     }
 }
+let store = ModelStore(model: model)
 /// Prints, per model, how Core ML assigns its operations to compute devices (its `MLComputePlan`).
 @available(macOS 14.4, *)
-func printComputePlans(directory: URL, vad: URL?) async {
+func printComputePlans(directory: URL, model: ParakeetModel, store: ModelStore, vad: URL?) async {
     var models: [(String, URL, MLComputeUnits)] = [
         ("Preprocessor", directory.appendingPathComponent("Preprocessor.mlmodelc"), .cpuOnly),
         ("Encoder", directory.appendingPathComponent("Encoder.mlmodelc"), .cpuAndNeuralEngine),
         ("Decoder", directory.appendingPathComponent("Decoder.mlmodelc"), .cpuAndNeuralEngine),
-        ("JointDecisionv3", directory.appendingPathComponent("JointDecisionv3.mlmodelc"), .cpuAndNeuralEngine),
+        (model.jointFilename, directory.appendingPathComponent(model.jointFilename), .cpuAndNeuralEngine),
     ]
     if let vad { models.append(("VadHead", vad, .cpuAndNeuralEngine)) }
-    if let own = ModelStore.ownEncoderURL { models.append(("Encoder (ours, default function)", own, .cpuAndNeuralEngine)) }
+    if let own = store.ownEncoderURL { models.append(("Encoder (ours, default function)", own, .cpuAndNeuralEngine)) }
     for (name, url, units) in models {
         let configuration = MLModelConfiguration()
         configuration.computeUnits = units
@@ -85,7 +113,7 @@ func printComputePlans(directory: URL, vad: URL?) async {
 }
 
 guard !files.isEmpty || showPlan else {
-    FileHandle.standardError.write(Data("usage: paraketto-cli [--vad DIR.mlmodelc] [--compare ref.tsv] [--vad-probe] file.wav ...\n".utf8))
+    FileHandle.standardError.write(Data("usage: paraketto-cli [--model eng|multi] [--vad DIR.mlmodelc] [--compare ref.tsv] [--vad-probe] file.wav ...\n".utf8))
     exit(2)
 }
 
@@ -115,20 +143,21 @@ func loadSamples(_ path: String) throws -> [Float] {
 }
 
 let started = Date()
-let directory = try await ModelStore.locate { fraction in
+let directory = try await store.locate { fraction in
     FileHandle.standardError.write(Data(String(format: "downloading %.0f%%\n", fraction * 100).utf8))
 }
 if showPlan {
     if #available(macOS 14.4, *) {
-        await printComputePlans(directory: directory, vad: vadPath.map { URL(fileURLWithPath: $0) })
+        await printComputePlans(directory: directory, model: model, store: store, vad: vadPath.map { URL(fileURLWithPath: $0) })
     } else {
         print("MLComputePlan needs macOS 14.4")
     }
     if files.isEmpty { exit(0) }
 }
-let encoderURL = encoderPath.map { URL(fileURLWithPath: $0) } ?? ModelStore.ownEncoderURL
-let fusedURL = useFused ? (fusedPath.map { URL(fileURLWithPath: $0) } ?? ModelStore.ownFusedDecoderURL) : nil
-let models = try ParakeetModels(directory: directory, vadModel: vadPath.map { URL(fileURLWithPath: $0) }, encoderModel: encoderURL, fusedDecoder: fusedURL)
+let encoderURL = encoderPath.map { URL(fileURLWithPath: $0) } ?? store.ownEncoderURL
+let fusedURL = useFused ? (fusedPath.map { URL(fileURLWithPath: $0) } ?? store.ownFusedDecoderURL) : nil
+let models = try ParakeetModels(directory: directory, model: model, vadModel: vadPath.map { URL(fileURLWithPath: $0) }, encoderModel: encoderURL, fusedDecoder: fusedURL)
+FileHandle.standardError.write(Data("mode: \(model.title) (\(model.description))\n".utf8))
 FileHandle.standardError.write(Data("fused decoder step: \(fusedURL == nil ? "off" : "on")\n".utf8))
 FileHandle.standardError.write(Data("encoder: \(encoderURL?.path ?? "FluidAudio 15 s") windows \(models.encoder.variants.map(\.melFrames))\n".utf8))
 let transcriber = try ParakeetTranscriber(models: models, commitPauseSeconds: pauseSeconds)
@@ -162,7 +191,7 @@ for path in files {
     var finishElapsed = 0.0
     if chunkMilliseconds > 0 {
         let session = transcriber.startSession()
-        let chunk = chunkMilliseconds * 16
+        let chunk = min(chunkMilliseconds * 16, max(samples.count, 1))
         for start in stride(from: 0, to: samples.count, by: chunk) {
             try session.append(Array(samples[start..<min(start + chunk, samples.count)]))
         }

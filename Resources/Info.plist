@@ -12,6 +12,8 @@
 	<string>6.0</string>
 	<key>CFBundleName</key>
 	<string>Paraketto</string>
+	<key>CFBundleIconFile</key>
+	<string>Paraketto</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
@@ -25,7 +27,7 @@
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Paraketto records your voice while the dictation hotkey is held and transcribes it on this Mac.</string>
+	<string>Paraketto records your voice between shortcut presses and transcribes it on this Mac.</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 </dict>

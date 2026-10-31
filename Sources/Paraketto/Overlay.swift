@@ -82,7 +82,7 @@ private struct PillView: View {
     private var content: some View {
         switch controller.state {
         case .recording, .transcribing:
-            SpectrumMeter(level: controller.inputLevel)
+            SpectrumMeter(level: controller.inputLevel, sampleTime: controller.elapsed)
                 .opacity(controller.state == .recording ? 1 : 0.4)
         case .failed(let message):
             Label(message, systemImage: "exclamationmark.triangle.fill")
@@ -117,6 +117,7 @@ private struct PillBackground: View {
 /// so the meter scrolls like a waveform rather than bouncing in place.
 private struct SpectrumMeter: View {
     let level: Float
+    let sampleTime: TimeInterval
 
     private static let barCount = 36
     private static let barWidth: CGFloat = 2
@@ -145,10 +146,10 @@ private struct SpectrumMeter: View {
         }
         .frame(
             width: CGFloat(Self.barCount) * Self.barWidth + CGFloat(Self.barCount - 1) * Self.spacing,
-            height: 16
+            height: 24
         )
-        .onChange(of: level) { _, newValue in
-            history.append(CGFloat(min(max(newValue, 0), 1)))
+        .onChange(of: sampleTime) { _, _ in
+            history.append(CGFloat(min(max(level, 0), 1)))
             if history.count > Self.barCount { history.removeFirst(history.count - Self.barCount) }
         }
     }

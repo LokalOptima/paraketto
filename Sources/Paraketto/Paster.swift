@@ -16,7 +16,7 @@ struct Destination: Equatable {
 
 /// Delivers text into the destination app: pasteboard write, then a synthetic Cmd+V.
 /// The transcript stays on the pasteboard afterwards; restoring the previous contents on a
-/// timer races slow readers, and the old contents are one undo away in most apps anyway.
+/// timer races slow readers.
 enum Paster {
     static var isAccessibilityTrusted: Bool {
         AXIsProcessTrusted()
@@ -34,7 +34,7 @@ enum Paster {
         NSWorkspace.shared.open(url)
     }
 
-    enum Outcome {
+    enum Outcome: Equatable {
         case pasted
         /// Automatic delivery is unavailable; the text is on the clipboard.
         case copiedOnly
@@ -42,30 +42,56 @@ enum Paster {
         case destinationChanged
     }
 
+    /// Keep system effects injectable so focus changes and cancellation can be tested without typing.
     @MainActor
-    static func deliver(_ text: String, to destination: Destination?) async -> Outcome {
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.setString(text, forType: .string)
+    struct Operations {
+        var copy: (String) -> Bool
+        var destination: () -> Destination?
+        var accessibilityTrusted: () -> Bool
+        var waitForModifiers: () async throws -> Bool
+        var paste: () -> Bool
 
-        if let destination, let current = Destination.frontmost, current != destination {
-            return .destinationChanged
+        static var live: Operations {
+            Operations(copy: { text in
+                NSPasteboard.general.clearContents()
+                return NSPasteboard.general.setString(text, forType: .string)
+            }, destination: { Destination.frontmost }, accessibilityTrusted: { isAccessibilityTrusted },
+                       waitForModifiers: waitForModifiersReleased, paste: sendCommandV)
         }
-        guard isAccessibilityTrusted else { return .copiedOnly }
+    }
 
-        await waitForModifiersReleased()
-        guard sendCommandV() else { return .copiedOnly }
+    @MainActor
+    static func deliver(_ text: String, to destination: Destination?, using operations: Operations? = nil) async throws -> Outcome {
+        let operations = operations ?? .live
+        try Task.checkCancellation()
+        guard operations.copy(text) else { throw DeliveryError.clipboardUnavailable }
+        guard let destination else { return .copiedOnly }
+        guard operations.destination() == destination else { return .destinationChanged }
+        guard operations.accessibilityTrusted() else { return .copiedOnly }
+
+        let released = try await operations.waitForModifiers()
+        try Task.checkCancellation()
+        // Focus may change during the wait. Recheck immediately before sending any keys.
+        guard operations.destination() == destination else { return .destinationChanged }
+        guard released, operations.paste() else { return .copiedOnly }
         return .pasted
     }
 
     /// The hotkey's modifiers are usually still held when the recording key is released.
     /// Pasting while they are down would turn Cmd+V into Cmd+Ctrl+Opt+V in the target app.
-    private static func waitForModifiersReleased() async {
+    private static func waitForModifiersReleased() async throws -> Bool {
         let modifiers: CGEventFlags = [.maskCommand, .maskControl, .maskAlternate, .maskShift]
         for _ in 0..<50 {
-            if CGEventSource.flagsState(.combinedSessionState).intersection(modifiers).isEmpty { return }
-            try? await Task.sleep(for: .milliseconds(20))
+            try Task.checkCancellation()
+            if CGEventSource.flagsState(.combinedSessionState).intersection(modifiers).isEmpty { return true }
+            try await Task.sleep(for: .milliseconds(20))
         }
+        return false
+    }
+
+    enum DeliveryError: LocalizedError {
+        case clipboardUnavailable
+        var errorDescription: String? { "Could not copy the transcript to the clipboard." }
     }
 
     private static func sendCommandV() -> Bool {

@@ -1,5 +1,19 @@
 import Foundation
 
+/// Retained probabilities indexed by their original frame positions.
+struct FrameProbabilities {
+    let values: [Float]
+    let startFrame: Int
+
+    subscript(_ frame: Int) -> Float { values[frame - startFrame] }
+    subscript(_ range: Range<Int>) -> ArraySlice<Float> {
+        values[(range.lowerBound - startFrame)..<(range.upperBound - startFrame)]
+    }
+    subscript(_ range: PartialRangeFrom<Int>) -> ArraySlice<Float> {
+        values[(range.lowerBound - startFrame)...]
+    }
+}
+
 /// Places cuts in a recording longer than one 15 s window at pauses found by the model's
 /// own voice-activity head, following the rules moondream describes for Photon (as
 /// reconstructed in parakeet.cpp), with a 15 s cap instead of 30 s because that is the
@@ -23,7 +37,7 @@ struct Segmenter {
 
     /// The first silence of `commitPauseFrames` after at least `minimumSegmentFrames` of the segment
     /// starting at `start`, as a cut a quarter second into it; nil when none has been heard yet.
-    func pauseCut(in probabilities: [Float], from start: Int) -> Int? {
+    func pauseCut(in probabilities: FrameProbabilities, from start: Int) -> Int? {
         guard commitPauseFrames > 0 else { return nil }
         let speech = smoothed(probabilities[start...])
         let earliest = start + minimumSegmentFrames
@@ -34,11 +48,10 @@ struct Segmenter {
     }
 
     /// Where to end the segment starting at `start`, given probabilities for at least
-    /// `0..<windowEnd`. Prefers the midpoint of the last pause fully inside the window, then
+    /// `start..<windowEnd`. Prefers the midpoint of the last pause fully inside the window, then
     /// the last pause whose midpoint is inside, then the quietest frame near the window end.
-    /// Only frames up to `probabilities.count` are consulted, so a decision made while
-    /// recording is the same one made afterwards with the whole recording.
-    func cut(in probabilities: [Float], from start: Int, windowEnd: Int) -> Int {
+    /// Consults the retained probabilities, whose indexes remain global after compaction.
+    func cut(in probabilities: FrameProbabilities, from start: Int, windowEnd: Int) -> Int {
         let speech = smoothed(probabilities[start...])
         let earliest = start + minimumSegmentFrames
         let pauses = runs(of: false, in: speech).map { ($0.lowerBound + start)..<($0.upperBound + start) }

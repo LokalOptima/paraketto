@@ -17,7 +17,7 @@ public enum ParakeetError: LocalizedError {
     }
 }
 
-/// Fixed properties of the Parakeet TDT 0.6B v3 family export used here (v3, Ultra, Redux, Phonon-2 share it).
+/// Shared tensor dimensions of the v2 and Ultra Core ML exports.
 public enum ParakeetConstants {
     public static let sampleRate = 16_000
     /// The exported preprocessor and encoder take exactly this many samples (15 s).
@@ -29,7 +29,6 @@ public enum ParakeetConstants {
     public static let encoderHiddenSize = 1024
     public static let decoderHiddenSize = 640
     public static let decoderLayers = 2
-    public static let blankToken = 8192
     public static let durationBins = [0, 1, 2, 3, 4]
     public static let maxSymbolsPerFrame = 10
     /// Shorter recordings are rejected: the model has nothing to decode and FluidAudio uses the same floor.
@@ -38,6 +37,7 @@ public enum ParakeetConstants {
 
 /// The four Core ML models of FluidAudio's export plus our VAD head and the vocabulary.
 public final class ParakeetModels {
+    public let model: ParakeetModel
     let preprocessor: MLModel
     public let encoder: EncoderSet
     let decoder: MLModel
@@ -49,7 +49,8 @@ public final class ParakeetModels {
 
     /// The preprocessor runs on the CPU; everything else prefers the Neural Engine, as FluidAudio does.
     /// - Parameter encoderModel: an alternative encoder (our multi-window export); nil uses the directory's.
-    public init(directory: URL, vadModel: URL?, encoderModel: URL? = nil, fusedDecoder: URL? = nil) throws {
+    public init(directory: URL, model: ParakeetModel = .multi, vadModel: URL?, encoderModel: URL? = nil, fusedDecoder: URL? = nil) throws {
+        self.model = model
         let cpu = MLModelConfiguration()
         cpu.computeUnits = .cpuOnly
         let ane = MLModelConfiguration()
@@ -70,10 +71,10 @@ public final class ParakeetModels {
         }
         encoder = try EncoderSet(url: encoderURL, configuration: ane)
         decoder = try Self.load(directory.appendingPathComponent("Decoder.mlmodelc"), small)
-        joint = try Self.load(directory.appendingPathComponent("JointDecisionv3.mlmodelc"), small)
+        joint = try Self.load(directory.appendingPathComponent(model.jointFilename), small)
         fusedStep = try fusedDecoder.map { try Self.load($0, small) }
         vad = try vadModel.map { try Self.load($0, ane) }
-        vocabulary = try Vocabulary(url: directory.appendingPathComponent("parakeet_v3_vocab.json"))
+        vocabulary = try Vocabulary(url: directory.appendingPathComponent(model.vocabularyFilename))
     }
 
     private static func load(_ url: URL, _ configuration: MLModelConfiguration) throws -> MLModel {
