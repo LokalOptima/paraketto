@@ -23,8 +23,10 @@ restored, since a timed restore races slow readers.
 
 Choose **eng** or **multi** using the segmented control in the menu. `multi` is the default.
 A successful selection is remembered across launches. Switching is disabled while recording,
-transcribing, or loading a model. The menu shows a byte-based download progress bar, a spinner
-while loading and warming up, and a green Ready label. If switching fails, the previous loaded mode remains available;
+transcribing, or preparing a model. The menu shows a byte-based download progress bar,
+then **Optimizing ENG…** or **Optimizing MULTI…** with a spinner for initial preparation.
+Later starts show **Loading** and the mode name, followed by a green Ready label.
+If switching fails, the previous loaded mode remains available;
 use **Retry Mode Change** to try the failed selection again.
 
 Each mode has a separate cache under `~/Library/Application Support/Paraketto/models/`:
@@ -63,6 +65,9 @@ loaded. `make bundle` performs that load and warm-up through the signed app exec
 without opening windows, accessing the microphone, registering hotkeys, or changing the
 selected mode. The first build can therefore spend tens of seconds preparing a model;
 subsequent builds normally reuse Core ML's disk cache. Missing models are skipped.
+Successful preparation is remembered per mode, model files, and macOS version, including
+preparation during builds. This is a UI hint, not a query of Core ML's private cache;
+a system cache purge can still make a later **Loading** take longer.
 
 - `make prepare-models` downloads and prepares both `eng` and `multi` explicitly.
 - `make bundle PREPARE_MODELS=0` skips preparation, useful when packaging for another Mac.

@@ -8,6 +8,7 @@ import ParakeetTDT
 final class DictationController: ObservableObject {
     enum State: Equatable {
         case downloadingModel(Double)
+        case optimizingModel
         case loadingModel
         case idle
         case recording
@@ -18,7 +19,7 @@ final class DictationController: ObservableObject {
         var symbolName: String {
             switch self {
             case .downloadingModel: return "arrow.down.circle"
-            case .loadingModel: return "hourglass"
+            case .loadingModel, .optimizingModel: return "hourglass"
             case .idle, .notice: return "mic"
             case .recording: return "mic.fill"
             case .transcribing: return "waveform"
@@ -30,6 +31,7 @@ final class DictationController: ObservableObject {
             switch self {
             case .downloadingModel(let fraction): return "Downloading model… \(Int(fraction * 100))%"
             case .loadingModel: return "Loading model…"
+            case .optimizingModel: return "Optimizing model…"
             case .idle: return "Ready"
             case .recording: return "Recording…"
             case .transcribing: return "Transcribing…"
@@ -191,6 +193,7 @@ final class DictationController: ObservableObject {
                     switch phase {
                     case .downloading(let fraction): self.state = .downloadingModel(fraction)
                     case .loading: self.state = .loadingModel
+                    case .optimizing: self.state = .optimizingModel
                     }
                 }
             }

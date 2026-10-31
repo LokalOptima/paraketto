@@ -89,7 +89,7 @@ private struct PillView: View {
                 .foregroundStyle(PillStyle.error)
         case .notice(let message):
             Label(message, systemImage: "doc.on.clipboard")
-        case .idle, .downloadingModel, .loadingModel:
+        case .idle, .downloadingModel, .loadingModel, .optimizingModel:
             Text(controller.state.label)
         }
     }

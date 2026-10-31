@@ -22,8 +22,11 @@ enum ModelPreparation {
     private static func prepare(_ mode: ParakeetModel) async throws {
         let recognizer = Transcriber()
         try await recognizer.load(model: mode) { phase in
-            if case .downloading(let fraction) = phase {
+            switch phase {
+            case .downloading(let fraction):
                 report(String(format: "%@ downloading %.0f%%", mode.title, fraction * 100))
+            case .optimizing: report("Optimizing \(mode.title.uppercased())…")
+            case .loading: report("Loading \(mode.title.uppercased())…")
             }
         }
     }

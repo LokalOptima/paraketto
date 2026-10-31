@@ -42,7 +42,7 @@ struct MenuContent: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 8) {
-                if controller.state == .loadingModel {
+                if controller.state == .loadingModel || controller.state == .optimizingModel {
                     ProgressView()
                         .controlSize(.mini)
                         .accessibilityLabel(statusLabel)
@@ -123,6 +123,7 @@ struct MenuContent: View {
         switch controller.state {
         case .downloadingModel: return "Downloading \(mode)…"
         case .loadingModel: return "Loading \(mode)…"
+        case .optimizingModel: return "Optimizing \(mode)…"
         default: return controller.state.label
         }
     }

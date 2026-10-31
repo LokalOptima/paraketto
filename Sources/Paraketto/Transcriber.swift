@@ -6,7 +6,9 @@ actor Transcriber {
     enum LoadPhase: Equatable {
         /// Fetching model files from Hugging Face; `fraction` is 0...1 of the download.
         case downloading(fraction: Double)
-        /// Models are on disk and Core ML is loading or compiling them.
+        /// First preparation of these model files on this macOS version.
+        case optimizing
+        /// Loading a model that has already been prepared successfully.
         case loading
     }
 
@@ -26,7 +28,12 @@ actor Transcriber {
     func load(model: ParakeetModel, progress: @escaping @Sendable (LoadPhase) -> Void) async throws {
         let store = ModelStore(model: model)
         let directory = try await store.locate { fraction in progress(.downloading(fraction: fraction)) }
-        progress(.loading)
+        let preparation = ModelPreparationRecord(
+            directory: directory,
+            additionalModels: [store.ownEncoderURL, store.ownFusedDecoderURL].compactMap { $0 },
+            recordURL: store.ownDirectory.deletingLastPathComponent()
+                .appendingPathComponent(".\(model.rawValue)-preparation.json"))
+        progress(preparation.isPrepared ? .loading : .optimizing)
         let vadModel = vadModelURL
         if vadModel == nil { Log.info("VadHead.mlmodelc not bundled; long recordings fall back to fixed windows") }
         // VadHead includes its own trained subsampler; it detects pauses independently
@@ -35,6 +42,8 @@ actor Transcriber {
         Log.info("encoder windows (mel frames): \(models.encoder.variants.map(\.melFrames))")
         let transcriber = try ParakeetTranscriber(models: models)
         try transcriber.warmUp()
+        do { try preparation.markPrepared() }
+        catch { Log.info("Could not save model preparation record: \(error.localizedDescription)") }
         session = nil
         sessionError = nil
         self.transcriber = transcriber
