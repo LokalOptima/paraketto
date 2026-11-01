@@ -19,9 +19,6 @@
 
 using namespace paraketto;
 
-#ifdef WITH_CORRECTOR
-#include "corrector.h"
-#endif
 
 static inline std::string json_escape(const std::string& s) {
     std::string out;
@@ -66,17 +63,10 @@ static inline void log_request(const httplib::Request& req, const httplib::Respo
     }
 }
 
-#ifdef WITH_CORRECTOR
-template<typename PipelineT>
-static void run_server(PipelineT& pipeline, Corrector* corrector,
-                       const std::string& info_json, const std::string& host, int port,
-                       const std::function<std::string()>& status = {}) {
-#else
 template<typename PipelineT>
 static void run_server(PipelineT& pipeline,
                        const std::string& info_json, const std::string& host, int port,
                        const std::function<std::string()>& status = {}) {
-#endif
     httplib::Server svr;
     std::mutex mtx;
 
@@ -129,34 +119,18 @@ static void run_server(PipelineT& pipeline,
         auto t1 = std::chrono::high_resolution_clock::now();
         double elapsed = std::chrono::duration<double>(t1 - t0).count();
 
-        std::string corrected_text;
-        double correct_ms = 0;
-#ifdef WITH_CORRECTOR
-        if (corrector) {
-            corrected_text = corrector->correct(text);
-            correct_ms = corrector->last_correct_ms;
-        }
-#endif
-
         // Stash detail for the logger callback (same thread)
-        const std::string& display_text = corrected_text.empty() ? text : corrected_text;
-        std::string preview = display_text.substr(0, 80);
-        if (display_text.size() > 80) preview += "...";
         char detail[256];
-        snprintf(detail, sizeof(detail), "audio=%.1fs  inference=%.0fms  RTFx=%.0fx  \"%s\"",
-                 audio_dur, elapsed * 1000, audio_dur / elapsed, preview.c_str());
+        snprintf(detail, sizeof(detail), "audio=%.1fs  inference=%.0fms  RTFx=%.0fx",
+                 audio_dur, elapsed * 1000, audio_dur / elapsed);
         t_log_detail = detail;
 
         std::string body = "{\"text\":\"" + json_escape(text) + "\"";
-        if (!corrected_text.empty())
-            body += ",\"corrected_text\":\"" + json_escape(corrected_text) + "\"";
         body += ",\"audio_duration_s\":" + std::to_string(audio_dur) +
             ",\"inference_time_s\":" + std::to_string(elapsed) +
             ",\"mel_ms\":" + std::to_string(pipeline.last_mel_ms) +
             ",\"enc_ms\":" + std::to_string(pipeline.last_enc_ms) +
             ",\"dec_ms\":" + std::to_string(pipeline.last_dec_ms);
-        if (correct_ms > 0)
-            body += ",\"correct_ms\":" + std::to_string(correct_ms);
         body += "}";
         res.set_content(body, "application/json");
     });

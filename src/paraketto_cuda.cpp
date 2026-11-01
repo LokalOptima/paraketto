@@ -21,10 +21,8 @@
 #include "paraketto.h"
 #include "server.h"
 #include "gpu_status.h"
+#include "model_selection.h"
 
-#ifdef WITH_CORRECTOR
-#include "corrector.h"
-#endif
 
 using namespace paraketto;
 
@@ -46,16 +44,14 @@ int main(int argc, char** argv) {
             "Speech-to-text using Paraketto (CUDA/cuBLAS backend).\n"
             "Accepts one or more 16kHz or 24kHz mono WAV files (int16 or float32).\n"
             "Long files (>120s) are automatically chunked at silence boundaries.\n"
-            "Weights are auto-downloaded from HuggingFace on first run.\n"
+            "V2/V3 weights download on first run; Ultra weights need one-time conversion.\n"
             "\n"
             "Options:\n"
-            "  --model v2|v3              Model version [default: v2 English, v3 multilingual]\n"
-            "  --weights FILE             Model weights [default: ~/.cache/paraketto/]\n"
+            "  --model v2|v3|ultra        Model preset [default: v2 English]\n"
+            "                             v3 and ultra are multilingual (V3 architecture)\n"
+            "  --weights FILE             Explicit weights; without --model, detect architecture\n"
+            "                             Default: beside executable, then ~/.cache/paraketto/\n"
             "  --server [[host]:port]     Start HTTP server [default: 0.0.0.0:8080]\n"
-#ifdef WITH_CORRECTOR
-            "  --correct                  Enable LLM text correction\n"
-            "  --llm-model FILE           LLM weights [default: ~/.cache/paraketto/olmoe-1b-7b-0924-q4_k_m.gguf]\n"
-#endif
             "  -h, --help                 Show this help\n",
             argv[0]);
     };
@@ -64,36 +60,33 @@ int main(int argc, char** argv) {
 
     std::string dir = cache_dir();
     bool custom_weights = false;
-    int model_version = 2;  // default: V2 English
+    bool explicit_model = false;
+    const models::Preset* selected_model = &models::preset("v2");
     std::string weights_path;
     std::vector<std::string> wav_files;
     bool server_mode = false;
     bool warmup = false;
     std::string server_host = "0.0.0.0";
     int server_port = 8080;
-#ifdef WITH_CORRECTOR
-    bool enable_correct = false;
-    std::string llm_model_path = dir + "/olmoe-1b-7b-0924-q4_k_m.gguf";
-#endif
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--help" || arg == "-h") { usage(); return 0; }
-        if (arg == "--model" && i + 1 < argc) {
-            std::string v = argv[++i];
-            if (v == "v2" || v == "2") model_version = 2;
-            else if (v == "v3" || v == "3") model_version = 3;
-            else { fprintf(stderr, "Unknown model version: %s (use v2 or v3)\n", v.c_str()); return 1; }
-        } else if (arg == "--weights" && i + 1 < argc) {
+        if (arg == "--model") {
+            if (i + 1 >= argc || argv[i + 1][0] == '-') {
+                fprintf(stderr, "--model requires v2, v3, or ultra.\n");
+                return 1;
+            }
+            try { selected_model = &models::preset(argv[++i]); }
+            catch (const std::exception& e) { fprintf(stderr, "%s\n", e.what()); return 1; }
+            explicit_model = true;
+        } else if (arg == "--weights") {
+            if (i + 1 >= argc || !argv[i + 1][0] || argv[i + 1][0] == '-') {
+                fprintf(stderr, "--weights requires a file path.\n");
+                return 1;
+            }
             weights_path = argv[++i];
             custom_weights = true;
-#ifdef WITH_CORRECTOR
-        } else if (arg == "--correct") {
-            enable_correct = true;
-        } else if (arg == "--llm-model" && i + 1 < argc) {
-            llm_model_path = argv[++i];
-            enable_correct = true;
-#endif
         } else if (arg == "--warmup") {
             warmup = true;
         } else if (arg == "--server") {
@@ -106,6 +99,9 @@ int main(int argc, char** argv) {
                     server_port = std::stoi(addr.substr(colon + 1));
                 }
             }
+        } else if (!arg.empty() && arg[0] == '-') {
+            fprintf(stderr, "Unknown option: %s\n", arg.c_str());
+            return 1;
         } else {
             wav_files.push_back(arg);
         }
@@ -116,29 +112,45 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Set default weight paths based on model version (if not overridden by --weights)
-    const char* hf_base = "https://huggingface.co/localoptima/paraketto/resolve/main";
-    if (!custom_weights) {
-        if (model_version == 3) {
-            weights_path = dir + "/paraketto-v3-fp16.bin";
-        } else {
-            weights_path = dir + "/paraketto-fp16.bin";
-        }
+    // Custom weights alone declare no checkpoint identity. V3 and Ultra have
+    // the same header; only an explicit preset can distinguish their labels.
+    if (custom_weights && !explicit_model) selected_model = nullptr;
+    if (selected_model) {
+        std::error_code error;
+        auto executable = std::filesystem::read_symlink("/proc/self/exe", error);
+        if (error) executable = std::filesystem::absolute(argv[0]);
+        weights_path = models::weights_path(*selected_model,
+            executable.parent_path().string(), dir, weights_path);
     }
-
-#ifdef WITH_CORRECTOR
-    if (server_mode) enable_correct = true;
-#endif
 
     using clk = std::chrono::high_resolution_clock;
     auto t_main_start = clk::now();
 
-    // Download weights if missing
+    // Only built-in V2/V3 paths can trigger the CLI's existing auto-download.
+    // Explicit weights are never downloaded or replaced.
     if (!custom_weights) {
-        const char* fname;
-        fname = (model_version == 3) ? "paraketto-v3-fp16.bin" : "paraketto-fp16.bin";
-        std::string url = std::string(hf_base) + "/" + fname;
-        ensure_file(weights_path, url.c_str());
+        if (selected_model->download_url[0]) {
+            ensure_file(weights_path, selected_model->download_url);
+        } else if (access(weights_path.c_str(), F_OK) != 0) {
+            fprintf(stderr,
+                "Ultra weights were not found at %s. No converted Ultra download is published.\n"
+                "Prepare them once from the repository:\n"
+                "  uvx hf download moondream/parakeet-ultra --revision "
+                "73175eb7aeb0d82f1e2a6b53b3aabc10a90bcd0b --local-dir scratch/parakeet-ultra\n"
+                "  uv run python scripts/export_ultra_weights.py scratch/parakeet-ultra\n"
+                "Place paraketto-ultra-fp16.bin beside this executable or at the path above,\n"
+                "or supply --model ultra --weights FILE.\n", weights_path.c_str());
+            return 1;
+        }
+    }
+    // Reject bad files and architecture mismatches before any CUDA context or
+    // background prefetch starts, including when --weights precedes --model.
+    try {
+        const int actual = models::read_architecture(weights_path);
+        if (selected_model) models::validate_architecture(*selected_model, actual);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "%s\n", e.what());
+        return 1;
     }
 
     Weights prefetched;
@@ -158,24 +170,19 @@ int main(int argc, char** argv) {
 
     prefetch_thread.join();
 
+    // Validate the file actually mapped by prefetch as well, in case it was
+    // replaced between the small header read and the mapping.
+    if (selected_model) {
+        try { models::validate_architecture(*selected_model, prefetched.config.version); }
+        catch (const std::exception& e) { fprintf(stderr, "%s\n", e.what()); return 1; }
+    }
+
     auto t_prefetch = clk::now();
 
     Pipeline pipeline;
     pipeline.init(std::move(prefetched));
     auto t_init_done = clk::now();
 
-#ifdef WITH_CORRECTOR
-    Corrector corrector;
-    if (enable_correct) {
-        ensure_file(llm_model_path,
-            "https://huggingface.co/allenai/OLMoE-1B-7B-0924-GGUF/resolve/main/"
-            "olmoe-1b-7b-0924-q4_k_m.gguf");
-        if (!corrector.init(llm_model_path)) {
-            fprintf(stderr, "error: LLM correction model failed to load\n");
-            return 1;
-        }
-    }
-#endif
 
     // Warmup: trigger cublasLt lazy init before timed inference
     {
@@ -204,12 +211,14 @@ int main(int argc, char** argv) {
         };
         double weights_mb = file_size_mb(weights_path);
         int    version    = pipeline.weights.config.version;
+        const std::string model_label = models::label(selected_model, version);
         double startup_ms = ms(t_main_start, t_warmup_done);
         double vram_total_mb = vram_total / (1024.0 * 1024.0);
         double vram_free_mb  = vram_free  / (1024.0 * 1024.0);
 
         fprintf(stderr, "\n");
-        fprintf(stderr, "model:     parakeet-tdt-0.6b-v%d  ·  %s\n", version, BACKEND_NAME);
+        fprintf(stderr, "model:     %s (architecture v%d)  ·  %s\n",
+                model_label.c_str(), version, BACKEND_NAME);
         fprintf(stderr, "weights:   %s (%.0f MB)\n", weights_path.c_str(), weights_mb);
         fprintf(stderr, "device:    %s (compute %d.%d, %.0f MB VRAM, %.0f MB free)\n",
                 prop.name, prop.major, prop.minor, vram_total_mb, vram_free_mb);
@@ -217,17 +226,15 @@ int main(int argc, char** argv) {
                 startup_ms, ms(t_main_start, t_cuda_init), ms(t_main_start, t_prefetch),
                 ms(t_prefetch, t_init_done), ms(t_init_done, t_warmup_done));
         fprintf(stderr, "endpoints: GET /health | GET /info | POST /transcribe\n");
-#ifdef WITH_CORRECTOR
-        if (enable_correct)
-            fprintf(stderr, "corrector: enabled (%.0fms warmup)\n", corrector.last_correct_ms);
-#endif
         fprintf(stderr, "\n");
 
         // Build the JSON served at GET /info so the web UI (and any client) can
         // show exactly which model version and backend are running.
         char nb[64];
         std::string info = "{";
-        info += "\"model\":\"parakeet-tdt-0.6b-v" + std::to_string(version) + "\",";
+        info += "\"model\":\"" + json_escape(model_label) + "\",";
+        info += "\"model_preset\":\"" + std::string(selected_model ? selected_model->key : "custom") + "\",";
+        info += "\"model_architecture\":\"v" + std::to_string(version) + "\",";
         info += "\"version\":" + std::to_string(version) + ",";
         info += "\"backend\":\"" + json_escape(BACKEND_NAME) + "\",";
         info += "\"weights\":\"" + json_escape(weights_path) + "\",";
@@ -237,19 +244,11 @@ int main(int argc, char** argv) {
         snprintf(nb, sizeof nb, "%.0f", vram_total_mb);   info += "\"vram_total_mb\":" + std::string(nb) + ",";
         snprintf(nb, sizeof nb, "%.0f", vram_free_mb);    info += "\"vram_free_mb\":" + std::string(nb) + ",";
         snprintf(nb, sizeof nb, "%.0f", startup_ms);      info += "\"startup_ms\":" + std::string(nb);
-#ifdef WITH_CORRECTOR
-        info += ",\"corrector\":";
-        info += (enable_correct ? "true" : "false");
-#endif
         info += "}";
 
         GpuStatus gpu_status;
         auto live_status = [&gpu_status] { return gpu_status.json(); };
-#ifdef WITH_CORRECTOR
-        run_server(pipeline, enable_correct ? &corrector : nullptr, info, server_host, server_port, live_status);
-#else
         run_server(pipeline, info, server_host, server_port, live_status);
-#endif
         return 0;
     }
 
@@ -279,16 +278,6 @@ int main(int argc, char** argv) {
         auto t1 = clk::now();
         double elapsed = std::chrono::duration<double>(t1 - t0).count();
 
-#ifdef WITH_CORRECTOR
-        if (enable_correct) {
-            std::string corrected = corrector.correct(text);
-            printf("%s\n", corrected.c_str());
-            fprintf(stderr, "%.1fs audio, %.1fms (mel=%.1f enc=%.1f dec=%.1f correct=%.1f), %.0fx RTFx\n",
-                    audio_dur, elapsed * 1000 + corrector.last_correct_ms,
-                    pipeline.last_mel_ms, pipeline.last_enc_ms, pipeline.last_dec_ms,
-                    corrector.last_correct_ms, audio_dur / elapsed);
-        } else
-#endif
         {
             printf("%s\n", text.c_str());
             fprintf(stderr, "%.1fs audio, %.1fms (mel=%.1f enc=%.1f dec=%.1f), %.0fx RTFx\n",

@@ -4,7 +4,7 @@
 Usage:
   uvx hf download moondream/parakeet-ultra --local-dir scratch/parakeet-ultra
   uv run python scripts/export_ultra_weights.py scratch/parakeet-ultra
-  ./paraketto.cuda --model v3 --weights paraketto-ultra-fp16.bin audio.wav
+  ./paraketto.cuda --model ultra audio.wav
 
 No PyTorch or NeMo is needed. Linear weights are transposed to our ONNX-derived
 layout, convolution BatchNorm is folded, and PyTorch LSTM gates (ifgo) become

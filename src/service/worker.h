@@ -31,7 +31,7 @@ struct WorkerResult {
 
 class Worker {
 public:
-    Worker(std::string executable, std::string weights, std::string log_path);
+    Worker(std::string executable, std::string weights, std::string log_path, std::string model_preset = {});
     ~Worker();
     WorkerState state();
     bool transcribe(std::string&& wav);
@@ -50,6 +50,7 @@ private:
     std::shared_ptr<httplib::Client> request_;
     int port_ = 0;
     int pid_ = 0;
+    std::string model_preset_;
     void run(const std::string& executable, const std::string& weights, const std::string& log_path);
     void poll();
 };

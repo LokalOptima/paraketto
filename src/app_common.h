@@ -24,7 +24,8 @@ public:
             g_object_unref(parser_);
             throw std::invalid_argument(message);
         }
-        if (!JSON_NODE_HOLDS_OBJECT(json_parser_get_root(parser_))) {
+        auto* root = json_parser_get_root(parser_);
+        if (!root || !JSON_NODE_HOLDS_OBJECT(root)) {
             g_object_unref(parser_);
             throw std::invalid_argument("Expected a JSON object");
         }

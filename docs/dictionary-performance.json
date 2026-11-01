@@ -1,0 +1,92 @@
+{
+  "date": "2026-10-30T23:59:48.711564+00:00",
+  "cpu": "12th Gen Intel(R) Core(TM) i7-12700",
+  "method": "CPU only; one process at a time; 3 warmups then 11 samples per workload; median wall time. Same UTF-8 dictation-like input and rules. No ASR, SQLite, HTTP, model load or GPU time. Before repeats JSON parsing/rule preparation per segment; after reuses a compiled matcher. Construction is recorded separately.",
+  "compiler_flags": "g++ -std=c++17 -O2 -Wall -Wextra",
+  "baseline_source_sha256": "61deb44b7345d4f647a2381e384a406d0c6a6467359f8948944a37209665da67",
+  "baseline_binary_sha256": "2f032697d6dbf2ec738995ddb9cb3f80c6c37465a613415bb62155d94a6de079",
+  "candidate_binary_sha256": "f05a54a9e36ad254cd175df6edbef36827c2ffb2344b65ad086a96aba97d74be",
+  "benchmark_source_sha256": "f98f7378e46db78d06fbcfa36235dfac1cef0e15babe5e045d9fc06d7ae6f986",
+  "candidate_note": "Measured matching code is final; subsequent edits only improve validation error messages and UI/store behavior.",
+  "cases": [
+    {
+      "entries": 10,
+      "words": 100,
+      "before_ms": 0.21042,
+      "cached_ms": 0.004202,
+      "prepare_ms": 0.052733,
+      "output_sha256": "d27a0716ff0a8ae076e9d0497bdf893460b5a449d7e34eb54495dce338c46b92",
+      "edits": 7
+    },
+    {
+      "entries": 10,
+      "words": 500,
+      "before_ms": 0.602873,
+      "cached_ms": 0.02132,
+      "prepare_ms": 0.052733,
+      "output_sha256": "caa47344bbe616b1e089b1f8ab4859016e89bc56085ab5ee7aff5c4f0fea151e",
+      "edits": 33
+    },
+    {
+      "entries": 100,
+      "words": 100,
+      "before_ms": 0.576779,
+      "cached_ms": 0.004302,
+      "prepare_ms": 0.303672,
+      "output_sha256": "d27a0716ff0a8ae076e9d0497bdf893460b5a449d7e34eb54495dce338c46b92",
+      "edits": 7
+    },
+    {
+      "entries": 100,
+      "words": 500,
+      "before_ms": 1.671147,
+      "cached_ms": 0.021868,
+      "prepare_ms": 0.303672,
+      "output_sha256": "caa47344bbe616b1e089b1f8ab4859016e89bc56085ab5ee7aff5c4f0fea151e",
+      "edits": 33
+    },
+    {
+      "entries": 1000,
+      "words": 100,
+      "before_ms": 4.450005,
+      "cached_ms": 0.004359,
+      "prepare_ms": 3.275158,
+      "output_sha256": "d27a0716ff0a8ae076e9d0497bdf893460b5a449d7e34eb54495dce338c46b92",
+      "edits": 7
+    },
+    {
+      "entries": 1000,
+      "words": 500,
+      "before_ms": 10.566169,
+      "cached_ms": 0.021347,
+      "prepare_ms": 3.275158,
+      "output_sha256": "caa47344bbe616b1e089b1f8ab4859016e89bc56085ab5ee7aff5c4f0fea151e",
+      "edits": 33
+    },
+    {
+      "entries": 10000,
+      "words": 100,
+      "before_ms": 46.170612,
+      "cached_ms": 0.004233,
+      "prepare_ms": 33.329497,
+      "output_sha256": "d27a0716ff0a8ae076e9d0497bdf893460b5a449d7e34eb54495dce338c46b92",
+      "edits": 7
+    },
+    {
+      "entries": 10000,
+      "words": 500,
+      "before_ms": 106.053602,
+      "cached_ms": 0.021404,
+      "prepare_ms": 33.329497,
+      "output_sha256": "caa47344bbe616b1e089b1f8ab4859016e89bc56085ab5ee7aff5c4f0fea151e",
+      "edits": 33
+    }
+  ],
+  "validation": {
+    "independent_brute_force_randomized_cases": 750,
+    "store_tests": "passed",
+    "service_tests": "passed",
+    "gtk_tests": "passed, including mapped popup and widget-relative coordinates"
+  },
+  "raw_artifacts": "scratch/dictionary-popover/"
+}

@@ -2665,3 +2665,340 @@ An additional private X11 session ran the installed Ghostty 1.1.3 with an
 isolated tmux server and a raw input reader: all three payloads arrived intact
 through bracketed paste (accounting for terminal newline conversion). No test
 sent input to the user's desktop or loaded a GPU model.
+
+### Durable long-form sessions and live cleanup
+
+Paraketto now records through the service instead of accumulating a complete
+recording in GTK memory. A bounded queue feeds a dedicated PCM writer, with
+30-second storage blocks, roughly one-second synchronization checkpoints and
+explicit captured/written/durable positions. Source discontinuities and write
+failures remain visible. GTK can disappear and reconnect while recording
+continues; service recovery adopts valid partial-file tails and schedules saved
+speech without reopening the microphone.
+
+SQLite holds session generations, source coverage, durable ASR/cleanup work,
+immutable transcript revisions, dictionary versions, edit decisions and Stop
+publications. Audio remains ordinary files. Original ASR is never overwritten:
+explicit dictionary aliases and validated S1-mini replacements/deletions render
+the cleaned view. Stale worker results, overlapping edits and conflicting
+revision decisions are rejected. Legacy history retains its provenance and files
+until explicit deletion. Database migrations use SQLite's backup API.
+
+CPU Silero plans bounded speech groups while retaining full raw audio, including
+silence. Recovery replays the unplanned boundary with detector context. Quiet
+speech testing found an actual omitted word at low volume; detector-only level
+normalization and conservative hysteresis address the checked cases without
+altering the saved audio or ASR input. Explicit reprocessing can bypass filtering.
+The pinned VAD code, model identity and independent probability fixtures are
+recorded in the repository.
+
+The service supervises Parakeet and a separate pinned llama-server for S1-mini.
+The GPU gate allows both models to remain resident when they fit, but admits
+only one inference job. ASR preempts cleanup and waits for actual process exit;
+a failed ASR load with resident cleanup gets one retry after eviction. Worker
+parent-death handling prevents orphan inference processes. Cleanup errors leave
+baseline text usable, and repeated execution failures require explicit retry.
+The pinned FP16 runtime needs Flash Attention disabled on the RTX 5070 Ti;
+validation with it enabled exposed corrupted output.
+
+The GTK window now has a resizable session pane above history, with Cleaned,
+Original and Changes views, source progress, per-section playback, reversible
+edit controls and bounded paging. Selection and scrolling suspend following
+new text. The existing pill, theme and shortcut remain. Stop copies an immutable
+snapshot using available cleanup plus baseline fallback, without waiting for S1.
+Later cleanup updates the saved view only. Retries, restart and reprocessing
+cannot replay automatic clipboard delivery. Removed destination tracking and
+simulated paste from dictation, along with the old synchronous OLMoE corrector.
+
+Validation includes isolated API/GTK lifecycle and pane interaction tests,
+SQLite migration/revision tests, actual queue/write faults, VAD boundary and
+recovery checks, CPU worker scheduling fixtures, and explicit GPU integration.
+The first 20-run warm GPU check measured 201 ms p95 from Stop to publication;
+cleanup preemption took 101 ms to actual process exit. A 125-second public-speech
+comparison retained the same 212 normalized words as the existing long-file
+path. A private desktop fixture observed 112.5 ms from published result to
+clipboard. Exact evidence and limitations, including the real-time recording
+soak, are maintained in docs/long-form-transcription-validation.md.
+
+The 62-minute real-time capture soak completed with all 59,520,000 samples saved,
+completed transcription and 3.06 MiB steady-state RSS variation. Final quiet-speech
+GPU checks preserved the complete phrase at both tested low levels after both
+short and 23-second pauses.
+
+A complete live 30-second public-speech chunk subsequently measured 37.45 ms
+ASR inference, 396.79 ms S1 worker time, and 485.68 ms from Stop to the saved
+validated cleaned view. The Stop publication was available at 130.33 ms.
+S1 steady-state generation measured roughly 370–406 tokens/s; first-request
+prefill initialization and cold asset verification are reported separately.
+
+### Removing S1 prompt-cache copy overhead
+
+The 100-word S1 benchmark reported 551 ms wall time despite approximately 295 ms
+of prefill plus decoding. Tracing the pinned server found a separate 8 GiB RAM
+prompt-state cache still enabled despite `--no-cache-prompt`. Its slot-selection
+path saved/restored GPU contexts before the inference timers started. With Flash
+Attention disabled, value-cache copies use many small synchronized GPU transfers;
+the runtime log accounted for roughly 254 ms in cache updates.
+
+CleanupWorker and its benchmark now also pass `--cache-ram 0` and record that
+setting in job configuration and runtime metadata. Three repetitions of the same
+13-case sequence produced identical text, stop types and output-token counts for
+all 39 paired requests. The 100-word request median fell from 556.46 to 297.78 ms;
+time outside prefill/decoding fell from 259.75 to 2.89 ms. The long case remained
+around one second because it had no cache-copy penalty in this sequence. A CPU
+fixture now requires the disabled-cache argument to catch regressions.
+
+
+### Remove S1-mini and retain durable dictation
+
+S1-mini's output quality did not meet the personal workflow's requirements, so
+removed the integration instead of substituting another cleanup model. Output is
+now immutable Parakeet ASR plus explicit, reversible dictionary replacements.
+The default pane is Transcript, alongside Original and dictionary Changes.
+Recording, CPU Silero grouping, live progress, history/playback, retry/reprocess
+and immutable copy-on-Stop publications remain.
+
+Deleted the cleanup worker, preparation script, runtime build target, model-only
+fixtures/benchmarks, diff/validation helpers and cleanup preferences/status/API.
+The existing ASR scheduler already serializes inference, so the second-model GPU
+gate and eviction/preemption paths are gone too. SQLite remains responsible for
+session progress, audio coverage, durable ASR work, revisions and decisions;
+CPU ggml remains solely for Silero.
+
+Schema v3 backs up and migrates existing stores, archives old model-run evidence,
+disables and excludes model edits from current transcripts, and preserves audio,
+originals, dictionary decisions and previously copied publications. No model work
+can resume after upgrade, and fresh stores contain no cleanup table. The model
+edit API cannot re-enable archived changes.
+
+Make/CMake service and desktop builds pass. Store/migration, capture, VAD,
+ASR scheduling, seven legacy API groups, eleven session scenarios, four desktop
+component groups and private pane/lifecycle suites pass. Removed routes return
+404 and status contains only ASR. GPU benchmarks were adapted to ASR-only and
+syntax/help checked; existing GPU/long-soak evidence is labelled historical in
+the validation document. No user service, microphone or clipboard was touched.
+
+
+## 30 October 2026 — transcription-first desktop
+
+Replaced the vertically split transcript/history window with Transcription and
+History tabs. The transcript owns the full reading area. Removed playback from
+history and transcript sections, removed Original/Changes sub-tabs and per-edit
+checkboxes, and made Copy the standard icon. Dictionary replacements are
+highlighted inline; hovering a highlight shows its exact original wording.
+Mapping uses immutable UTF-8 source offsets and rendered offsets, including
+repeated aliases and length-changing replacements, with a safe plain-text
+fallback for inconsistent data.
+
+One pill controls replacements for the entire current session, including future
+ASR groups and manual copy. Changes update all segments atomically; previous Stop
+snapshots remain immutable. Schema v4 stores the setting per generation and
+migrates mixed old dictionary decisions to all-off so existing opt-outs survive.
+The old per-edit control route is replaced by the global replacements endpoint.
+
+Pause/Resume and Stop are fixed-size icons in a reserved slot inside the
+transcription pane, visible only during active capture. Pause stops acquisition,
+drains and synchronizes accepted audio, and waits for the current transcription
+boundary to be planned without publishing. Resume continues the same session and
+sample timeline. Paused wall time is omitted. Stop, Cancel, Quit and crash recovery
+all handle paused sessions. Retry after a failed pause boundary cannot bypass the
+unsaved boundary. Failed Stop restores usable capture controls.
+
+History's reprocessing action is now in its overflow menu; failed transcription
+alone exposes Retry. Older-recordings navigation uses actual has_more and stays
+hidden across show_all when no further page exists. The recording indicator and
+keyboard shortcut remain, and opening the app restores a paused session without
+restarting acquisition.
+
+Validation covers the schema migration and atomic replacement updates, ten
+capture cases, fourteen session API scenarios, replacement-range unit checks,
+desktop component/lifecycle tests, and real GTK interactions at normal scale and
+125% dark theme. The pane tests exercise actual Pango hover coordinates, unloaded
+text pages, copy results, selection preservation and fixed control geometry
+through Pause/Resume/Stop. Visual checks use screenshots in
+scratch/desktop-redesign and scratch/desktop-redesign-dark-125. All checks use
+private services, synthetic/public audio and Xvfb/D-Bus; the user's microphone,
+clipboard and running service are untouched.
+
+## 30 October 2026 — named model presets
+
+The CLI and desktop service now accept `--model v2|v3|ultra`. A shared CPU-only
+selector maps each name to its checkpoint filename and compatible PRKT
+architecture. Ultra uses V3's architecture and vocabulary with its own weights.
+The CLI keeps its V2 default and the service keeps Ultra. Preset lookup prefers
+weights beside the executable, then the XDG cache; `--weights` overrides the
+path. An explicit preset rejects incompatible headers before CUDA initialization.
+Custom weights without a preset retain architecture auto-detection.
+
+V2/V3 retain the standalone CLI's existing download behavior. No converted Ultra
+binary is published in the download repository, so missing Ultra weights produce
+the pinned preparation commands. The service never downloads during load and
+keeps missing assets repairable. The service installer can persist the model and
+weight flags without modifying a custom systemd unit.
+
+API metadata distinguishes the declared model preset from its actual architecture;
+Ultra now has its own display name, and arbitrary custom V3 weights never acquire
+an Ultra identity from their filename. Session model revisions include the preset
+alongside the existing weight/runtime fingerprints. Failed reloads clear stale
+worker metadata so a previous model label cannot accompany a replacement file's
+architecture and hash.
+
+Make builds pass for both CUDA backends, service and desktop; CMake builds pass
+for the CLI, service and desktop. CPU checks cover preset lookup, invalid headers,
+CLI argument errors and overrides, worker argument propagation, installer quoting,
+missing-weight recovery and failed-reload metadata. Existing service lifecycle
+and ASR scheduling checks pass. Eight private GPU smoke runs transcribed the same
+public clip: all three presets on CUTLASS and cuBLAS, plus custom V2/V3 files on
+CUTLASS. Each checked `/info` identity and architecture. Evidence is in
+`scratch/model-selection-smoke/results.json`; no performance claims changed.
+
+## 31 October 2026 — learn dictionary spellings from the transcript
+
+Selecting transcript text opens a spelling popover above the selection, with
+keyboard and context-menu access. The highlight remains visible while typing.
+Saving learns the original ASR alias, updates that section, and applies the new
+rule to subsequent sections and new recordings. Capture continues; raw text,
+previous revisions and saved Stop publications remain intact. Existing aliases
+with a different destination produce an explicit conflict instead of changing
+other dictionary entries silently. The Replacements switch still controls rendering.
+
+Displayed byte offsets can differ from the ASR source after Unicode text and
+length-changing replacements. The correction endpoint checks the exact selection,
+section revision, generation and replacement state, maps the selection back to
+the immutable source, and commits its dictionary and section revision together.
+An already-running ASR job reads the updated session dictionary when committing.
+The incremental `POST /dictionary/entries` API merges with the latest dictionary;
+full-list saves from the desktop include an expected revision so concurrent
+additions cannot be lost.
+
+The previous replacement path reparsed the dictionary and scanned its rules for
+every segment. Immutable Aho–Corasick matchers are now cached by revision, with
+sparse transitions, an ASCII fast path and exact Unicode fold boundaries. The
+cache retains at most four revisions with a 64 MiB target, retaining one larger
+active dictionary if necessary. New revisions enter the cache only after their
+database transaction commits, preventing rolled-back IDs from naming stale rules.
+
+At 10,000 entries, dictionary processing fell from 46.17 to 0.004 ms for 100 words
+and from 106.05 to 0.021 ms for 500 words on the i7-12700. Preparation costs about
+33 ms per compiled revision. These are CPU dictionary-only measurements, excluding
+ASR, SQLite and HTTP, with matching output hashes and edit counts for all eight
+workloads. Inputs, methodology and provenance are in `docs/dictionary.md` and
+`docs/dictionary-performance.json`; `make bench-dictionary` reproduces the current
+path and CMake exposes the same benchmark target.
+
+A visual check caught a flaw in the first GUI test: a popover object existed but
+was not mapped. GtkLabel's Pango offsets included its parent-window allocation;
+the popover expected widget-relative coordinates. Correcting that conversion
+also fixed original-text hover after scrolling. The GTK regression now requires
+a visibly mapped popup, checks its anchor, exercises dismissal and keyboard
+reopening, and tests a stale selection without changing the dictionary. A targeted
+review question records this failure mode. Exercising real dismissal also exposed
+GTK continuing to use the popover after emitting `closed`; destruction now runs
+on the next main-loop turn, with cancellation when the popup or app closes first.
+
+Validation covers 750 randomized comparisons with an independent brute-force
+matcher, Unicode expansions and boundaries, overlapping phrases, non-cascading
+edits, cache eviction, concurrent additions, in-flight transcription and immutable
+originals/publications. Store, HTTP and real GTK tests use private fixtures; the
+user's running service, microphone and clipboard were not touched. Popup screenshots
+and raw benchmark artifacts are in `scratch/dictionary-popover/`.
+
+## 31 October 2026 — Dictionary tab and service-version diagnosis
+
+Dictionary management now sits beside Transcription and History. The tab provides
+Add entry, case-insensitive search over desired spellings and aliases, and
+Change/Remove on each row. Editors save individual entries and keep aliases in
+separate fields, preserving punctuation instead of splitting on semicolons.
+Search uses pre-folded keys, waits briefly while typing, and renders at most 50
+rows per page. The component lives in `dictionary_view.*`; the old menu dialog
+and full-list editor were removed.
+
+The reported “Session request failed” was an empty HTTP 404: the live service
+still ran its October 27 executable, while private tests used current binaries.
+Both `/dictionary` and `/sessions` were absent from that running process. The
+client now explains missing Dictionary support and preserves method/path/status
+for other empty HTTP errors. The shared JSON wrapper also rejects a missing root
+without a GLib critical for empty or whitespace-only responses. Loading failures stay within the tab and disable
+editing until retry succeeds. This exposed a deployment verification gap, now
+recorded in the engineering review questions.
+
+Individual change/remove endpoints require the dictionary revision associated
+with their list index. They reject stale writes atomically, preserve unrelated
+entries and reuse the existing immutable revision/matcher cache. The entry editor
+keeps its contents on failure. GTK regression coverage exercises add, Unicode
+and alias search, change, remove, concurrent-update conflicts, bounded pagination,
+and recovery after load errors. HTTP tests exercise revision guards and alias
+conflicts; a private HTTP fixture reproduces the old service's empty 404 and a
+503 before recovering. Visual artifacts are in `scratch/dictionary-tab/visual/`.
+
+Make builds and desktop component, pane, session store and session API checks pass;
+the secondary CMake desktop build passes too. After confirming the live service
+was sleeping with no recording leases, reloaded the desktop and service. Verified
+that both processes use the rebuilt executables and the live `/dictionary` and
+`/sessions` routes return HTTP 200. Deployment evidence is in
+`scratch/dictionary-tab/deployment.json`.
+
+## 31 October 2026 — click-only replacements and quieter transcripts
+
+Replaced the draggable replacement switch with a rounded toggle button. Its
+entire surface is clickable, the label says On or Off, and its size stays fixed.
+The previous tests set the switch property directly and missed the interaction
+problem; the GTK suite now uses real pointer clicks across the pill, drag/release
+and keyboard activation, checking the persisted flag and rendered text.
+
+Removed Saved/Transcribed/Caught up lines, spelling/dictionary-save confirmations,
+copy-success text and completion overlays. Completed history entries retain text
+and date/duration. Errors, interrupted recordings and warnings about incomplete
+copies remain actionable; recording controls and the clock still indicate capture.
+Empty notice widgets are hidden instead of leaving blank status rows. Jump to
+latest appears only when away from the end, paging older sections, or actual
+updates are waiting; empty polling responses no longer raise it.
+
+The existing spelling selector trims leading/trailing Unicode whitespace before
+prefilling the editor and mapping the alias. Extended the real GTK/API test to
+select a phrase with accidental spaces on both sides, verify the learned alias
+retains only its internal space, and check that source text/publications stay
+unchanged. The suite also checks silent success and visible errors. Screenshots
+and validation logs are in `scratch/replacement-toggle/`.
+
+Make and CMake desktop builds, the real GTK pane suite and desktop lifecycle
+checks pass. Reviewed the updated transcript/history screenshots, then reloaded
+the idle desktop and verified it uses the rebuilt executable. The service stayed
+running; deployment evidence is in `scratch/replacement-toggle/deployment.json`.
+
+## 31 October 2026 — restore the replacement pill's appearance
+
+The click-only change misread the requested interaction fix as permission to
+replace the switch's appearance with an On/Off text button. Restored the compact
+pill, white knob and separate Replacements label. Standard button input handles
+clicks and Space; the knob draws only at the two endpoints, without dragging or
+animation. The persisted replacement flag and transcript behavior are unchanged.
+
+The real GTK suite passes pointer clicks across the pill, drag/release, keyboard
+activation and fixed compact geometry, alongside the existing transcript,
+dictionary and spelling checks. Reviewed both on/off screenshots against the
+original control. Sharpened the review question to cover preserving requested
+appearance as well as interaction. Rebuilt and reloaded the idle desktop, verified
+its executable, and kept the service running. Artifacts are in
+`scratch/replacement-pill/`.
+
+## 1 November 2026 — commit the completed session and dictionary implementation
+
+The session service, dictionary engine and desktop editing flow had passed their
+checks and were running locally, but the implementation was still outside Git
+history. New source files were untracked. There was no known failing check holding
+back a commit; leaving that step unfinished was a completion error. The dictionary
+needs the new session store, durable edit records and API, so those dependencies
+ship with its UI, build integration, tests and the development notes above.
+
+Before committing, reran all thirteen relevant Make test targets: storage and
+dictionary matching, capture, segmentation, ASR scheduling, session API, replacement
+highlights, desktop components, pane interactions, desktop lifecycle, legacy
+service, model selection, service model selection and CLI model selection. They
+all passed. The matcher checks include 750 comparisons against an independent
+brute-force implementation; GTK checks exercise actual pointer and keyboard
+input, spelling selection and Dictionary add/search/change/remove. Logs are in
+`scratch/commit-dictionary/checks.log`. This run uses private CPU fixtures and
+Xvfb/D-Bus; GPU performance and long-soak evidence remain the earlier documented
+runs. Added a completion check and project guidance to commit validated work
+before reporting it finished.

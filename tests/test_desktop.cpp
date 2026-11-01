@@ -1,4 +1,5 @@
 // Integration checks run under a private X server and D-Bus session.
+#include "cpp-httplib/httplib.h"
 #include "desktop/audio.h"
 #include "desktop/backend.h"
 #include "service/worker.h"
@@ -140,6 +141,42 @@ static void backend_failure_and_shutdown() {
     g_rmdir(directory.c_str());
 }
 
+static void dictionary_request_errors() {
+    httplib::Server server;
+    server.Get("/health", [](const auto&, auto& response) {
+        response.set_content("{\"service\":\"paraketto\",\"api_version\":1}", "application/json");
+    });
+    std::atomic<int> status{404};
+    server.Get("/dictionary", [&](const auto&, auto& response) {
+        response.status = status;
+        if (status == 503) response.set_content(" \n", "text/plain");
+        if (status == 400) response.set_content("{\"error\":\"Fixture dictionary validation failed\"}", "application/json");
+        if (status == 200) response.set_content("{\"revision\":1,\"entries\":[]}", "application/json");
+    });
+    const int port = server.bind_to_any_port("127.0.0.1"); g_assert_cmpint(port, >, 0);
+    std::thread serving([&] { server.listen_after_bind(); });
+    {
+        desktop::Backend backend("http://127.0.0.1:" + std::to_string(port), "/unused");
+        auto request = [&] {
+            SessionEvent received; bool complete = false;
+            backend.session_request("dictionary:test", "GET", "/dictionary");
+            g_assert_true(until([&] {
+                for (const auto& event : backend.session_events()) if (event.operation == "dictionary:test") { received = event; complete = true; }
+                return complete;
+            }));
+            return received;
+        };
+        auto missing = request(); g_assert_cmpint(missing.status, ==, 404);
+        g_assert_nonnull(strstr(missing.error.c_str(), "Restart the updated Paraketto service"));
+        status = 503; auto unavailable = request();
+        g_assert_nonnull(strstr(unavailable.error.c_str(), "GET /dictionary (HTTP 503)"));
+        status = 400; auto invalid = request();
+        g_assert_cmpstr(invalid.error.c_str(), ==, "Fixture dictionary validation failed");
+        status = 200; g_assert_true(request().error.empty());
+    }
+    server.stop(); serving.join();
+}
+
 static void clipboard_delivery() {
     auto* window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     auto* field = gtk_text_view_new();
@@ -233,5 +270,6 @@ int main(int argc, char** argv) {
     g_test_add_func("/desktop/transcript-previews", transcript_previews);
     g_test_add_func("/desktop/clipboard-delivery", clipboard_delivery);
     g_test_add_func("/desktop/backend-failure-shutdown", backend_failure_and_shutdown);
+    g_test_add_func("/desktop/dictionary-request-errors", dictionary_request_errors);
     return g_test_run();
 }

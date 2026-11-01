@@ -109,13 +109,17 @@ void Player::stop() {
     pipeline_ = nullptr;
 }
 bool Player::play(const std::string& path, std::string& error) {
+    gchar* uri = g_filename_to_uri(path.c_str(), nullptr, nullptr);
+    if (!uri) { error = "Invalid recording path"; return false; }
+    bool result = play_uri(uri, error);
+    g_free(uri);
+    return result;
+}
+bool Player::play_uri(const std::string& uri, std::string& error) {
     stop();
     pipeline_ = gst_element_factory_make("playbin", nullptr);
     if (!pipeline_) { error = "GStreamer playbin is unavailable"; return false; }
-    gchar* uri = g_filename_to_uri(path.c_str(), nullptr, nullptr);
-    if (!uri) { error = "Invalid recording path"; stop(); return false; }
-    g_object_set(pipeline_, "uri", uri, nullptr);
-    g_free(uri);
+    g_object_set(pipeline_, "uri", uri.c_str(), nullptr);
     if (gst_element_set_state(pipeline_, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
         error = "Could not play recording";
         stop();

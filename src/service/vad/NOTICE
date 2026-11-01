@@ -1,0 +1,12 @@
+Silero v5 CPU implementation adapted from LokalOptima Jarvis,
+revision 7df37bab2381a28346c875de18b0e2decca4539a (MIT; see LICENSE).
+https://github.com/LokalOptima/jarvis
+
+Model: Jarvis models-v1/silero_vad.bin, Silero v5 16 kHz.
+SHA-256: 0776449541b2b34cea5479bda89f6028e304ba0728fd4a1f053e17169f74a3eb
+https://github.com/LokalOptima/jarvis/releases/download/models-v1/silero_vad.bin
+Silero VAD upstream: https://github.com/snakers4/silero-vad
+(MIT; see LICENSE_SILERO, preserved from the upstream v5.1.2 tag).
+
+This adaptation uses the CPU backend of the pinned vendored llama.cpp/ggml.
+Model checksums are validated before parsing; no downloads occur during capture.

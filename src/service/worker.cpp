@@ -1,5 +1,6 @@
 #include "worker.h"
 #include "app_common.h"
+#include "model_selection.h"
 #include "cpp-httplib/httplib.h"
 #include <fcntl.h>
 #include <cstdio>
@@ -30,7 +31,9 @@ double query_gpu_total_mb() {
     return std::isfinite(total) && total > 0 ? total : -1;
 }
 
-Worker::Worker(std::string executable, std::string weights, std::string log_path) {
+Worker::Worker(std::string executable, std::string weights, std::string log_path, std::string model_preset)
+    : model_preset_(std::move(model_preset)) {
+    if (!model_preset_.empty()) model_preset_ = paraketto::models::preset(model_preset_).key;
     worker_ = std::thread([this, executable, weights, log_path] {
         try { run(executable, weights, log_path); }
         catch (const std::exception& e) {
@@ -109,12 +112,16 @@ void Worker::run(const std::string& executable, const std::string& weights, cons
     if (log_fd < 0) { g_object_unref(launcher); throw std::runtime_error("Could not open server log"); }
     g_subprocess_launcher_take_stderr_fd(launcher, log_fd);
     g_subprocess_launcher_set_child_setup(launcher, [](gpointer owner) {
-        prctl(PR_SET_PDEATHSIG, SIGTERM);
+        // An abrupt service exit cannot leave a wedged or TERM-ignoring model
+        // holding the GPU. Ordinary destruction still tries graceful SIGTERM.
+        prctl(PR_SET_PDEATHSIG, SIGKILL);
         if (getppid() != GPOINTER_TO_INT(owner)) _exit(1);
     }, GINT_TO_POINTER(getpid()), nullptr);
-    const char* args[] = {executable.c_str(), "--weights", weights.c_str(), "--server", "127.0.0.1:0", nullptr};
+    std::vector<const char*> args{executable.c_str(), "--weights", weights.c_str()};
+    if (!model_preset_.empty()) { args.push_back("--model"); args.push_back(model_preset_.c_str()); }
+    args.insert(args.end(), {"--server", "127.0.0.1:0", nullptr});
     GError* error = nullptr;
-    auto* child = g_subprocess_launcher_spawnv(launcher, args, &error);
+    auto* child = g_subprocess_launcher_spawnv(launcher, args.data(), &error);
     g_object_unref(launcher);
     if (!child) {
         std::string message = error->message;
@@ -213,7 +220,8 @@ void Worker::poll() {
             if (info && info->status == 200) {
                 next.info_json = info->body;
                 Json json(info->body);
-                next.model = json.text("weights").find("ultra") != std::string::npos ? "Parakeet Ultra" : json.text("model");
+                next.model = model_preset_.empty() ? json.text("model_label", json.text("model").c_str()) :
+                    paraketto::models::preset(model_preset_).label;
                 next.model += " · " + json.text("backend");
                 next.device = json.text("device");
             }

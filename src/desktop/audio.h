@@ -33,6 +33,7 @@ class Player {
 public:
     ~Player();
     bool play(const std::string& path, std::string& error);
+    bool play_uri(const std::string& uri, std::string& error);
     void stop();
     bool playing();
 private:

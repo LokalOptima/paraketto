@@ -49,12 +49,15 @@ class Fixture:
         self.port = 0
         self.log = (self.directory / 'service.log').open('w')
 
-    def start(self, missing=False, load_timeout=5, auto_port=False):
+    def start(self, missing=False, load_timeout=5, auto_port=False, vad_model=None,
+              model=None, default_weights=False, service_binary=None):
         port_args = [] if auto_port else ['--port', str(self.port)]
-        self.process = subprocess.Popen([str(REPO / 'paraketto-service'), *port_args,
+        vad_args = [] if vad_model is None else ['--vad-model', str(vad_model)]
+        model_args = [] if model is None else ['--model', model]
+        weights_args = [] if default_weights else ['--weights', str(self.directory / 'missing-weights' if missing else self.weights)]
+        self.process = subprocess.Popen([str(service_binary or REPO / 'paraketto-service'), *port_args,
             '--worker-binary', str(REPO / 'tests/desktop_fixture_server.py'), '--data-dir', str(self.data),
-            '--weights', str(self.directory / 'missing-weights' if missing else self.weights),
-            '--load-timeout', str(load_timeout)], env=self.env, stdout=subprocess.PIPE, stderr=self.log, text=True)
+            *weights_args, *model_args, '--load-timeout', str(load_timeout), *vad_args], env=self.env, stdout=subprocess.PIPE, stderr=self.log, text=True)
         assert select.select([self.process.stdout], [], [], 8)[0], 'Service startup timed out'
         line = self.process.stdout.readline()
         assert line, (self.directory / 'service.log').read_text()
