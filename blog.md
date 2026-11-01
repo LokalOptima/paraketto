@@ -3002,3 +3002,18 @@ input, spelling selection and Dictionary add/search/change/remove. Logs are in
 Xvfb/D-Bus; GPU performance and long-soak evidence remain the earlier documented
 runs. Added a completion check and project guidance to commit validated work
 before reporting it finished.
+
+## 1 November 2026 — move the Linux app to its own branch
+
+Master is the inference engine again: CLI, `--server`, weight tooling and benchmarks.
+The GTK client only builds against X11, and it and its session service exist to serve
+that one app, so both moved to the `linux-app` branch together with what only they use:
+vendored SQLite, the `vendor/llama.cpp` submodule for CPU ggml, VAD fixtures, the
+dictionary and long-form documents, and their tests and build targets. `linux-app`
+keeps the complete tree as it stood before this change, and the native macOS app is on
+`macos-app`.
+
+Engine sources are unchanged. This change was prepared on a Mac without CUDA, so the
+CUDA build itself was not run on it. Checked instead that nothing kept refers to a
+removed file, that `make -n` resolves the remaining targets, and that
+`make test-model-selection` passes.

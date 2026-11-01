@@ -20,7 +20,7 @@ WAV (16kHz/24kHz mono) → mel spectrogram → conformer encoder → TDT greedy 
 
 ## Performance
 
-Recorded V2 results on RTX 5070 Ti, batch size 1. Two FP16 GEMM backends: **CUTLASS** (zero dependencies beyond `libcudart.so`) and **cuBLAS** (requires `libcublas.so`). Everything else — FFT, mel filterbank, LayerNorm, convolutions, SiLU, GLU, LSTM, greedy decoding — runs on custom CUDA kernels in all backends. The separate Ultra comparison below uses different weights; these tables are not desktop Stop-to-clipboard latency measurements.
+Recorded V2 results on RTX 5070 Ti, batch size 1. Two FP16 GEMM backends: **CUTLASS** (zero dependencies beyond `libcudart.so`) and **cuBLAS** (requires `libcublas.so`). Everything else — FFT, mel filterbank, LayerNorm, convolutions, SiLU, GLU, LSTM, greedy decoding — runs on custom CUDA kernels in all backends. The separate Ultra comparison below uses different weights.
 
 ```
                  CUTLASS (cudart only)          cuBLAS (+ libcublas)
@@ -72,7 +72,7 @@ Two FP16 CUDA backends, same driver and weight loader. Both support all three mo
 | `--model v3` | V3, multilingual | `paraketto-v3-fp16.bin` |
 | `--model ultra` | V3, multilingual; Moondream checkpoint | `paraketto-ultra-fp16.bin` |
 
-The standalone CLI defaults to V2; the desktop service defaults to Ultra.
+The standalone CLI defaults to V2.
 The selected filename is looked up beside the executable, then in
 `$XDG_CACHE_HOME/paraketto/` (normally `~/.cache/paraketto/`). `--weights FILE`
 overrides this lookup. An explicit `--model` checks the file's architecture
@@ -81,8 +81,7 @@ the file and the checkpoint is reported as custom.
 
 The standalone CLI downloads missing V2/V3 weights to the cache. Ultra needs the
 one-time [conversion below](#parakeet-ultra); its converted binary is not hosted
-in our download repository. The desktop service requires weights to be prepared
-before loading any preset.
+in our download repository.
 
 FP8 inference, quantization, calibration, and kernel experiments are preserved
 on the separate `fp8-ultra` branch. The main branch uses FP16.
@@ -91,15 +90,18 @@ Word timestamps, forced alignment and clickable word playback are isolated on
 `codex/word-timestamps`. That branch contains `docs/word-playback.md` and its
 setup instructions; the main branch does not load or require Qwen alignment weights.
 
+The native dictation apps live on their own branches: `linux-app` has the GTK app and its
+persistent session service, and `macos-app` has the Core ML menu-bar app.
+
 ## Quick start
 
 ### Prerequisites
 
 - Linux, NVIDIA GPU (Ampere or newer), CUDA toolkit 12+
-- A C++17 compiler and Make; CMake and `pkg-config` for desktop/service builds
+- A C++17 compiler and Make; CMake for embedding as a library
 - `curl` (for auto-downloading weights at runtime)
 - `wget` (for Makefile benchmark data downloads)
-- Python 3.10+ with [uv](https://docs.astral.sh/uv/) for benchmarks, weight conversion and model preparation; not needed for inference
+- Python 3.10+ with [uv](https://docs.astral.sh/uv/) for benchmarks and weight conversion; not needed for inference
 
 ### Build & run
 
@@ -111,7 +113,7 @@ make paraketto.cuda              # CUTLASS backend (cudart only)
 ./paraketto.cuda audio.wav       # auto-downloads weights on first run (~1.2 GB)
 ```
 
-The FP16 GEMMs come from the [CUTLASS](https://github.com/NVIDIA/cutlass) submodule at `third_party/cutlass` (header-only — nothing to build). The GPU architecture is auto-detected via `nvidia-smi`; override with `make ARCH=sm_XX` if cross-compiling. The desktop service uses CPU ggml from the pinned `vendor/llama.cpp` submodule for speech detection.
+The FP16 GEMMs come from the [CUTLASS](https://github.com/NVIDIA/cutlass) submodule at `third_party/cutlass` (header-only — nothing to build). The GPU architecture is auto-detected via `nvidia-smi`; override with `make ARCH=sm_XX` if cross-compiling.
 
 Missing V2/V3 weights are downloaded from [HuggingFace](https://huggingface.co/localoptima/paraketto)
 to the cache on first run. Use `--model` to choose a preset and `--weights FILE`
@@ -206,211 +208,9 @@ All backends support the same server mode. Open `http://localhost:8080` in a bro
 Recordings and uploads stay in a stack, newest first, with playback and a copy
 button on each transcript. History lasts until you refresh or close the page.
 
-### Linux desktop dictation
-
-The native GTK app connects to a persistent local service for long recordings.
-The [implementation plan](docs/long-form-transcription-plan.md) records the design
-and requirements. Capture belongs to the service: audio is saved continuously,
-transcription runs during recording, and your dictionary applies explicit spelling
-replacements to each finished speech group. Closing or crashing GTK does not discard a recording.
-
-**Transcription** is the main view, alongside **History** and **Dictionary** tabs.
-Dictionary has **Add entry**, search across spellings and aliases, and **Change**
-and **Remove** on each entry. Replacements are highlighted in the transcript,
-with the original wording on hover.
-Select a word or phrase to open **Desired spelling** above the selection. Saving
-corrects that section and remembers the alias for future transcription; the
-original text remains available. Leading and trailing whitespace in the selection
-is ignored; spaces inside a phrase are preserved.
-Click the pill beside **Replacements** to toggle all replacements for the displayed
-session, including future speech groups and copied text. The copy icon copies the
-current transcript. The knob snaps on/off with a click; it cannot be dragged.
-There are no playback controls or separate changes view.
-Scrolling up or selecting text pauses following new content; **Jump to latest**
-appears when there is newer text or you are away from the end. History opens
-saved transcripts, with older content paged. Completed entries show text and
-date/duration, without success-status lines. Notices are reserved for problems
-that need attention, such as retrying a failed transcription or fixing a spelling.
-
-Pause/Resume and Stop appear only inside the transcription pane during recording,
-in a reserved location with fixed button sizes. Pause checkpoints captured audio
-and flushes the current speech group without finishing the session; Resume
-continues the same recording. Paused time is excluded from saved audio and elapsed
-recording time. Stop also works while paused. The floating recording indicator
-keeps its waveform and counter.
-
-Press **Ctrl+Alt+Space** or Record to start, and press again to Stop. Stop saves
-and finishes outstanding transcription, then copies the transcript with enabled
-dictionary replacements. Turn Replacements off to view and copy unchanged ASR text. There is no simulated paste or destination
-window tracking. Cancel retains audio for recovery and suppresses automatic copy.
-A failed or empty transcription leaves the clipboard unchanged. Reopening GTK,
-retrying failed work and reprocessing old audio never replay an automatic copy.
-
-Silence stays in saved audio and is skipped only for inference. Speech is grouped
-at natural pauses, normally around 30–60 seconds, with a 90-second input ceiling.
-CPU Silero detection falls back visibly to bounded unfiltered chunks if its
-verified model is unavailable. Reprocess can bypass silence filtering explicitly.
-
-The service starts with Parakeet sleeping. Speech loads it in the background,
-and one worker processes queued transcriptions serially. The default idle timeout
-is five minutes. Preferences controls idle timeout and keeping the model loaded.
-The bottom model-status row provides Load, Unload and Retry. Inference failures
-preserve recording and available text.
-Microphone, storage and capture-buffer failures stop recording visibly and retain
-its saved prefix. A service restart recovers saved audio and pending work without
-reopening the microphone.
-
-Build dependencies on Ubuntu/Debian (the apt command installs system packages):
-
-```bash
-sudo apt install build-essential cmake pkg-config libgtk-3-dev libgstreamer1.0-dev \
-  libgstreamer-plugins-base1.0-dev libjson-glib-dev libxdo-dev
-git submodule update --init third_party/cutlass vendor/llama.cpp
-make desktop
-make prepare-models
-# Prepare paraketto-ultra-fp16.bin using the Parakeet Ultra instructions above.
-./paraketto-service
-```
-
-`make prepare-models` explicitly prepares the pinned Silero asset; it does not
-download the desktop's Ultra ASR weights. Convert those using the
-[Parakeet Ultra instructions](#parakeet-ultra), or start the service with
-`--model v2` or `--model v3` after preparing that preset's weights with the CLI.
-`--weights /absolute/path/to/existing-weights.bin` selects a custom checkpoint.
-Downloads never happen on
-Stop. Python is used only for preparation. The service uses GIO,
-JSON-GLib, GStreamer, vendored SQLite and CPU ggml, with no GTK or CUDA linkage.
-ASR runs in one owned GPU process. No language model runtime or Python is needed
-at runtime. See [VAD provenance](tests/vadfixtures/README.md).
-
-For the foreground service above, run `./paraketto-desktop` in another terminal.
-To use a user systemd service instead, stop the foreground service first, then run:
-
-```bash
-make install-service
-./paraketto-desktop --install-desktop
-./paraketto-desktop
-```
-
-To persist a different model choice, use
-`uv run python scripts/install_service.py --model v3` instead of
-`make install-service`. The installer also accepts `--weights FILE`.
-
-The installer starts a user systemd service from this checkout, with no sudo.
-Rerun it if the checkout moves. The desktop installer adds the launcher and GNOME
-shortcut while preserving existing shortcuts; it does not enable desktop autostart.
-Closing the window hides it. Explicit **Quit Paraketto** or
-`./paraketto-desktop --quit` stops and saves its active recording. Stop/start the
-service with `systemctl --user stop paraketto.service` and
-`systemctl --user start paraketto.service`.
-
-Session metadata, immutable transcript revisions, dictionaries, reversible edits
-and Stop publications live in `~/.local/share/paraketto/sessions.sqlite3`.
-Audio is stored as 30-second PCM blocks under `sessions/<id>/audio/`, with roughly
-one-second synchronization checkpoints. Capture buffers, audio reads and transcript
-paging are bounded; explicit full-text exports and clipboard copies materialize
-the requested transcript.
-A sudden power loss may lose an unsynchronized tail; recovery adopts readable
-frames from an interrupted block. Legacy WAV/JSON history is imported idempotently
-and labelled as legacy text, since earlier correction may already have changed it.
-Explicit deletion removes the session's owned files. Preferences and logs remain
-in this data directory. `$XDG_DATA_HOME` is respected.
-
-The service accepts `--model v2|v3|ultra` with the same preset lookup as the CLI
-and defaults to Ultra. It also accepts `--weights FILE`,
-`--worker-binary FILE`, `--vad-model FILE`, `--data-dir DIRECTORY`, `--port PORT` and
-`--load-timeout SECONDS` (120 by default). An explicit occupied port fails;
-`--port 0` chooses a free port. Without a port argument, 8080 is preferred with
-an automatic free-port fallback. The desktop discovers the service and never
-starts or stops it. Use `--service-url URL` for an explicit endpoint or matching
-`--data-dir DIRECTORY` arguments for isolated instances. The file chooser and
-`--transcribe FILE` import existing WAV recordings with bounded ingestion.
-
-CMake supports `-DPARAKETTO_BUILD_DESKTOP=ON` (includes the service) and
-`-DPARAKETTO_BUILD_SERVICE=ON`. The service's ggml dependency is CPU-only.
-
-Focused CPU checks:
-
-```bash
-make test-session-store test-capture test-segmenter test-asr-scheduling
-make test-service test-sessions test-desktop test-desktop-lifecycle test-desktop-pane
-make test-replacement-highlights
-```
-
-Desktop tests use a private Xvfb/D-Bus session and require `xvfb`; no test changes
-the user's clipboard, focus or shortcuts. Service tests use isolated directories
-and fake inference workers. Explicit opt-in checks are
-`python3 tests/bench_sessions.py`,
-`python3 tests/bench_pipeline.py` (GPU), and
-`python3 tests/test_long_session.py` (62-minute real-time public-speech capture,
-no microphone or GPU). GPU benchmarks check `nvidia-smi` before starting.
-
-### Local service API
-
-The persistent service binds only to loopback and rejects cross-origin browser
-requests. It publishes its identity, port and PID in `<data-dir>/service.json`,
-readable only by the current user. The desktop checks that identity before sending
-requests. Shutdown uses systemd/signals. Standalone `paraketto.cuda --server` and
-its existing web UI remain available separately.
-
-| Endpoint | Behaviour |
-|---|---|
-| `GET /health`, `/status`, `/info` | Identity/API v1, ASR state, queue, active session, settings and known model metadata |
-| `POST /transcribe` | Legacy multipart WAV transcription; bounded queue, raw transcription JSON |
-| `POST /model/load`, `/model/unload`, `/model/release` | Legacy ASR lifecycle and recording reservations |
-| `POST /models/asr/{load,unload}` | Explicit model lifecycle; unload returns 409 while in use |
-| `PATCH /settings` | `idle_seconds` (1–86400), `keep_loaded` |
-| `POST /sessions` | Start capture with UUID `request_id`; optional `silence_filter` |
-| `POST /sessions/import` | Import absolute local WAV `path` with UUID `request_id` |
-| `GET /sessions?limit=50&cursor=0` | Bounded history metadata and statistics |
-| `GET /sessions/{id}` | Capture, ASR and source-timeline progress, generation and publication identity |
-| `GET /sessions/{id}/updates?after=0&limit=50&generation=1` | Bounded changed segments/edits and next cursor; `reset` requests a refresh |
-| `GET /sessions/{id}/levels` | Small elapsed-time/level response and captured/written/durable sample counts |
-| `POST /sessions/{id}/pause`, `/resume` | Suspend/resume capture in the same session without publishing or copying |
-| `POST /sessions/{id}/stop`, `/cancel` | Save/finish capture or cancel work while retaining audio |
-| `POST /sessions/{id}/retry` | Retry failed `stage`: `all` or `asr` |
-| `POST /sessions/{id}/reprocess` | New generation with `audio`, `silence_filter`, optional `dictionary_revision` |
-| `GET /sessions/{id}/publication` | Immutable Stop snapshot and completion status |
-| `GET /sessions/{id}/transcript?view=edited` | Explicit full text export: `edited`, `original` or `publication` |
-| `GET /sessions/{id}/audio?start=0&end=16000` | Bounded WAV source range, offsets in 16 kHz samples; HTTP Range supported |
-| `PATCH /sessions/{id}/replacements` | Global `enabled` flag for existing/future dictionary replacements; optional `expected_revision` rejects stale guarded writes |
-| `GET /dictionary`, `PUT /dictionary` | Immutable revisions of `entries`; optional `expected_revision` protects full-list saves |
-| `POST /dictionary/entries` | Atomically merge one canonical spelling and its aliases without replacing other entries |
-| `PUT /dictionary/entries/{index}`, `DELETE /dictionary/entries/{index}` | Change/remove one entry; required `expected_revision` guards its list index |
-| `POST /sessions/{id}/spelling` | Save a selected transcript spelling and alias with source/revision checks |
-| `DELETE /sessions/{id}` | Cancel work, tombstone session and recoverably remove its owned files |
-
-The legacy upload limit is 64 MiB, with four accepted transcriptions including
-the active request; excess requests return 429. New session capture is block-based
-and does not have that duration-dependent upload limit. Errors use JSON `error`.
-Legacy recording reservations use UUID `lease_id`, expire after ten seconds and
-can be renewed with `/model/load`; session capture manages its own activity.
-
-### Dictionary replacements
-
-The explicit dictionary maps aliases to canonical terms using Unicode-aware word
-boundaries and configured case matching. Replacements do not cascade. Every edit
-references the immutable original transcript. The Replacements pill applies or
-removes all dictionary replacements in the session, without changing raw ASR.
-A session keeps its dictionary revision. Saving a selected spelling updates the
-selected section and the rules for subsequent speech groups without interrupting
-recording; other existing sections remain unchanged. Reprocess with `audio: false`
-to apply the latest dictionary throughout an existing transcript.
-
-Rules are compiled once per cached revision into an Aho–Corasick matcher, with
-an ASCII fast path and exact Unicode byte mappings. No dictionary parsing or
-rule rebuilding occurs on a cache hit. [Dictionary usage, API and measurements](docs/dictionary.md).
-
-There is no automatic LLM rewriting. S1-mini and the old synchronous corrector
-have been removed. Upgrading an older session database retires old model edits
-from the current transcript while preserving raw text, recordings, immutable Stop
-publications and historical audit data. Schema v4 stores the global replacement
-setting; old sessions with any disabled dictionary change migrate with replacements
-off, preserving that opt-out. SQLite creates a backup before migration.
-
 ### Embedding as a library (CMake)
 
-The Makefile is the canonical build for the standalone binaries. A separate CMake build produces a static library (`paraketto_lib`) for embedding the engine in other projects — see the header comment in `CMakeLists.txt` for options (`PARAKETTO_USE_CUBLAS`, `PARAKETTO_BUILD_LIB_ONLY`). The public API is `paraketto::Pipeline` in `src/paraketto.h`. Desktop/service targets are optional.
+The Makefile is the canonical build for the standalone binaries. A separate CMake build produces a static library (`paraketto_lib`) for embedding the engine in other projects — see the header comment in `CMakeLists.txt` for options (`PARAKETTO_USE_CUBLAS`, `PARAKETTO_BUILD_LIB_ONLY`). The public API is `paraketto::Pipeline` in `src/paraketto.h`.
 
 ## HTTP API
 
@@ -474,7 +274,7 @@ Correctness checks:
 
 ```bash
 uv run python -m unittest discover -s tests -p test_ultra_conversion.py
-make test-model-selection test-model-selection-cli test-service-models
+make test-model-selection test-model-selection-cli
 make test-cublas-fallback
 ```
 
@@ -495,8 +295,6 @@ src/kernels.cu            # Custom kernels: FFT, LayerNorm, SiLU, GLU, conv, LST
 src/mel.h                 # Custom 512-point FFT + mel filterbank
 src/wav.h                 # WAV file reader (16kHz/24kHz mono, int16/float32)
 src/server.h              # HTTP server + web UI (uses cpp-httplib)
-src/service/             # Durable sessions, audio capture, VAD, ASR scheduling and dictionary edits
-src/desktop/             # GTK session pane, history and recording pill
 scripts/weight_format.py  # Shared FP16 tensor order and alignment
 scripts/export_weights.py # ONNX → PRKT FP16 converter (V2 / V3)
 scripts/export_ultra_weights.py # Safetensors → PRKT FP16 converter (Ultra)

@@ -12,21 +12,8 @@ No Python at runtime; Python (via uv) is only for benchmarks and weight tooling.
 - Needs the `third_party/cutlass` submodule (`git submodule update --init third_party/cutlass`).
 - The `fp8-ultra` branch preserves FP8 inference and experiments; main is FP16 only.
 - `CMakeLists.txt` is a secondary build for embedding `paraketto_lib` in other
-  projects and optional desktop/service targets. Keep it in sync when adding sources.
-- Long-form service uses vendored SQLite and CPU ggml from `vendor/llama.cpp`.
-  `make prepare-models` explicitly prepares the pinned Silero VAD asset.
-  Output is ASR plus reversible dictionary replacements; there is no LLM cleanup.
-  Desktop defaults to Transcription with History and Dictionary tabs, global replacement
-  pill, inline hover highlights, selection-to-spelling popover and capture
-  Pause/Resume/Stop; no playback UI. Dictionary matchers are cached by immutable
-  revision; see `docs/dictionary.md` for correction/API semantics and CPU timings.
-  Dictionary management lives in `src/desktop/dictionary_view.*`: searchable,
-  paged entries with individual Add/Change/Remove actions and guarded writes.
-  Keep the replacement control's pill/knob appearance; clicking snaps it fully
-  on/off, without dragging. Keep routine save/copy/complete
-  confirmations out of the UI; show notices only when the user needs to act.
-- Session validation: `make test-session-store test-capture test-segmenter
-  test-asr-scheduling test-sessions`; GPU integration is opt-in via `tests/bench_sessions.py`.
+  projects. Keep it in sync when adding sources.
+- The native Linux app and its session service live on the `linux-app` branch.
 
 ## GPU etiquette
 
@@ -35,13 +22,13 @@ Compilation is CPU-only and always safe.
 
 ## Weights & data
 
-- CLI and service accept `--model v2|v3|ultra`; shared selection lives in
-  `src/model_selection.h`. CLI defaults to V2, service to Ultra. Lookup prefers
+- The CLI accepts `--model v2|v3|ultra`; selection lives in
+  `src/model_selection.h`. It defaults to V2. Lookup prefers
   the preset filename beside the executable, then the XDG user cache.
   `--weights` overrides the path; without an explicit `--model` it means custom
   weights with architecture auto-detection. Explicit presets verify the header.
 - CLI V2/V3 weights auto-download to `~/.cache/paraketto/` (HF repo `localoptima/paraketto`).
-  Ultra requires `scripts/export_ultra_weights.py`; service loads never download.
+  Ultra requires `scripts/export_ultra_weights.py`.
   Binary formats are versioned — `make check-weights` validates the default V2 header;
   `scripts/repack_weights.py` migrates old files.
 - Benchmark data: `make download-data` (English) / `make download-data-v3` (de/it/fr FLEURS)
@@ -51,7 +38,7 @@ Compilation is CPU-only and always safe.
 
 - Benchmark harnesses: `make bench-cuda|bench-cublas|bench-v3`.
 - Ultra converter checks: `uv run python -m unittest discover -s tests -p test_ultra_conversion.py`.
-- Selector checks: `make test-model-selection test-model-selection-cli test-service-models`.
+- Selector checks: `make test-model-selection test-model-selection-cli`.
 - Forced cuBLAS fallback check: `make test-cublas-fallback`.
 - Regression testing with statistical confidence: `tests/bench_regression.py`
   (`--save baseline.json` then `--compare`; baselines are machine-specific, gitignored).

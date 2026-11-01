@@ -141,86 +141,9 @@ clean:
 	rm -f paraketto.cuda paraketto.cublas
 	rm -f bench_ff2 bench_gemm bench_splitk bench_tiles
 	rm -f src/*.o
-	rm -f scratch/test_cublas_fallback scratch/test_desktop
-	rm -f paraketto-desktop paraketto-service
+	rm -f scratch/test_cublas_fallback scratch/test_model_selection
 
-# Optional native Linux app. The inference builds do not need these libraries.
-DESKTOP_PKGS = gtk+-3.0 gio-unix-2.0 gstreamer-app-1.0 json-glib-1.0 x11
-DESKTOP_SOURCES = src/desktop/app.cpp src/desktop/audio.cpp src/desktop/backend.cpp src/desktop/dictionary_view.cpp src/desktop/history.cpp src/desktop/input.cpp
-APP_HEADERS = src/app_common.h src/model_settings.h src/model_selection.h src/service/api.h
-DESKTOP_HEADERS = $(wildcard src/desktop/*.h) $(APP_HEADERS) src/wav.h
-SERVICE_CORE = src/service/worker.cpp src/service/session_store.cpp src/service/dictionary.cpp src/service/edits.cpp src/service/capture.cpp src/service/segmenter.cpp src/service/sessions.cpp src/service/vad/vad_ggml.cpp
-SERVICE_SOURCES = src/service/main.cpp $(SERVICE_CORE)
-SERVICE_PKGS = gio-unix-2.0 json-glib-1.0 gstreamer-app-1.0
-SERVICE_HEADERS = $(wildcard src/service/*.h src/service/vad/*.h) $(APP_HEADERS)
-GGML_SERVICE = scratch/ggml-service
-GGML_SERVICE_LIBS = $(GGML_SERVICE)/ggml/src/libggml.a $(GGML_SERVICE)/ggml/src/libggml-cpu.a $(GGML_SERVICE)/ggml/src/libggml-base.a
-SERVICE_LIBS = -Wl,--start-group $(GGML_SERVICE_LIBS) -Wl,--end-group -ldl
-SERVICE_INCLUDES = -Ithird_party -Ithird_party/sqlite -Isrc -Ivendor/llama.cpp/ggml/include
-
-$(GGML_SERVICE)/.stamp: vendor/llama.cpp/ggml/include/ggml.h
-	cmake -S vendor/llama.cpp -B $(GGML_SERVICE) -DBUILD_SHARED_LIBS=OFF -DGGML_CUDA=OFF \
-		-DGGML_NATIVE=ON -DGGML_OPENMP=OFF -DGGML_CCACHE=OFF -DLLAMA_BUILD_COMMON=OFF \
-		-DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF
-	cmake --build $(GGML_SERVICE) --target ggml --parallel 6
-	touch $@
-
-scratch/sqlite3.o: third_party/sqlite/sqlite3.c third_party/sqlite/sqlite3.h
-	mkdir -p scratch
-	$(CC) -O2 -DSQLITE_THREADSAFE=1 -DSQLITE_DEFAULT_FOREIGN_KEYS=1 -c $< -o $@
-
-.PHONY: prepare-models
-prepare-models:
-	uv run --no-project python scripts/prepare_vad.py
-
-paraketto-service: $(SERVICE_SOURCES) $(SERVICE_HEADERS) src/web_ui.h scratch/sqlite3.o $(GGML_SERVICE)/.stamp
-	pkg-config --exists $(SERVICE_PKGS)
-	$(CXX) -std=c++17 -O2 -Wall -Wextra $(SERVICE_INCLUDES) \
-		$(SERVICE_SOURCES) scratch/sqlite3.o $$(pkg-config --cflags --libs $(SERVICE_PKGS)) $(SERVICE_LIBS) -pthread -o $@
-
-.PHONY: desktop
-desktop: paraketto.cuda paraketto-service paraketto-desktop
-
-.PHONY: install-service
-install-service: paraketto-service
-	uv run --no-project python scripts/install_service.py
-
-paraketto-desktop: $(DESKTOP_SOURCES) $(DESKTOP_HEADERS)
-	pkg-config --exists $(DESKTOP_PKGS)
-	$(CXX) -std=c++17 -O2 -Wall -Wextra -Wno-deprecated-declarations -Ithird_party -Isrc \
-		$(DESKTOP_SOURCES) $$(pkg-config --cflags --libs $(DESKTOP_PKGS)) -lxdo -pthread -o $@
-
-.PHONY: test-desktop
-test-desktop: scratch/test_desktop
-	sh tests/run_desktop_tests.sh
-
-.PHONY: test-replacement-highlights
-test-replacement-highlights: scratch/test_replacement_highlights
-	./scratch/test_replacement_highlights
-
-scratch/test_replacement_highlights: tests/test_replacement_highlights.cpp src/desktop/replacement_highlights.h
-	mkdir -p scratch
-	$(CXX) -std=c++17 -O2 -Wall -Wextra -Werror -Isrc $< -o $@
-
-.PHONY: test-desktop-lifecycle
-test-desktop-lifecycle: paraketto-desktop paraketto-service
-	sh tests/run_desktop_tests.sh uv run --no-project python tests/test_desktop_lifecycle.py
-
-.PHONY: test-desktop-pane
-test-desktop-pane: scratch/test_desktop_pane paraketto-service
-	sh tests/run_desktop_tests.sh uv run --no-project python tests/test_desktop_pane.py
-
-scratch/test_desktop_pane: tests/test_desktop_pane.cpp $(DESKTOP_SOURCES) $(DESKTOP_HEADERS) src/service/session_store.cpp src/service/dictionary.cpp src/service/edits.cpp $(SERVICE_HEADERS) scratch/sqlite3.o
-	mkdir -p scratch
-	$(CXX) -std=c++17 -O2 -Wall -Wextra -Wno-deprecated-declarations $(SERVICE_INCLUDES) $< \
-		$(filter-out src/desktop/app.cpp,$(DESKTOP_SOURCES)) src/service/session_store.cpp src/service/dictionary.cpp src/service/edits.cpp \
-		scratch/sqlite3.o $$(pkg-config --cflags --libs $(DESKTOP_PKGS)) -lxdo -pthread -o $@
-
-.PHONY: test-service
-test-service: paraketto-service
-	uv run --no-project python tests/test_service.py
-
-.PHONY: test-model-selection test-model-selection-cli test-service-models
+.PHONY: test-model-selection test-model-selection-cli
 test-model-selection: scratch/test_model_selection
 	./scratch/test_model_selection
 
@@ -230,49 +153,3 @@ scratch/test_model_selection: tests/test_model_selection.cpp src/model_selection
 
 test-model-selection-cli: paraketto.cuda
 	uv run --no-project python tests/test_model_selection_cli.py
-
-test-service-models: paraketto-service
-	uv run --no-project python tests/test_service_models.py
-
-.PHONY: test-sessions test-session-store test-capture test-segmenter test-asr-scheduling
-test-asr-scheduling: scratch/test_asr_scheduling
-	./scratch/test_asr_scheduling tests/desktop_fixture_server.py
-
-scratch/test_asr_scheduling: tests/test_asr_scheduling.cpp src/service/main.cpp src/service/worker.cpp $(SERVICE_HEADERS)
-	mkdir -p scratch
-	$(CXX) -std=c++17 -O2 -Wall -Wextra -ffunction-sections -fdata-sections $(SERVICE_INCLUDES) $< src/service/worker.cpp $$(pkg-config --cflags --libs $(SERVICE_PKGS)) -pthread -Wl,--gc-sections -o $@
-
-test-sessions: paraketto-service
-	uv run --no-project python tests/test_sessions.py
-
-test-session-store: scratch/test_session_store
-	./scratch/test_session_store
-
-.PHONY: bench-dictionary
-bench-dictionary: scratch/bench_dictionary
-	./scratch/bench_dictionary
-
-scratch/bench_dictionary: tests/bench_dictionary.cpp src/service/dictionary.cpp src/service/dictionary.h src/service/edits.h src/app_common.h
-	mkdir -p scratch
-	$(CXX) -std=c++17 -O2 -Wall -Wextra -Isrc tests/bench_dictionary.cpp src/service/dictionary.cpp $$(pkg-config --cflags --libs json-glib-1.0) -o $@
-
-scratch/test_session_store: tests/test_session_store.cpp src/service/session_store.cpp src/service/dictionary.cpp src/service/edits.cpp $(SERVICE_HEADERS) scratch/sqlite3.o
-	$(CXX) -std=c++17 -O2 -Wall -Wextra $(SERVICE_INCLUDES) $< src/service/session_store.cpp src/service/dictionary.cpp src/service/edits.cpp scratch/sqlite3.o $$(pkg-config --cflags --libs gio-unix-2.0 json-glib-1.0) -pthread -o $@
-
-test-capture: scratch/test_capture
-	./scratch/test_capture
-
-scratch/test_capture: tests/test_capture.cpp src/service/capture.cpp src/service/session_store.cpp src/service/dictionary.cpp src/service/edits.cpp $(SERVICE_HEADERS) scratch/sqlite3.o
-	$(CXX) -std=c++17 -O2 -Wall -Wextra $(SERVICE_INCLUDES) $< src/service/capture.cpp src/service/session_store.cpp src/service/dictionary.cpp src/service/edits.cpp scratch/sqlite3.o $$(pkg-config --cflags --libs $(SERVICE_PKGS)) -pthread -o $@
-
-test-segmenter: scratch/test_segmenter
-	./scratch/test_segmenter
-
-scratch/test_segmenter: tests/test_segmenter.cpp src/service/segmenter.cpp src/service/vad/vad_ggml.cpp $(SERVICE_HEADERS) $(GGML_SERVICE)/.stamp
-	$(CXX) -std=c++17 -O2 -Wall -Wextra $(SERVICE_INCLUDES) $< src/service/segmenter.cpp src/service/vad/vad_ggml.cpp $$(pkg-config --cflags --libs $(SERVICE_PKGS)) $(SERVICE_LIBS) -pthread -o $@
-
-scratch/test_desktop: tests/test_desktop.cpp $(filter-out src/desktop/app.cpp,$(DESKTOP_SOURCES)) src/service/worker.cpp src/service/worker.h $(DESKTOP_HEADERS)
-	mkdir -p scratch
-	$(CXX) -std=c++17 -O2 -Wall -Wextra -Wno-deprecated-declarations -Ithird_party -Isrc \
-		$< $(filter-out src/desktop/app.cpp,$(DESKTOP_SOURCES)) src/service/worker.cpp \
-		$$(pkg-config --cflags --libs $(DESKTOP_PKGS)) -lxdo -pthread -o $@
