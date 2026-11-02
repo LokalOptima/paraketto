@@ -90,8 +90,8 @@ Word timestamps, forced alignment and clickable word playback are isolated on
 `codex/word-timestamps`. That branch contains `docs/word-playback.md` and its
 setup instructions; the main branch does not load or require Qwen alignment weights.
 
-The native dictation apps live on their own branches: `linux-app` has the GTK app and its
-persistent session service, and `macos-app` has the Core ML menu-bar app.
+The native Linux dictation app and its persistent session service live on the
+`linux-app` branch.
 
 ## Quick start
 
