@@ -112,9 +112,14 @@ static void run_server(PipelineT& pipeline,
         double audio_dur = (double)wav.samples.size() / wav.sample_rate;
         auto t0 = std::chrono::high_resolution_clock::now();
         std::string text;
-        {
+        try {
             std::lock_guard<std::mutex> lock(mtx);
             text = pipeline.transcribe(wav.samples.data(), wav.samples.size());
+        } catch (const Error& e) {
+            // The server has one model and no way to carry on without it:
+            // as before the library threw, say why and end.
+            fprintf(stderr, "%s\n", e.what());
+            std::exit(1);
         }
         auto t1 = std::chrono::high_resolution_clock::now();
         double elapsed = std::chrono::duration<double>(t1 - t0).count();

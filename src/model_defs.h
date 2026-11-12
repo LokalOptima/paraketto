@@ -154,13 +154,16 @@ struct Weights {
     // Methods
     // ---------------------------------------------------------------------------
 
-    /// Prefetch: mmap paraketto-fp16.bin (CPU only, no CUDA).
+    /// Prefetch: mmap paraketto-fp16.bin (CPU only, no CUDA). Throws
+    /// paraketto::Error when the file cannot be opened or is not a weights file.
+    /// The result owns the mapping until Pipeline::init takes it or free().
     static Weights prefetch(const std::string& path);
 
-    /// Upload prefetched data to GPU, assign weight pointers.
+    /// Upload prefetched data to GPU, assign weight pointers. Throws
+    /// paraketto::Error when the file has the wrong size or a CUDA call fails.
     void upload(cudaStream_t stream = nullptr);
 
-    /// Free the GPU allocation.
+    /// Free the GPU allocation, and the mapping if upload() did not finish.
     void free();
 };
 

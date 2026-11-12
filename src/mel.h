@@ -293,14 +293,19 @@ struct MelSpec {
 
     void ensure_buffers(int n_frames) {
         size_t need_frames = (size_t)n_frames * N_FFT * sizeof(float);
+        // A failed allocation throws: leave no pointer to the freed buffer behind.
         if (need_frames > frames_cap) {
             if (d_frames) cudaFree(d_frames);
+            d_frames = nullptr;
+            frames_cap = 0;
             CUDA_CHECK(cudaMalloc(&d_frames, need_frames));
             frames_cap = need_frames;
         }
         size_t need_mel = (size_t)n_frames * N_MELS * sizeof(float);
         if (need_mel > mel_cap) {
             if (d_mel) cudaFree(d_mel);
+            d_mel = nullptr;
+            mel_cap = 0;
             CUDA_CHECK(cudaMalloc(&d_mel, need_mel));
             mel_cap = need_mel;
         }

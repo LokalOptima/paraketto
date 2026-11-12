@@ -1,6 +1,8 @@
 // wav.h — WAV file reader (16kHz mono, int16 or float32, with 24kHz→16kHz resampling)
 #pragma once
 
+#include "common.h"      // fail(): read_wav throws paraketto::Error
+
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -88,13 +90,13 @@ static inline WavData wav_decode_samples(const WavFmt& fmt, const char* raw_data
 
 static inline WavData read_wav(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
-    if (!f) { fprintf(stderr, "Cannot open WAV: %s\n", path.c_str()); std::exit(1); }
+    if (!f) fail("Cannot open WAV: %s", path.c_str());
 
     char riff[4]; f.read(riff, 4);
-    if (memcmp(riff, "RIFF", 4)) { fprintf(stderr, "Not RIFF: %s\n", path.c_str()); std::exit(1); }
+    if (memcmp(riff, "RIFF", 4)) fail("Not RIFF: %s", path.c_str());
     uint32_t file_size; f.read((char*)&file_size, 4);
     char wave[4]; f.read(wave, 4);
-    if (memcmp(wave, "WAVE", 4)) { fprintf(stderr, "Not WAVE: %s\n", path.c_str()); std::exit(1); }
+    if (memcmp(wave, "WAVE", 4)) fail("Not WAVE: %s", path.c_str());
 
     WavFmt fmt;
     std::vector<char> raw_data;
@@ -110,7 +112,7 @@ static inline WavData read_wav(const std::string& path) {
             f.read((char*)&fmt.bits_per_sample, 2);
             if (sz > 16) f.seekg(sz - 16, std::ios::cur);
         } else if (!memcmp(id, "data", 4)) {
-            if (sz > 512 * 1024 * 1024) { fprintf(stderr, "WAV data chunk too large: %u bytes\n", sz); std::exit(1); }
+            if (sz > 512 * 1024 * 1024) fail("WAV data chunk too large: %u bytes", sz);
             fmt.data_size = sz; raw_data.resize(sz); f.read(raw_data.data(), sz);
         } else {
             f.seekg(sz, std::ios::cur);
@@ -118,11 +120,11 @@ static inline WavData read_wav(const std::string& path) {
         if (sz & 1) f.seekg(1, std::ios::cur);  // WAV chunks are padded to even byte boundaries
     }
 
-    if (fmt.num_channels != 1) { fprintf(stderr, "Need mono, got %d ch\n", fmt.num_channels); std::exit(1); }
-    if (fmt.sample_rate != 16000 && fmt.sample_rate != 24000) { fprintf(stderr, "Need 16kHz (or 24kHz), got %dHz: %s\n(resample with: ffmpeg -i input.wav -ar 16000 output.wav)\n", fmt.sample_rate, path.c_str()); std::exit(1); }
+    if (fmt.num_channels != 1) fail("Need mono, got %d ch", fmt.num_channels);
+    if (fmt.sample_rate != 16000 && fmt.sample_rate != 24000) fail("Need 16kHz (or 24kHz), got %dHz: %s\n(resample with: ffmpeg -i input.wav -ar 16000 output.wav)", fmt.sample_rate, path.c_str());
 
     WavData wav = wav_decode_samples(fmt, raw_data.data());
-    if (wav.samples.empty()) { fprintf(stderr, "Unsupported fmt=%d bits=%d\n", fmt.audio_format, fmt.bits_per_sample); std::exit(1); }
+    if (wav.samples.empty()) fail("Unsupported fmt=%d bits=%d", fmt.audio_format, fmt.bits_per_sample);
     return wav;
 }
 

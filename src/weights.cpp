@@ -116,23 +116,16 @@ Weights Weights::prefetch(const std::string& path) {
     Weights w;
 
     int fd = open(path.c_str(), O_RDONLY);
-    if (fd < 0) {
-        fprintf(stderr, "Cannot open weights: %s\n", path.c_str());
-        std::exit(1);
-    }
+    if (fd < 0) fail("Cannot open weights: %s", path.c_str());
     struct stat st;
     if (fstat(fd, &st) != 0 || st.st_size < (off_t)WEIGHTS_HEADER) {
-        fprintf(stderr, "Invalid or truncated weights header: %s\n", path.c_str());
         close(fd);
-        std::exit(1);
+        fail("Invalid or truncated weights header: %s", path.c_str());
     }
     size_t file_size = (size_t)st.st_size;
     void* mapped = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0);
     close(fd);
-    if (mapped == MAP_FAILED) {
-        fprintf(stderr, "mmap failed: %s\n", path.c_str());
-        std::exit(1);
-    }
+    if (mapped == MAP_FAILED) fail("mmap failed: %s", path.c_str());
     madvise(mapped, file_size, MADV_SEQUENTIAL);
 
     // Validate header
@@ -141,10 +134,9 @@ Weights Weights::prefetch(const std::string& path) {
     memcpy(&magic,   base,     4);
     memcpy(&version, base + 4, 4);
     if (magic != WEIGHTS_MAGIC || (version != 2 && version != 3)) {
-        fprintf(stderr, "Bad weights file %s (magic=0x%08x version=%u, expected PRKT v2 or v3)\n",
-                path.c_str(), magic, version);
         munmap(mapped, file_size);
-        std::exit(1);
+        fail("Bad weights file %s (magic=0x%08x version=%u, expected PRKT v2 or v3)",
+             path.c_str(), magic, version);
     }
 
     // Set model config from weight file version
@@ -172,11 +164,8 @@ void Weights::upload(cudaStream_t stream) {
 
     // Validate file data size
     size_t expected_file = WEIGHTS_HEADER + gpu_data_size;
-    if (mmap_size != expected_file) {
-        fprintf(stderr, "Weight file size mismatch: expected %zu, got %zu\n",
-                expected_file, mmap_size);
-        std::exit(1);
-    }
+    if (mmap_size != expected_file)
+        fail("Weight file size mismatch: expected %zu, got %zu", expected_file, mmap_size);
 
     CUDA_CHECK(cudaMalloc(&gpu_data, gpu_data_size));
 
@@ -207,5 +196,11 @@ void Weights::free() {
         cudaFree(gpu_data);
         gpu_data      = nullptr;
         gpu_data_size = 0;
+    }
+    // Still mapped only when upload() never ran or failed.
+    if (mmap_ptr) {
+        munmap(mmap_ptr, mmap_size);
+        mmap_ptr  = nullptr;
+        mmap_size = 0;
     }
 }

@@ -212,6 +212,21 @@ button on each transcript. History lasts until you refresh or close the page.
 
 The Makefile is the canonical build for the standalone binaries. A separate CMake build produces a static library (`paraketto_lib`) for embedding the engine in other projects — see the header comment in `CMakeLists.txt` for options (`PARAKETTO_USE_CUBLAS`, `PARAKETTO_BUILD_LIB_ONLY`). The public API is `paraketto::Pipeline` in `src/paraketto.h`.
 
+The library never ends your process. A weights or WAV file it cannot use, and any failed CUDA call, is thrown as `paraketto::Error` (`src/common.h`), a `std::runtime_error` whose `what()` is the one line the command line prints and whose `cuda` member is the failed call's `cudaError_t` (`cudaSuccess` when the failure was not a CUDA call):
+
+```cpp
+try {
+    paraketto::Pipeline stt;
+    stt.init(paraketto::Weights::prefetch(path));
+    text = stt.transcribe(samples, count);
+} catch (const paraketto::Error& e) {
+    if (e.cuda == cudaErrorMemoryAllocation) { /* the GPU is full: try again later */ }
+    else { /* e.what() names the file or the CUDA call */ }
+}
+```
+
+A full GPU is always `cudaErrorMemoryAllocation` ("out of memory"), whether there was no room for the CUDA context (thrown by the first call in `Pipeline::init`), for the weights (`Weights::upload`), or, with the model already loaded, for a recording's mel buffers (`transcribe`). Destructors do not throw: a `Pipeline` whose `init` threw is safe to destroy and gives back what it had allocated, and a new one can be loaded in the same process afterwards. After an out-of-memory error from `transcribe` the same `Pipeline` can be used again. The command line and `--server` catch the error, print it and exit with status 1.
+
 ## HTTP API
 
 - `GET /` — web UI (microphone recording + file upload; shows the running model/backend)

@@ -6,6 +6,8 @@
 //   auto w = paraketto::Weights::prefetch("/path/to/paraketto-fp16.bin");
 //   stt.init(std::move(w));
 //   std::string text = stt.transcribe(samples, n_samples);
+//
+// Failures are thrown as paraketto::Error (common.h), never ended with exit().
 
 #pragma once
 
@@ -82,9 +84,17 @@ struct Pipeline {
     MelSpec mel;
     cudaStream_t stream = nullptr;
 
+    // Loads the model onto the GPU. Call once per Pipeline. Throws
+    // paraketto::Error when the weights are not this model's or a CUDA call
+    // fails; the Pipeline is then only good for destroying, which gives back
+    // whatever was allocated, and a new Pipeline may be loaded afterwards.
     void init(Weights&& prefetched) {
+        // Taken first, so that the mapping is released whatever fails below.
+        weights = prefetched;
+        prefetched.mmap_ptr  = nullptr;
+        prefetched.mmap_size = 0;
+
         CUDA_CHECK(cudaStreamCreate(&stream));
-        weights = std::move(prefetched);
 
         weights.upload(stream);
 
@@ -103,6 +113,9 @@ struct Pipeline {
 
     using ChunkCallback = std::function<void(int, int)>;
 
+    // Throws paraketto::Error when a CUDA call fails. The Pipeline stays safe
+    // to destroy, and to use again if the failure was a passing one such as a
+    // full GPU (Error::cuda == cudaErrorMemoryAllocation).
     std::string transcribe(const float* samples, int num_samples,
                            ChunkCallback on_chunk = nullptr) {
         const int max_chunk_samples = MAX_MEL_FRAMES * HOP;

@@ -245,25 +245,19 @@ static void run_gemm(int M, int N, int K,
 
     GemmOp op;
     auto status = op.can_implement(args);
-    if (status != cutlass::Status::kSuccess) {
-        fprintf(stderr, "CUTLASS can_implement failed for %dx%dx%d: %d\n", M, N, K, (int)status);
-        exit(1);
-    }
+    if (status != cutlass::Status::kSuccess)
+        fail("CUTLASS can_implement failed for %dx%dx%d: %d", M, N, K, (int)status);
 
     size_t ws_size = GemmOp::get_workspace_size(args);
     void* ws = (ws_size > 0 && ws_size <= s_workspace_size) ? s_workspace : nullptr;
 
     status = op.initialize(args, ws, stream);
-    if (status != cutlass::Status::kSuccess) {
-        fprintf(stderr, "CUTLASS initialize failed for %dx%dx%d: %d\n", M, N, K, (int)status);
-        exit(1);
-    }
+    if (status != cutlass::Status::kSuccess)
+        fail("CUTLASS initialize failed for %dx%dx%d: %d", M, N, K, (int)status);
 
     status = op(stream);
-    if (status != cutlass::Status::kSuccess) {
-        fprintf(stderr, "CUTLASS run failed for %dx%dx%d: %d\n", M, N, K, (int)status);
-        exit(1);
-    }
+    if (status != cutlass::Status::kSuccess)
+        fail("CUTLASS run failed for %dx%dx%d: %d", M, N, K, (int)status);
 }
 
 // =========================================================================
@@ -296,18 +290,14 @@ static void run_splitk_gemm(int M, int N, int K,
     void* ws = (ws_size > 0 && ws_size <= s_workspace_size) ? s_workspace : nullptr;
 
     auto status = op.initialize(args, ws);
-    if (status != cutlass::Status::kSuccess) {
-        fprintf(stderr, "CUTLASS split-K initialize failed for %dx%dx%d sk=%d: %d\n",
-                M, N, K, split_k_slices, (int)status);
-        exit(1);
-    }
+    if (status != cutlass::Status::kSuccess)
+        fail("CUTLASS split-K initialize failed for %dx%dx%d sk=%d: %d",
+             M, N, K, split_k_slices, (int)status);
 
     status = op.run(stream);
-    if (status != cutlass::Status::kSuccess) {
-        fprintf(stderr, "CUTLASS split-K run failed for %dx%dx%d sk=%d: %d\n",
-                M, N, K, split_k_slices, (int)status);
-        exit(1);
-    }
+    if (status != cutlass::Status::kSuccess)
+        fail("CUTLASS split-K run failed for %dx%dx%d sk=%d: %d",
+             M, N, K, split_k_slices, (int)status);
 }
 
 // =========================================================================
@@ -337,25 +327,19 @@ static void run_batched_gemm(int M, int N, int K,
 
     BatchedGemmOp op;
     auto status = op.can_implement(args);
-    if (status != cutlass::Status::kSuccess) {
-        fprintf(stderr, "CUTLASS batched can_implement failed for %dx%dx%d batch=%d: %d\n",
-                M, N, K, batch, (int)status);
-        exit(1);
-    }
+    if (status != cutlass::Status::kSuccess)
+        fail("CUTLASS batched can_implement failed for %dx%dx%d batch=%d: %d",
+             M, N, K, batch, (int)status);
 
     status = op.initialize(args, nullptr, stream);
-    if (status != cutlass::Status::kSuccess) {
-        fprintf(stderr, "CUTLASS batched initialize failed for %dx%dx%d batch=%d: %d\n",
-                M, N, K, batch, (int)status);
-        exit(1);
-    }
+    if (status != cutlass::Status::kSuccess)
+        fail("CUTLASS batched initialize failed for %dx%dx%d batch=%d: %d",
+             M, N, K, batch, (int)status);
 
     status = op(stream);
-    if (status != cutlass::Status::kSuccess) {
-        fprintf(stderr, "CUTLASS batched run failed for %dx%dx%d batch=%d: %d\n",
-                M, N, K, batch, (int)status);
-        exit(1);
-    }
+    if (status != cutlass::Status::kSuccess)
+        fail("CUTLASS batched run failed for %dx%dx%d batch=%d: %d",
+             M, N, K, batch, (int)status);
 }
 
 // Helper: pick alignment for batched GEMM (considers leading dims AND strides)

@@ -3017,3 +3017,66 @@ Engine sources are unchanged. This change was prepared on a Mac without CUDA, so
 CUDA build itself was not run on it. Checked instead that nothing kept refers to a
 removed file, that `make -n` resolves the remaining targets, and that
 `make test-model-selection` passes.
+
+## 12 November 2026 — the library throws instead of exiting
+
+The engine is now linked into a desktop app as a library, and every failure in it
+ended the process: `CUDA_CHECK` printed the error and called `exit(1)`, as did the
+weight loader, the CUTLASS runners and `read_wav`. For the command line that is the
+right ending. For an app it means the window disappears, and the failure that
+happens in practice is an ordinary one: other jobs share the GPU and it is full.
+The app worked around this by checking the weight file's size itself and by keeping
+each recording on disk so that the next launch could try again.
+
+Every such exit is now a thrown `paraketto::Error`, defined in `src/common.h`. It is
+a `std::runtime_error` whose `what()` is the line that used to be printed, and it
+carries the `cudaError_t` of the failed call, or `cudaSuccess` for a bad file or a
+CUTLASS status. `CUDA_CHECK` and `CUBLAS_CHECK` call a small out-of-line function
+that formats the message and throws. `src/paraketto_cuda.cpp` catches the error at
+the top of `main`, prints `what()` and returns 1; the prefetch thread hands its
+exception to the main thread, since one that leaves a thread ends the program; and
+the `/transcribe` handler in `src/server.h` prints and exits as before. The
+download helper and the server's bind failures still exit: only the command line
+reaches them.
+
+Throwing instead of exiting means the objects live on, so three places needed care.
+`Pipeline::init` now takes the prefetched mapping before its first CUDA call and
+`Weights::free` unmaps it, or a failed load would leave 1.2 GB of the weight file
+mapped each time. `MelSpec::ensure_buffers` freed a buffer and then allocated its
+replacement; a failed allocation left the freed pointer and the old capacity in
+place, and the next shorter recording would have written to freed memory. It now
+clears both first. Nothing else needed changing: every free in the destructors was
+already guarded and unchecked.
+
+A full GPU was tried with a second process that holds memory until a given amount
+is free. It is `cudaErrorMemoryAllocation`, "out of memory", in every case. With
+about 500 MiB free the context is created and `cudaMalloc` in `Weights::upload`
+fails. With 100 MiB or less there is no room for the context, and the first CUDA
+call of `Pipeline::init`, `cudaStreamCreate`, fails with the same code, also after a
+`cudaDeviceReset`. With the model already loaded and 4 MiB free, `transcribe` fails
+allocating its mel buffers, and the same `Pipeline` transcribes again once there is
+room. After each failed load the process loaded and transcribed correctly as soon
+as the other process was gone. A missing, foreign, too short, truncated or
+overlong weight file throws and names the file or the two sizes.
+
+The first version of `CUDA_CHECK` passed five arguments to the throwing function.
+Transcripts were identical, but the mel stage of a 15.8-minute recording took about
+2 ms longer than the old binary's 51 ms, run after run. The disassembly showed the
+same instructions in the preemphasis loop, with other registers and at another
+address: the larger call sites had moved the loop, not changed it. Passing only the
+code, file and line, as the macro does now, moved it again and the difference went
+away: 593.4 ms against 593.1 ms for the whole recording over 200 warm runs each,
+mel 51.5 against 51.4, encoder and decoder equal. A timing difference of this size
+in host code can be the placement of a loop and nothing else; compare the
+disassembly before looking for a cause in the source.
+
+Checked against the binary built from the previous commit, with Ultra weights:
+transcripts of 240 clips (LibriSpeech, earnings22, long, difficult) and of the
+15.8-minute file are byte-identical; so are the cuBLAS build's on the 100
+LibriSpeech clips and the long file. `tests/bench_regression.py --expect-same`,
+five sessions against five of the old binary, passes: WER unchanged on all four
+sets, RTFx within 2% either way. The command line
+prints the same message and exits 1 for every failure listed above, a full GPU
+included; only the line number in `CUDA error at file:line` differs where a source
+line moved. `make test-model-selection`, `test-model-selection-cli` and
+`test-cublas-fallback` pass.

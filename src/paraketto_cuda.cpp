@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <functional>
 #include <string>
 #include <thread>
@@ -36,7 +37,7 @@ using namespace paraketto;
 // main
 // ---------------------------------------------------------------------------
 
-int main(int argc, char** argv) {
+static int run(int argc, char** argv) {
     auto usage = [&]() {
         fprintf(stderr,
             "Usage: %s [OPTIONS] <wav_file>...\n"
@@ -154,9 +155,12 @@ int main(int argc, char** argv) {
     }
 
     Weights prefetched;
-    // Prefetch in background while CUDA context inits.
+    std::exception_ptr prefetch_error;
+    // Prefetch in background while CUDA context inits. An exception must not
+    // leave the thread: it is thrown again below, once the thread has ended.
     std::thread prefetch_thread([&]() {
-        prefetched = Weights::prefetch(weights_path);
+        try { prefetched = Weights::prefetch(weights_path); }
+        catch (const Error&) { prefetch_error = std::current_exception(); }
     });
 
     // Force eager CUDA context initialization (overlaps with weight prefetch)
@@ -169,6 +173,7 @@ int main(int argc, char** argv) {
     }
 
     prefetch_thread.join();
+    if (prefetch_error) std::rethrow_exception(prefetch_error);
 
     // Validate the file actually mapped by prefetch as well, in case it was
     // replaced between the small header read and the mapping.
@@ -288,4 +293,15 @@ int main(int argc, char** argv) {
     }
 
     return 0;
+}
+
+// The library reports a file it cannot use or a failed GPU call by throwing.
+// For the command line that is the end: print the reason and exit 1.
+int main(int argc, char** argv) {
+    try {
+        return run(argc, argv);
+    } catch (const Error& e) {
+        fprintf(stderr, "%s\n", e.what());
+        return 1;
+    }
 }
