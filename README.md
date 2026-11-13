@@ -84,14 +84,27 @@ one-time [conversion below](#parakeet-ultra); its converted binary is not hosted
 in our download repository.
 
 FP8 inference, quantization, calibration, and kernel experiments are preserved
-on the separate `fp8-ultra` branch. The main branch uses FP16.
+at the `archive/2026-11-13/fp8-ultra` tag. The main branch uses FP16; retired
+TensorRT, FP8, no-CUDA, S1 and Linux service variants have matching
+`archive/2026-11-13/*` tags rather than maintained branches.
 
 Word timestamps, forced alignment and clickable word playback are isolated on
 `codex/word-timestamps`. That branch contains `docs/word-playback.md` and its
 setup instructions; the main branch does not load or require Qwen alignment weights.
 
-The native Linux dictation app and its persistent session service live on the
-`linux-app` branch.
+The current Linux dictation app is
+[gtk-paraketto](https://github.com/LokalOptima/gtk-paraketto). Its
+`paraketto-desktop` executable embeds this engine as `paraketto_lib` and handles
+recording, dictionary corrections and S1 cleanup in its own process. The older,
+same-named desktop application and `paraketto-service` from `linux-app` are
+retired and preserved at `archive/2026-11-13/linux-app`.
+
+The supported entry points are the standalone `paraketto.cuda`/`paraketto.cublas`
+CLI, their HTTP server with browser UI, and `paraketto_lib` for embedding.
+None needs the retired session service, Silero/ggml, SQLite or GStreamer.
+The separate Sony recorder importer only transfers and verifies recordings and
+safely ejects the device; it does not start transcription. Saved audio can be
+transcribed explicitly with the CLI or browser UI.
 
 ## Quick start
 

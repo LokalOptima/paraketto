@@ -35,9 +35,6 @@ Thumbs.db
 *.so
 *.a
 
-# llama.cpp build artifacts (submodule source is tracked, build is not)
-vendor/llama.cpp/build/
-
 # Model weights (generated or quantized)
 *.bin
 *.bin.*
@@ -62,9 +59,6 @@ plan.md
 
 # Benchmark baselines (generated, machine-specific)
 baseline_*.json
-
-# Generated calibration data retained from experimental branches
-scripts/v3_scales_new.txt
 
 # Agent workspace
 .claude/

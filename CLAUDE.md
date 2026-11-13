@@ -10,10 +10,14 @@ No Python at runtime; Python (via uv) is only for benchmarks and weight tooling.
   `make paraketto.cublas` (cuBLAS FP16). Bare `make` builds CUTLASS FP16.
 - GPU arch is auto-detected from `nvidia-smi`; override with `ARCH=sm_XX`.
 - Needs the `third_party/cutlass` submodule (`git submodule update --init third_party/cutlass`).
-- The `fp8-ultra` branch preserves FP8 inference and experiments; main is FP16 only.
+- Main is FP16 only. Retired variants are preserved under `archive/2026-11-13/*` tags.
 - `CMakeLists.txt` is a secondary build for embedding `paraketto_lib` in other
   projects. Keep it in sync when adding sources.
-- The native Linux app and its session service live on the `linux-app` branch.
+- The current Linux app lives in the separate `LokalOptima/gtk-paraketto` repository
+  and embeds `paraketto_lib`. The old `linux-app` desktop and `paraketto-service`
+  are retired. Keep the standalone CLI and its HTTP server/browser UI.
+- The Sony recorder importer only transfers and verifies files, then safely ejects
+  the recorder. It must not start automatic transcription or depend on this engine.
 
 ## GPU etiquette
 

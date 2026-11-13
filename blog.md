@@ -3080,3 +3080,55 @@ prints the same message and exits 1 for every failure listed above, a full GPU
 included; only the line number in `CUDA error at file:line` differs where a source
 line moved. `make test-model-selection`, `test-model-selection-cli` and
 `test-cublas-fallback` pass.
+
+## 2026-11-13 — Retire the old Linux service and make recorder import transfer-only
+
+The current Linux desktop is the separate `gtk-paraketto` application, which
+embeds `paraketto_lib`. Its same-named predecessor on `linux-app` caused confusion
+about which application was running. The recorder importer was the remaining
+installed client of `paraketto-service`, using `--transcribe-only` while still
+linking capture, SQLite, Silero and ggml. The requested recorder behavior is now
+verified file transfer and safe eject, with no automatic transcription.
+
+Disabled and removed the recorder transcription watcher and its dedicated
+Paraketto systemd unit, override, Python transcriber, adapter and tests. Removed
+their endpoint setting, obsolete runtime directories and installed worker/service
+pair. Kept the transfer program, its tests and systemd unit byte-identical; the
+watcher remains enabled and running. Its transfer journal and connection state
+remain in place. Updated the installed instructions for transfer only. Existing
+recordings and published text remain in their original locations.
+
+Historical session audio/databases, transcription queues and migration backups,
+retired configuration/scripts, and untracked recorder benchmark records are in
+`~/Desktop/Recordings/archive/retired-transcription-20261113T163736Z.tar.gz`.
+Verified all 459 files against SHA-256 manifests before deleting their originals.
+Separate FP8 experiment artifacts, calibrated weights and abandoned source
+folders are in `retired-fp8-20261113T164501Z.tar.gz` in the same archive directory;
+verified its 367 files and preserved its symlink without following it. Removed
+the obsolete FP8 executable, CMake build, object files and generated FP8 caches.
+The current FP16 and S1 model assets remain available.
+
+Preserved eight retired branch tips as annotated `archive/2026-11-13/*` tags:
+`linux-app`, `local-file-transcription`, `s1-mini-cutlass`, `fp8`, `fp8-ultra`,
+`nocuda`, `tensorrt`, and `worktree-agent-a4c791d7`. Removed the obsolete local
+branch names and the clean `scratch/local-file-transcription` worktree. The three
+existing remote branches (`linux-app`, `fp8`, `nocuda`) were atomically replaced
+with their archive tags, with leases on the inspected tips. The other archive
+tags remain local. `codex/word-timestamps` retains unique, unsuperseded work and
+remains a separate branch. S1's maintained implementation is in its own repository.
+
+Kept both FP16 backends, the library API, CLI and browser testing UI. No recorder
+API or audio-conversion code from the retired branch was merged into the engine.
+Updated README and agent guidance, removed obsolete ignore rules, and sharpened
+the retired-dependency check. A second targeted check covers ignored generated
+weights/builds and abandoned worktree folders, which branch cleanup alone misses.
+
+Validation: all 20 isolated recorder transfer/eject tests pass; the current
+desktop's six CPU/GUI suites pass on its private test display; model-selection
+checks and all six CLI selector cases pass. Rebuilt both retained executables
+and transcribed a public LibriSpeech clip with each. The engine's private
+localhost server served the browser page, health/model metadata and a multipart
+upload; its transcript matched the CLI. The temporary worker shut down cleanly.
+The transfer unit is active/enabled; both transcription units are absent, with
+no remaining launchers. Saved audio/text file inventory, sizes and modification
+times are unchanged. These checks did not perform a physical USB transfer.
